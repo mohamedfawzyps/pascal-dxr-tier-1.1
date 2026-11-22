@@ -39,7 +39,16 @@ then cluster operations, then Tier 1.2.
       `GeometryIndex()` everywhere except `RayTracingDebugMainCHS`, the ray
       tracing debug view's closest-hit. `D3D12RayTracing.cpp:759` says a
       failed pipeline "will be fatal when it's actually needed for
-      rendering", so opening that view in Escher is INFERRED to crash today.
+      rendering". **The view cannot be opened in a SHIPPING build at all**
+      (read 2026-11-23, 5.7 clone): `ShowFlagsValues.inl:407` declares
+      `SHOWFLAG_FIXED_IN_SHIPPING(0, RayTracingDebug, ...)`, a constant 0
+      when `UE_BUILD_SHIPPING && !WITH_EDITOR`, and the console is off in
+      Shipping unless `ALLOW_CONSOLE_IN_SHIPPING`. So Escher's Shipping build
+      never uses that closest-hit; testing it there needs a Development build.
+      Modes that use it, through the full pipeline (`RayTracingDebug.cpp`
+      takes that path first when it is supported): `Instances`, `Triangles`,
+      `DynamicInstances`, `ProxyType`, `Picker`, `InstanceOverlap`
+      (`RequiresRayTracingDebugCHS`, `RaytracingDebugDefinitions.h:79`).
       Design constraint found reading the harness: a DXR 1.0 hit shader
       cannot tell which geometry it serves except through WHICH RECORD it
       runs from, and `raytest`'s own TraceRay passes a geometry multiplier of
@@ -155,6 +164,28 @@ user 2026-09-24.** Verified from Unreal's source the same day:
   own denoising, a different image, which is why it is in scope.
 
 ## Current position (2026-09-23)
+
+**0.67.0 IN THE GAME (2026-11-23, 11 min 42 s): CLEAN, NOTHING REFUSED.**
+The first game run since 0.53.1, so the first of 0.54.0 to 0.67.0. Start
+line 0.67.0, DXC 1.10.2605.37, clean end marker, no device removal. 162
+RayQuery shaders lowered, 0 refused; 321 of 321 `CreateStateObject` hr=0;
+38631 lowered dispatches drawn (all indirect), REFUSED 0 of every kind,
+scene resolved 40684, not resolved 0; 36159 tables built, 35911 into a
+spare, 153 buffers freed. No `GeometryIndex()` library was created (the ray
+tracing debug view was not opened), and no lowered dispatch used the shim's
+own record layout.
+
+**0.67.0 WITH THE DEBUG LAYER (dxcpl forced, 2026-11-23, 1 min 57 s):
+NOTHING FROM THE SHIM.** Clean end marker, 5862 lowered dispatches drawn, 0
+refused. Errors: only Unreal's 24 `#622` (native 16-bit compute shaders),
+as in every run. Warnings, each attributed: `#1008` (one barrier call naming
+a subresource twice; every shim barrier call has one desc), `#1254`
+(Dispatch with 0 groups; every shim pass returns early on a zero count),
+`#209`, `#679`, `#1328` (Unreal's draws, PSOs and resources), `#926`
+(Unreal's placed resources alias; may include the shim binding Unreal's
+instance buffer by address, which reads exactly what the build read), and
+`#0`, the live-object report at process exit (12737; 6542 in 0.52.1). Same
+kinds as 0.52.1's debug run, counts higher with the busier scene.
 
 **0.67.0: PLAN STEP 3 h, FOR ANY-HIT BODIES, AND AN EXACT `Abort()`.** Any
 write in the loop body lowers (once per candidate, by
