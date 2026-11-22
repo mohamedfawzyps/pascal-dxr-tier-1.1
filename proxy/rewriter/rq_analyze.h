@@ -135,6 +135,10 @@ struct Query {
     // local root signature and the wider hit records, both of which cost
     // something and are therefore only added for a shader that asks.
     bool needsRecordConstants = false;
+    // Committed state read inside the Proceed loop (0.66.0). With `track` the
+    // any-hit keeps it in the payload; see rayquery.py.
+    bool committedInLoop = false;
+    bool track = false;
 
     int patternNum = 0;
     std::string patternDesc;

@@ -599,10 +599,19 @@ bool SameSubobjects(const LibSubobjects& a, const LibSubobjects& b) {
 // Until 0.58.0 they were declared again at state object scope, which could
 // not follow an export list or an association into another library. The
 // result's subobject table is checked against the original's.
+// `config1ToConfig` (0.64.0): a RaytracingPipelineConfig1 goes back as a
+// RaytracingPipelineConfig of the same depth, its flags dropped, because the
+// GTX 1070 rejects a pipeline carrying one; proxy/pipe_flags applies them.
 bool AssembleLibrary(std::string text, const void* orig, size_t origSize, std::vector<uint8_t>* out,
-                     std::string* err) {
+                     std::string* err, bool config1ToConfig = false) {
     LibSubobjects so;
     if (orig && LibrarySubobjects(orig, origSize, &so) && !so.all.empty()) {
+        if (config1ToConfig)
+            for (auto& x : so.all)
+                if (x.kind == D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1) {
+                    x.kind = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG;
+                    x.w[1] = 0;
+                }
         unsigned next = 0;
         for (size_t p = text.find('!'); p != std::string::npos; p = text.find('!', p + 1)) {
             size_t q = p + 1;
@@ -3055,6 +3064,23 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
         ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex(): shim layout over %u scenes, %u scene "
                  "slot(s), %u hit group records\n", D, S, records);
     return true;
+}
+
+// For proxy/pipe_flags (0.64.0).
+bool ReassembleLibrary(const std::string& text, const void* orig, size_t origSize, bool config1ToConfig,
+                       std::vector<uint8_t>* out, std::string* err) {
+    return AssembleLibrary(text, orig, origSize, out, err, config1ToConfig);
+}
+bool LibraryConfig1(const void* container, size_t size, UINT* depth, UINT* flags) {
+    LibSubobjects so;
+    if (!LibrarySubobjects(container, size, &so)) return false;
+    for (const auto& x : so.all)
+        if (x.kind == D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1) {
+            *depth = x.w[0];
+            *flags = x.w[1];
+            return true;
+        }
+    return false;
 }
 
 }  // namespace gidx

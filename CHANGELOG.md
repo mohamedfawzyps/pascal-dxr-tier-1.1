@@ -24,6 +24,172 @@ not.
 
 ---
 
+## 0.67.0
+
+**Plan step 3 (spec item 3), gap h: writes in the Proceed loop body, and
+`Abort()` made exact.** Both were refused or approximate.
+
+- **Any write in the loop body lowers**, not only a counter append: a plain
+  store, an atomic. With `NO_DUPLICATE_ANYHIT_INVOCATION` on every geometry
+  (set by the proxy since 0.41.0) the any-hit runs once per candidate
+  `Proceed()` would yield, never after an `Abort()` (its flag is checked
+  first), in an order that is implementation-defined for RayQuery too: the
+  same writes. Still refused: a write in a body that becomes an INTERSECTION
+  shader, which the spec lets run more than once per primitive.
+- **`Abort()` stops the search.** It used to set a flag and let traversal run
+  to its end, ignoring each later candidate. Now: commit then abort accepts
+  the hit and calls `AcceptHitAndEndSearch()`; a bare abort in a query that
+  never reads committed state ends the search too (the hit it commits is
+  never read); a bare abort where committed state IS read traces the query
+  forced non-opaque (the 0.66.0 machinery), so an opaque candidate met after
+  the abort reaches the any-hit and is rejected, where before traversal
+  committed it, which RayQuery never does. Appends next to an `Abort()` lower
+  now for the same reason.
+- **TWO DRIVER FAULTS, found by the new cases and fixed: payloads of 124 and
+  128 bytes.** `rayquery_abortstack` carries enough values to make the payload
+  124 bytes, and the 1070's driver access-violated inside `CreateStateObject`
+  on it, 3 of 3, offline too; WARP builds it. Bisected
+  (`phase5/cases/driver-crash/`, `pay124` and its controls): an any-hit
+  reading the LAST dword of a 124 byte payload crashes; reading the last field
+  of payloads from 80 to 260 bytes in steps of 4, only 124 does; a larger
+  declared `MaxPayloadSizeInBytes` does not help. Padding it to 128 built, and
+  then REMOVED THE DEVICE when dispatched, and so does a payload that is 128
+  bytes by itself (`rayquery_carry128`, `carryout` with one more counter);
+  run at 120 and at 132 to 156 bytes, all match WARP. So the lowering never
+  emits 124 or 128: both get unused fields up to 132, in both implementations.
+  No case before this one reached either size.
+- **Measured, against WARP on the 1070:** `writes` and `writesop` (a store
+  and an atomic, one candidate per ray, two quadrants opaque), `abortflag`
+  (`--stack`), `abortcmt` and `abortcmtc` (commit then abort and a bare
+  abort, `--opaquemix`, contribution 2), `abortstack` and `abortmix` (two
+  candidates per ray, checks order-free that nothing commits after the
+  abort), `carry128`. `DXR_TIER11_ABORT_POISON=1` (the aborting query keeps
+  its own flags) diverges in 11936 rays on `raytest --stackmix`, new: the
+  back instance forced opaque. On `--stack --opaquemix` the poison MATCHED,
+  because both layers are one structure and so one opacity per quadrant: no
+  ray there meets both kinds, though the case's comment said it did. Dispatch suite 86 of 86. Rewriter suite 49 of 49, Python and C++
+  byte-identical on all four new cases; the `abort` case renders only in the
+  dispatch suite now, as it reads record words.
+
+## 0.66.0
+
+**Plan step 3 (spec item 3), gap c: committed state read inside the Proceed
+loop.** Comparing a candidate's t with the committed one is the common alpha
+idiom (`if (q.CandidateTriangleRayT() < q.CommittedRayT())`). It was refused.
+
+- **The any-hit keeps the committed hit in the payload.** The raygen starts
+  it at none, with t at TMax; the any-hit's accept path records t,
+  barycentrics, status, the indices, the record words and the object-to-world
+  rows; a committed read in the body loads them. The spec keeps an any-hit's
+  payload writes whether it accepts or not, and an accepted hit is the next
+  committed one, so this is RayQuery's committed state, candidate by
+  candidate.
+- **Opaque candidates are the hard part.** RayQuery commits them during
+  `Proceed()` without yielding them, and a DXR 1.0 any-hit never sees them,
+  so the payload would miss them. A tracked query is therefore traced forced
+  non-opaque, with its own flags carried in the payload, and the any-hit
+  decides opacity itself, before the body: the geometry's `OPAQUE` flag (a
+  third word in each hit record, from the bottom-level build), the instance's
+  `FORCE_OPAQUE` and `FORCE_NON_OPAQUE`, then the ray's, then
+  `CULL_OPAQUE` and `CULL_NON_OPAQUE`. An opaque candidate is accepted
+  without running the body, exactly as `Proceed()` would commit it.
+- **The table carries opacity.** Records the application's layout would give
+  two opacities (two instances, or a structure's builds, disagreeing) go to
+  the shim's own layout, and a structure whose opacity is unknown (a
+  deserialized one) is refused by name.
+- **Procedural bodies:** `CommittedRayT` is `RayTCurrent()` in an
+  intersection shader, which is exact; any other committed read there is
+  refused (no payload).
+- **Measured, all against WARP:** `cmt` (`--geom`), with two quadrants
+  opaque (`--opaquemix`), contribution 2, the instance forced non-opaque and
+  forced opaque, `CULL_OPAQUE`, `CULL_NON_OPAQUE`, `FORCE_NON_OPAQUE`, two
+  queries, and two candidates per ray (`--stack`, the final hit only, since
+  which candidate a body sees first is implementation-defined, on WARP too);
+  procedural in a procedural and in a mixed scene. `DXR_TIER11_OPACITY_POISON=1`
+  (every record not opaque) diverges in 9248 rays. Dispatch suite 78 of 78,
+  rewriter suite 49 of 49.
+
+## 0.65.0
+
+**Plan step 3 (spec item 3, RayQuery in compute shaders): a `switch`
+through the Proceed loop, Shader Model 6.6 resource arrays, and state carried
+across candidates and out of the loop.** The step's full list was read off
+the rewriter's refusals first (docs/tier11-plan.md, 3 a to l); these are a,
+b and d.
+
+- **a, `switch`.** Both CFG models followed only `br`; a switch spans lines,
+  so its block had no successors and a Proceed loop through one was not
+  found ("2 Proceed calls but no loop"). Now its default and case labels are
+  successors, in both implementations. `rayquery_switch.hlsl` (`[forcecase]`
+  in the loop and after it) matches WARP; it had been refused and forwarded,
+  and the driver rejected the pipeline.
+- **b, 6.6 resource arrays, and a silent wrong result found doing it.** The
+  shape was read off DXC (`reference/lib_sm66_dynarray_ref.hlsl`): an array
+  of handles, `getelementptr` at the register less the range's lower bound,
+  `!dx.nonuniform` kept. The dynamic index was refused. The CONSTANT index was
+  worse: the global was declared one handle, so `bufs[2]` bound element 0,
+  silently. Measured on the 0.64.0 DLL: `rayquery_table_sm66` 0 hits of
+  14450. Now `table66`, `dyn66`, `dynnu66` all match, the decoys making a wrong
+  element write nowhere visible.
+- **d, loop state.** A value the loop defines and code after it reads, and a
+  loop-carried variable (a header phi: a count, the nearest t), were refused,
+  or for a header phi emitted into the any-hit's entry block as invalid IR.
+  The spec keeps an any-hit's payload writes even when it ignores its hit
+  ("Any modifications made to the ray payload up to this point in the any
+  hit shader are preserved"), so an any-hit invocation is one iteration: each
+  header phi is a payload field the raygen starts and each iteration loads
+  and, through a tail block per edge into the latch, stores again; each
+  escaping value a field each iteration stores and the raygen loads after
+  TraceRay; and a flag says whether any iteration ran, which picks the
+  guard's edge the original would have taken. `rayquery_carryout.hlsl` (a
+  candidate count, the nearest t, a value chosen with it) matches WARP on all
+  18496 rays that saw a candidate; `DXR_TIER11_STATE_POISON=1` (no iteration
+  stores) diverges. Refused by name: the same in an intersection shader (no
+  payload), and a latch that computes something itself.
+- **Measured:** rewriter suite, Python and C++ byte-identical on every case
+  including the new ones; dispatch suite 66 of 66, 7 of them new, plus the
+  state poison.
+
+## 0.64.0
+
+**Spec Tier 1.1 items 7 and 6: the extra vertex formats and the pipeline
+flags.** The first version worked from the spec's own definition of Tier 1.1
+(docs/tier11-plan.md), which lists seven additions; item 7 had never been
+tracked.
+
+- **Item 7, the vertex formats Tier 1.1 adds** for bottom-level builds
+  (`R16G16B16A16_UNORM`, `R16G16_UNORM`, `R10G10B10A2_UNORM`,
+  `R8G8B8A8_UNORM`, `R8G8_UNORM`, `R8G8B8A8_SNORM`, `R8G8_SNORM`): MEASURED
+  native on the GTX 1070. `raytest --vformat N [--vstride S]` builds the
+  triangle in each, the packed 3 and 6 byte strides too: every one bit-exact
+  against WARP (max |dt| and |dbary| 0.000000), and 8-bit positions against
+  float ones diverge in 2278 rays, so the case sees the format. No shim code.
+- **Item 6, `D3D12_RAYTRACING_PIPELINE_CONFIG1`:** MEASURED that the 1070
+  REJECTS a pipeline carrying one, as a subobject or declared in a library
+  (`CreateStateObject` E_INVALIDARG), so until now an application using it
+  got no pipeline at all. The ray flags themselves are native. So
+  `proxy/pipe_flags` does what the spec says the pipeline flags mean, before
+  anything else the shim does to a state object: every `TraceRay` in the
+  pipeline's libraries gets the flags OR'd into its ray flags (a literal
+  folded, a value through an `or`), a `CONFIG1` becomes a `CONFIG` of the same
+  depth (a library's own too, written back as `!dx.subobjects`), and a
+  collection linked with other flags is built again from a copy of its
+  description the shim keeps for every collection.
+- **`RayFlags()`**: the spec says the pipeline flags do not show up there.
+  WARP shows them (measured, against the spec). The shim masks them off
+  where that is exact, when every `TraceRay` of the pipeline passes literal
+  flags without those bits; otherwise it cannot tell a ray the application
+  flagged itself, leaves them showing, as WARP does, and logs it.
+- **Measured:** `tier11/pflagtest.exe`, a triangle and a procedural box, the
+  config as a subobject and in the DXIL, masked and not, in a collection,
+  in a collection the shim has to build again (a second library tracing with
+  cbuffer flags: "1 collection built again"), and grown by
+  `AddToStateObject`: 12 of 12 against WARP (RayFlags() against the spec
+  where masked). `DXR_TIER11_PFLAGS_POISON=1` (the config stripped, the
+  flags not applied) diverges. Dispatch suite 59 of 59 with a vertex format section (13 cases) and a pipeline flag section (12); gitest matrix 511 of 511, plus 2 gates.
+- **Tier 1.1 after this:** items 1, 2, 4, 5, 6 and 7 done; item 3, RayQuery
+  outside compute shaders, is what is left.
+
 ## 0.63.0
 
 **The shim's own layouts past the GTX 1070's local root signature limit are

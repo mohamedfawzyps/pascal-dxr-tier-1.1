@@ -26,6 +26,16 @@ const char* kAttrs = "%struct.BuiltInTriangleIntersectionAttributes";
 const char* kPayloadType =
     "{ float, <2 x float>, i32, i32, i32, i32, i32, i32, [12 x float], i32, i32 }";
 const int kPayloadBytes = 92;
+// DRIVER FACTS, 0.67.0, GTX 1070: a payload of exactly 124 bytes whose last
+// dword an any-hit reads crashes the driver inside CreateStateObject; one of
+// 128 bytes builds and removes the device when dispatched. 120 and 132 to 260
+// are fine. So 124 and 128 get unused fields up to 132. See _payload_pad in
+// lower.py.
+const int kDriverSafePayloadBytes = 132;
+int PayloadBytesFor(bool multi, int carried) {
+    const int n = kPayloadBytes + 4 * ((multi ? 1 : 0) + carried);
+    return (n == 124 || n == 128) ? kDriverSafePayloadBytes : n;
+}
 // Values the loop body reads from before it and the hit shader cannot rebuild
 // ride after the fixed fields, 4 bytes each. See _plan_carry in lower.py.
 const int kCarryField0 = 11;
@@ -80,13 +90,15 @@ std::vector<std::string> RecordRead(const std::string& tag, int word,
         out.push_back("  %rq.cbh" + tag + " = call %dx.types.Handle @" + kRecordHandleFn +
                       "(i32 160, " + t + " %rq.cbv" + tag + ")  ; CreateHandleForLib(Resource)");
     }
+    // Word 2, whether the record's geometry is opaque (0.66.0), is a load of
+    // its own at offset 8.
     const std::vector<std::string> rest = {
         "  %rq.cbr" + tag + " = call " + kResRet +
             " @dx.op.rawBufferLoad.i32(i32 139, %dx.types.Handle %rq.cbh" + tag +
-            ", i32 0, i32 undef, i8 3, i32 4)"
+            (word == 2 ? ", i32 8, i32 undef, i8 1, i32 4)" : ", i32 0, i32 undef, i8 3, i32 4)") +
             "  ; RawBufferLoad(srv,index,elementOffset,mask,alignment)",
         "  " + result + " = extractvalue " + kResRet + " %rq.cbr" + tag + ", " +
-            std::to_string(word),
+            std::to_string(word == 2 ? 0 : word),
     };
     out.insert(out.end(), rest.begin(), rest.end());
     return out;
@@ -178,6 +190,16 @@ const int kRawBufferStore = 140;
 // overload is named after the handle type too. That is the part that cannot be
 // guessed from the 6.5 path, where both are the resource type.
 const char kHandleType[] = "%dx.types.Handle";
+
+// The global a Shader Model 6.6 binding lowers to: a handle, or for a
+// resource ARRAY an array of handles, `[4 x %dx.types.Handle]` (read off DXC,
+// phase5/cases/reference/lib_sm66_dynarray_ref.hlsl).
+std::string BindingGty(const std::string& gty, const std::string& elem) {
+    static const std::regex kN(R"(^\[(\d+) x )");
+    std::smatch m;
+    if (gty != elem && std::regex_search(gty, m, kN)) return "[" + m[1].str() + " x " + kHandleType + "]";
+    return kHandleType;
+}
 
 // 0x2000000 is the raytracing tier 1.1 shader flag: measured on GeometryIndex,
 // which sets it and makes CreateStateObject refuse the library on a GTX 1070.
@@ -755,8 +777,136 @@ unsigned long long ModuleFlags(const std::string& text,
     return 0;
 }
 
+// The any-hit's first act when it tracks committed state (0.66.0); see
+// _opacity in lower.py.
+std::vector<std::string> Opacity(const Query& q, bool sm66) {
+    const std::string t = "o" + std::to_string(q.qid);
+    const std::string n = "%rq." + t;
+    std::vector<std::string> out = RecordRead(t, 2, n + ".w", sm66);
+    const std::vector<std::string> rest = {
+        "  " + n + ".fo = and i32 %rq.oflags, 1",
+        "  " + n + ".fn = and i32 %rq.oflags, 2",
+        "  " + n + ".a = icmp ne i32 " + n + ".fo, 0",
+        "  " + n + ".b = icmp ne i32 " + n + ".fn, 0",
+        "  " + n + ".c = icmp ne i32 " + n + ".w, 0",
+        "  " + n + ".d = select i1 " + n + ".b, i1 false, i1 " + n + ".c",
+        "  " + n + ".op = select i1 " + n + ".a, i1 true, i1 " + n + ".d",
+        "  " + n + ".co = and i32 %rq.oflags, 64",
+        "  " + n + ".cn = and i32 %rq.oflags, 128",
+        "  " + n + ".cu = select i1 " + n + ".op, i32 " + n + ".co, i32 " + n + ".cn",
+        "  " + n + ".cl = icmp ne i32 " + n + ".cu, 0",
+        "  br i1 " + n + ".cl, label %rq.reject, label " + n + ".k",
+        "",
+        "rq." + t + ".k:",
+        "  br i1 " + n + ".op, label %rq.accept, label " + q.loop.header,
+    };
+    out.insert(out.end(), rest.begin(), rest.end());
+    return out;
+}
+
+// What the closest-hit would record, on every accept; see _record_commit.
+std::vector<std::string> RecordCommit(const Query& q, bool sm66) {
+    const std::string pl = kPayload;
+    auto gep = [&](int idx) {
+        return "  %rq.cp" + std::to_string(idx) + " = getelementptr inbounds " + pl + ", " + pl +
+               "* %p, i32 0, i32 " + std::to_string(idx);
+    };
+    std::vector<std::string> out = {
+        "  %rq.ct = call float @dx.op.rayTCurrent.f32(i32 154)  ; RayTCurrent()",
+        gep(0), "  store float %rq.ct, float* %rq.cp0, align 4",
+        gep(1), "  store <2 x float> %rq.ab, <2 x float>* %rq.cp1, align 4",
+        gep(2), "  store i32 1, i32* %rq.cp2, align 4",
+    };
+    for (const auto& kv : kChSource) {
+        const std::string idx = std::to_string(kv.first);
+        out.push_back("  %rq.ci" + idx + " = " + kv.second);
+        out.push_back(gep(kv.first));
+        out.push_back("  store i32 %rq.ci" + idx + ", i32* %rq.cp" + idx + ", align 4");
+    }
+    if (q.needsRecordConstants) {
+        for (const auto& l : RecordRead("c", 0, "%rq.cg", sm66)) out.push_back(l);
+        out.push_back(gep(5));
+        out.push_back("  store i32 %rq.cg, i32* %rq.cp5, align 4");
+        out.push_back(std::string("  %rq.cc = extractvalue ") + kResRet + " %rq.cbrc, 1");
+        out.push_back(gep(10));
+        out.push_back("  store i32 %rq.cc, i32* %rq.cp10, align 4");
+    }
+    bool w2o = false;
+    auto scan = [&](const Query& x) {
+        for (const auto& c : x.committedOps)
+            if (c.second->DxOp() == kCommittedWorldToObject) w2o = true;
+    };
+    scan(q);
+    for (const auto& o : q.others) scan(o);
+    if (w2o) {
+        out.push_back(gep(8));
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 4; ++c) {
+                const std::string s = std::to_string(r * 4 + c);
+                out.push_back("  %rq.cw" + s + " = call float @dx.op.worldToObject.f32(i32 152, i32 " +
+                              std::to_string(r) + ", i8 " + std::to_string(c) +
+                              ")  ; WorldToObject(row,col)");
+                out.push_back("  %rq.cq" + s + " = getelementptr inbounds [12 x float], [12 x float]* %rq.cp8, "
+                              "i32 0, i32 " + s);
+                out.push_back("  store float %rq.cw" + s + ", float* %rq.cq" + s + ", align 4");
+            }
+    }
+    return out;
+}
+
+// A committed accessor read inside the loop, from the payload; see
+// _committed_read.
+std::vector<std::string> CommittedRead(const llm::Instr& i) {
+    const auto f = PayloadField(i.DxOp());
+    const std::string r = i.result.substr(1);
+    const std::string ptr = "%rq.cq" + r;
+    const std::string pl = kPayload;
+    std::vector<std::string> out = {
+        "  " + ptr + " = getelementptr inbounds " + pl + ", " + pl + "* %p, i32 0, i32 " + std::to_string(f->idx)
+    };
+    if (i.DxOp() == kCommittedFrontFace) {
+        out.push_back("  %rq.cf" + r + " = load i32, i32* " + ptr + ", align 4");
+        out.push_back("  " + i.result + " = icmp eq i32 %rq.cf" + r + ", " + std::to_string(kHitKindFront));
+    } else if (i.DxOp() == kCommittedWorldToObject) {
+        static const std::regex kRowRe(R"(i32\s+(\d+))");
+        static const std::regex kColRe(R"(i8\s+(\d+))");
+        std::smatch rm2, cm2;
+        std::string ar = Trim(i.args[2]), ac = Trim(i.args[3]);
+        std::regex_search(ar, rm2, kRowRe);
+        std::regex_search(ac, cm2, kColRe);
+        const int slot = std::stoi(rm2[1].str()) * 4 + std::stoi(cm2[1].str());
+        out.push_back("  %rq.cw" + r + " = getelementptr inbounds [12 x float], [12 x float]* " + ptr +
+                      ", i32 0, i32 " + std::to_string(slot));
+        out.push_back("  " + i.result + " = load float, float* %rq.cw" + r + ", align 4");
+    } else if (i.DxOp() == kCommittedBary) {
+        static const std::regex kI8(R"(i8\s+(\d+))");
+        std::smatch mm;
+        std::string a2 = Trim(i.args[2]);
+        std::regex_search(a2, mm, kI8);
+        out.push_back("  %rq.cb" + r + " = load <2 x float>, <2 x float>* " + ptr + ", align 4");
+        out.push_back("  " + i.result + " = extractelement <2 x float> %rq.cb" + r + ", i32 " + mm[1].str());
+    } else {
+        out.push_back("  " + i.result + " = load " + f->ty + ", " + f->ty + "* " + ptr + ", align " +
+                      std::to_string(f->align));
+    }
+    return out;
+}
+
 LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
     struct Carry { std::string name, ty; int field; };
+    // A loop's state and what leaves it, in the payload (0.65.0). See
+    // _plan_state in lower.py, which this mirrors.
+    struct StatePhi { std::string name, ty; int field; std::string init, next; };
+    struct StateOut { std::string name, ty; int field; };
+    struct LoopState {
+        std::vector<StatePhi> phis;
+        std::vector<StateOut> outs;
+        int iter = -1;
+        std::string guardFalse;
+        std::map<std::string, std::map<std::string, std::string>> latchPhis;   // phi -> pred -> value
+        std::vector<std::pair<std::string, std::string>> tails;                // (block, accept/reject)
+    };
+    std::map<const Query*, LoopState> states;
     // Every value carried by any query, in field order, once all are planned.
     std::vector<Carry> carry;
     // Several queries in one entry point, 0.43.0: each its own TraceRay and
@@ -889,23 +1039,46 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             }
             const std::string a2b = instr.args.size() > 2 ? Trim(instr.args[2])
                                                           : std::string();
-            if (!std::regex_match(a2b, kI32End)) {
-                // The 6.5 path DOES support this, through a getelementptr on
-                // the array global. The 6.6 form is refused only because the
-                // shape of an ARRAY global in the binding form has not been
-                // measured off DXC, and guessing it is how a lowering goes
-                // silently wrong. phase5/cases/reference/ is where that
-                // question gets answered.
-                handleErr = "resource handle " + instr.result +
-                            " comes from an array binding indexed dynamically (" +
-                            a2b + "); the Shader Model 6.6 form of that has not "
-                            "been measured, and the 6.5 form is what this lowers";
-                return "";
-            }
+            static const std::regex kI32Signed(R"(^i32\s+(-?\d+)$)");
             const std::string rawb = "%rq.raw." + instr.result.substr(1);
             const std::string h = kHandleType;
-            return "  " + rawb + " = load " + h + ", " + h + "* @" + gb->sym +
-                   ", align 4\n"
+            std::string preb, srcb;
+            std::smatch bm;
+            const bool constIdx = std::regex_match(a2b, bm, kI32Signed);
+            if (gb->gty == gb->elem) {
+                if (!constIdx) {
+                    handleErr = "createHandleFromBinding indexes a resource that is not an array (" + a2b + ")";
+                    return "";
+                }
+                srcb = h + "* @" + gb->sym;
+            } else {
+                // A resource ARRAY (0.65.0; until then refused dynamically
+                // and, indexed by a constant, silently bound its first
+                // element). The binding's index is the REGISTER, the array's
+                // element is that less the range's lower bound; read off DXC,
+                // phase5/cases/reference/lib_sm66_dynarray_ref.hlsl.
+                const std::string arr = BindingGty(gb->gty, gb->elem);
+                if (constIdx) {
+                    srcb = h + "* getelementptr inbounds (" + arr + ", " + arr + "* @" + gb->sym + ", i32 0, i32 " +
+                           std::to_string(std::stoll(bm[1].str()) - b.lower) + ")";
+                } else {
+                    std::string ix = a2b;
+                    if (b.lower) {
+                        const std::string sub = "%rq.ix." + instr.result.substr(1);
+                        const size_t sp = a2b.find_last_of(' ');
+                        preb += "  " + sub + " = sub i32 " + a2b.substr(sp + 1) + ", " +
+                                std::to_string(b.lower) + "\n";
+                        ix = "i32 " + sub;
+                    }
+                    const std::string a3b = instr.args.size() > 3 ? Trim(instr.args[3]) : std::string("i1 false");
+                    const bool nub = a3b != "i1 false" && a3b != "i1 0";
+                    const std::string gep = "%rq.gep." + instr.result.substr(1);
+                    preb += "  " + gep + " = getelementptr inbounds " + arr + ", " + arr + "* @" + gb->sym +
+                            ", i32 0, " + ix + (nub ? ", !dx.nonuniform !RQNU" : "") + "\n";
+                    srcb = h + "* " + gep;
+                }
+            }
+            return preb + "  " + rawb + " = load " + h + ", " + srcb + ", align 4\n"
                    "  " + instr.result + " = call " + h +
                    " @dx.op.createHandleForLib.dx.types.Handle(i32 160, " + h +
                    " " + rawb + ")  ; CreateHandleForLib(Resource)";
@@ -1032,6 +1205,10 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             if (!b) continue;
             for (const auto& i : b->instrs) {
                 if (!i.result.empty()) defined.insert(i.result);
+                // A header phi is loop STATE (0.65.0): its start is stored by
+                // the raygen and its next value by each iteration, so what it
+                // reads is not read by the any-hit.
+                if (lbl == x.loop.header && i.isPhi) continue;
                 for (const auto& u : Operands(i, types)) used.insert(u);
             }
         }
@@ -1064,15 +1241,15 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         for (const auto& u : used)
             if (!defined.count(u) && u != x.handle && !handles.count(u))
                 outside.push_back(u);
+        // A value the loop defines and code after it reads leaves through
+        // the payload (0.65.0; until then refused).
+        std::vector<std::string> escapes;
         for (const auto& b : fn.blocks) {
             if (x.loop.body.count(b.label)) continue;
             for (const auto& i : b.instrs)
                 for (const auto& u : Operands(i, types))
-                    if (defined.count(u)) {
-                        r.error = "value " + u + " defined in the Proceed loop is used "
-                                  "after it; the any-hit shader cannot return it";
-                        return false;
-                    }
+                    if (defined.count(u) && std::find(escapes.begin(), escapes.end(), u) == escapes.end())
+                        escapes.push_back(u);
         }
 
         // What the hit shader cannot rebuild travels in the PAYLOAD, 0.42.0:
@@ -1141,6 +1318,136 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 r.error = "the Proceed loops read " + std::to_string(carryFields.size()) +
                           " values defined outside them between them; more than the " +
                           std::to_string(kMaxCarry) + " the payload carries";
+                return false;
+            }
+        }
+
+        // The loop's state and what leaves it (0.65.0): see _plan_state.
+        {
+            const llm::Block* hdr = fn.FindBlock(x.loop.header);
+            std::vector<const llm::Instr*> phis;
+            if (hdr)
+                for (const auto& i : hdr->instrs)
+                    if (i.isPhi) phis.push_back(&i);
+            if (!phis.empty() || !escapes.empty()) {
+                if (x.NeedsIntersection()) {
+                    std::string names;
+                    for (const auto* p : phis) names += (names.empty() ? "" : ", ") + p->result;
+                    for (const auto& s : escapes) names += (names.empty() ? "" : ", ") + s;
+                    r.error = "Proceed loop carries state across candidates or out of the loop (" +
+                              names + ") and becomes an intersection shader, which has no payload "
+                              "to carry it in";
+                    return false;
+                }
+                std::map<std::string, const llm::Instr*> defs;
+                for (const auto& b : fn.blocks)
+                    for (const auto& i : b.instrs)
+                        if (!i.result.empty()) defs[i.result] = &i;
+                const llm::Block* lat = fn.FindBlock(x.loop.latch);
+                for (const auto& i : lat->instrs)
+                    if (!i.isPhi && i.DxOp() != kProceed && i.body.rfind("br ", 0) != 0) {
+                        r.error = "the Proceed loop latch computes " +
+                                  (i.result.empty() ? i.body.substr(0, 40) : i.result) +
+                                  " itself; the any-hit shader has no latch to compute it in";
+                        return false;
+                    }
+                std::string terr;
+                auto typed = [&](const std::string& name) -> std::string {
+                    auto d = defs.find(name);
+                    const std::string ty = d == defs.end() ? std::string() : ResultType(*d->second);
+                    if (ty != "i32" && ty != "float" && ty != "i1")
+                        terr = "Proceed loop state " + name + " is of type " +
+                               (ty.empty() ? std::string("None") : ty) +
+                               "; the payload carries i32, float and i1";
+                    return ty;
+                };
+                auto field = [&](const std::string& key, const std::string& ty) {
+                    auto it = carryFields.find(key);
+                    if (it == carryFields.end())
+                        it = carryFields.emplace(key, std::make_pair(ty, carryBase + (int)carryFields.size())).first;
+                    return it->second.second;
+                };
+                LoopState& st = states[&x];
+                for (const auto* p : phis) {
+                    const std::string ty = typed(p->result);
+                    if (!terr.empty()) { r.error = terr; return false; }
+                    std::vector<std::string> inits, nexts;
+                    for (const auto& in : p->phiIncoming)
+                        (in.second == x.loop.latch ? nexts : inits).push_back(Trim(in.first));
+                    if (inits.size() != 1 || nexts.size() != 1) {
+                        r.error = "Proceed loop header phi " + p->result + " has an unexpected shape";
+                        return false;
+                    }
+                    st.phis.push_back({p->result, ty, field(p->result, ty), inits[0], nexts[0]});
+                }
+                for (const auto& s : escapes) {
+                    const std::string ty = typed(s);
+                    if (!terr.empty()) { r.error = terr; return false; }
+                    st.outs.push_back({s, ty, field(s + ".out", ty)});
+                }
+                st.iter = field("%rq.iter", "i32");
+                if ((int)carryFields.size() > kMaxCarry) {
+                    r.error = "the Proceed loops carry " + std::to_string(carryFields.size()) +
+                              " values between them; more than the " + std::to_string(kMaxCarry) +
+                              " the payload carries";
+                    return false;
+                }
+                // The guard: the Proceed before the loop, whose other edge
+                // skips it.
+                std::string pre;
+                const llm::Block* guard = nullptr;
+                for (const auto& p : x.proceeds)
+                    if (p.first->label != x.loop.latch) { guard = p.first; break; }
+                if (guard)
+                    for (const auto& s : guard->Successors()) {
+                        if (x.loop.body.count(s)) continue;
+                        const llm::Block* blk = fn.FindBlock(s);
+                        if (blk) {
+                            auto succ = blk->Successors();
+                            if (succ.size() == 1 && succ[0] == x.loop.header) { pre = s; break; }
+                        }
+                    }
+                if (!guard) {
+                    r.error = "Proceed loop carries state but has no guard Proceed";
+                    return false;
+                }
+                std::vector<std::string> others;
+                for (const auto& s : guard->Successors())
+                    if (!x.loop.body.count(s) && s != pre) others.push_back(s);
+                if (others.size() != 1) {
+                    r.error = "the guard Proceed has an unexpected shape";
+                    return false;
+                }
+                st.guardFalse = others[0];
+                for (const auto& i : lat->instrs) {
+                    if (!i.isPhi) continue;
+                    auto& mp = st.latchPhis[i.result];
+                    for (const auto& in : i.phiIncoming) mp[in.second] = Trim(in.first);
+                }
+                // The loop's exit block now follows the trace block.
+                const llm::Block* ex = fn.FindBlock(exitLabel);
+                const std::string tb = x.traceBlock->label;
+                const std::regex kLatchIn("\\" + x.loop.latch + "(\\s*\\])");
+                for (const auto& i : ex->instrs) {
+                    if (!i.isPhi || !std::regex_search(i.line, kLatchIn)) continue;
+                    if (tb.empty()) {
+                        r.error = "the Proceed loop exit has a phi and the trace is in the entry "
+                                  "block, which has no label to name";
+                        return false;
+                    }
+                    edits[i.index] = std::regex_replace(i.line, kLatchIn, tb + "$1");
+                }
+            }
+        }
+
+        if (x.track) {
+            if (!carryFields.count("%rq.oflags"))
+                carryFields.emplace("%rq.oflags", std::make_pair(std::string("i32"),
+                                                                 carryBase + (int)carryFields.size()));
+            if ((int)carryFields.size() > kMaxCarry) {
+                r.error = "the Proceed loops carry " + std::to_string(carryFields.size()) +
+                          " values between them; more than the " + std::to_string(kMaxCarry) +
+                          " the payload carries";
                 return false;
             }
         }
@@ -1223,19 +1530,15 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     const std::string name = sp == std::string::npos ? a : a.substr(sp + 1);
                     if (counters.count(name)) continue;
                 }
-                r.error = "Proceed loop body has a side effect (" + w->callee +
-                          ", opcode " + (op >= 0 ? std::to_string(op) : "?") +
-                          "); the any-hit shader it becomes runs a different "
-                          "number of times than the loop body does, and in an "
-                          "implementation-defined order, so the write would not "
-                          "be the same write";
-                return false;
-            }
-            if (!writes.empty() && !x.aborts.empty()) {
-                r.error = "Proceed loop body appends to a buffer and the query calls "
-                          "Abort(); this lowering lets traversal continue after an "
-                          "abort, so it would append records RayQuery would not";
-                return false;
+                // Any write, 0.67.0: see _check_loop_side_effects in lower.py.
+                if (x.NeedsIntersection()) {
+                    r.error = "Proceed loop body has a side effect (" + w->callee +
+                              ", opcode " + (op >= 0 ? std::to_string(op) : "?") +
+                              ") and becomes an intersection shader, which the spec lets "
+                              "run more than once per primitive, so the write could happen "
+                              "more than once";
+                    return false;
+                }
             }
             if (!writes.empty() && x.NeedsIntersection()) {
                 r.error = "Proceed loop body appends to a buffer and becomes an "
@@ -1271,9 +1574,15 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             { 9, "i32", 4 }, { 10, "i32", 4 },
         };
         for (const auto& f : init) {
-            const std::string zero =
+            std::string zero =
                 std::string(f.ty) == "float" ? "0.000000e+00"
                 : ((f.ty[0] == '<' || f.ty[0] == '[') ? "zeroinitializer" : "0");
+            if (f.idx == 0 && x.track) {
+                // CommittedRayT() is TMax until something is committed.
+                const std::string tmx = x.RayArgs()[8];
+                const std::string on = llm::OperandName(tmx);
+                zero = on.empty() ? tmx.substr(tmx.find_last_of(' ') + 1) : on;
+            }
             lines.push_back("  %" + x.pfx + ".pl" + std::to_string(f.idx) +
                             " = getelementptr inbounds " + kPayload + ", " + kPayload +
                             "* %" + x.pfx + ".pl, i32 0, i32 " + std::to_string(f.idx));
@@ -1301,11 +1610,55 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                                 f + ", align 4");
             }
         }
+        auto sit = states.find(&x);
+        const LoopState* st = sit == states.end() ? nullptr : &sit->second;
+        if (st) {
+            // Loop state (0.65.0): each header phi starts at its value from
+            // before the loop, and the iteration flag at 0.
+            for (const auto& p : st->phis) {
+                const std::string f = std::to_string(p.field);
+                lines.push_back("  %" + x.pfx + ".plc" + f + " = getelementptr inbounds " + kPayload + ", " +
+                                kPayload + "* %" + x.pfx + ".pl, i32 0, i32 " + f);
+                if (p.ty == "i1") {
+                    lines.push_back("  %" + x.pfx + ".plz" + f + " = zext i1 " + p.init + " to i32");
+                    lines.push_back("  store i32 %" + x.pfx + ".plz" + f + ", i32* %" + x.pfx + ".plc" + f + ", align 4");
+                } else {
+                    lines.push_back("  store " + p.ty + " " + p.init + ", " + p.ty + "* %" + x.pfx + ".plc" + f +
+                                    ", align 4");
+                }
+            }
+            const std::string f = std::to_string(st->iter);
+            lines.push_back("  %" + x.pfx + ".plc" + f + " = getelementptr inbounds " + kPayload + ", " +
+                            kPayload + "* %" + x.pfx + ".pl, i32 0, i32 " + f);
+            lines.push_back("  store i32 0, i32* %" + x.pfx + ".plc" + f + ", align 4");
+        }
         const auto ra = x.RayArgs();
         // The RayFlags operand, which may be a runtime value. The OR that
         // combines it with the template's flags has to land before the call.
-        const auto flags = x.FlagsOperand();
+        auto flags = x.FlagsOperand();
         if (!flags.first.empty()) lines.push_back(flags.first);
+        if (x.track) {
+            // The original flags go to the any-hit, which applies the opacity
+            // ones itself; the ray is traced forced non-opaque (0.66.0).
+            const std::string f = std::to_string(carryFields.at("%rq.oflags").second);
+            const std::string v = flags.second.substr(flags.second.find_last_of(' ') + 1);
+            lines.push_back("  %" + x.pfx + ".plc" + f + " = getelementptr inbounds " + kPayload + ", " +
+                            kPayload + "* %" + x.pfx + ".pl, i32 0, i32 " + f);
+            lines.push_back("  store i32 " + v + ", i32* %" + x.pfx + ".plc" + f + ", align 4");
+            static const std::regex kInt(R"(^-?\d+$)");
+            // DXR_TIER11_ABORT_POISON=1: an aborting query keeps its own flags,
+            // so opaque candidates skip the any-hit and traversal commits them
+            // after an Abort(), as before 0.67.0. The abort cases must diverge.
+            static const bool abortPoison = std::getenv("DXR_TIER11_ABORT_POISON") != nullptr;
+            if (abortPoison && !x.aborts.empty()) {
+            } else if (std::regex_match(v, kInt)) {
+                flags.second = "i32 " + std::to_string((int)(((unsigned)std::stoll(v) & ~0xC3u) | 2u));
+            } else {
+                lines.push_back("  %" + x.pfx + ".tf0 = and i32 " + v + ", -196");
+                lines.push_back("  %" + x.pfx + ".tf = or i32 %" + x.pfx + ".tf0, 2");
+                flags.second = "i32 %" + x.pfx + ".tf";
+            }
+        }
         std::ostringstream tr;
         tr << "  call void @dx.op.traceRay." << std::string(kPayload).substr(1)
            << "(i32 157, %dx.types.Handle " << x.AsHandle() << ", " << flags.second
@@ -1316,7 +1669,29 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
            << ", " << ra[7] << ", " << ra[8] << ", " << kPayload
            << "* nonnull %" + x.pfx + ".pl)  ; TraceRay(...)";
         lines.push_back(tr.str());
-        if (!exitLabel.empty()) lines.push_back("  br label " + exitLabel);
+        if (st) {
+            // What left the loop, as the last iteration stored it; then the
+            // guard's two ways on, by whether any iteration ran.
+            for (const auto& o : st->outs) {
+                const std::string f = std::to_string(o.field);
+                lines.push_back("  %" + x.pfx + ".plc" + f + " = getelementptr inbounds " + kPayload + ", " +
+                                kPayload + "* %" + x.pfx + ".pl, i32 0, i32 " + f);
+                if (o.ty == "i1") {
+                    lines.push_back("  %" + x.pfx + ".plv" + f + " = load i32, i32* %" + x.pfx + ".plc" + f +
+                                    ", align 4");
+                    lines.push_back("  " + o.name + " = icmp ne i32 %" + x.pfx + ".plv" + f + ", 0");
+                } else {
+                    lines.push_back("  " + o.name + " = load " + o.ty + ", " + o.ty + "* %" + x.pfx + ".plc" +
+                                    f + ", align 4");
+                }
+            }
+            lines.push_back("  %" + x.pfx + ".it = load i32, i32* %" + x.pfx + ".plc" + std::to_string(st->iter) +
+                            ", align 4");
+            lines.push_back("  %" + x.pfx + ".itc = icmp ne i32 %" + x.pfx + ".it, 0");
+            lines.push_back("  br i1 %" + x.pfx + ".itc, label " + exitLabel + ", label " + st->guardFalse);
+        } else if (!exitLabel.empty()) {
+            lines.push_back("  br label " + exitLabel);
+        }
         std::string joined;
         for (size_t i = 0; i < lines.size(); ++i) {
             if (i) joined += "\n";
@@ -1367,7 +1742,12 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         // for deletion and the body is re-emitted into the any-hit, where the
         // intrinsic IS legal. Overwriting that would resurrect it in the raygen
         // as well.
-        if (edits.count(i.index)) { x.rayFlagsInLoop = true; continue; }
+        if (edits.count(i.index)) {
+            // With `track` the any-hit reads the query's flags from the
+            // payload instead (0.66.0).
+            if (!x.track) x.rayFlagsInLoop = true;
+            continue;
+        }
         if (x.StaticFlags()) {
             edits[i.index] = "  " + i.result + " = add i32 " +
                              std::to_string(x.RayFlags()) + ", 0";
@@ -1383,6 +1763,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
     // --- committed accessors become payload reads ---------------------------
     for (const auto& c : x.committedOps) {
         const llm::Instr& i = *c.second;
+        if (x.hasLoop && x.loop.body.count(c.first->label)) continue;   // a generated shader's, 0.66.0
         const auto f = PayloadField(i.DxOp());
         if (!f) continue;
         if (i.DxOp() == kCommittedFrontFace) {
@@ -1445,6 +1826,9 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         ptype = ptype.substr(0, ptype.size() - 2);
         if (multi) ptype += ", i32";
         for (const auto& c : carry) ptype += c.ty == "i1" ? ", i32" : ", " + c.ty;
+        for (int n = kPayloadBytes + 4 * ((multi ? 1 : 0) + (int)carry.size());
+             n < PayloadBytesFor(multi, (int)carry.size()); n += 4)
+            ptype += ", i32";
         ptype += " }";
         decls.push_back(std::string(kPayload) + " = type " + ptype);
         decls.push_back(std::string(kAttrs) + " = type { <2 x float> }");
@@ -1470,7 +1854,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             // resource is; the RECORD bitcasts it back to the resource type.
             // Copied from DXC: `@CB = external constant %dx.types.Handle`.
             decls.push_back("@" + g.sym + " = external constant " +
-                            (binding ? std::string(kHandleType) : g.gty) +
+                            (binding ? BindingGty(g.gty, g.elem) : g.gty) +
                             ", align 4");
         }
         static const std::regex kAnchor(R"(%dx\.types\.Handle = type .*)");
@@ -1608,6 +1992,15 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         add.push_back("");
         add.push_back("; Function Attrs: noreturn nounwind");
         add.push_back("declare void @dx.op.ignoreHit(i32) #RQNR");
+        {
+            bool anyAbort = false;
+            for (const Query* qp : queries) anyAbort = anyAbort || (qp->hasLoop && !qp->aborts.empty());
+            if (anyAbort && (!q.NeedsIntersection() || q.NeedsBoth())) {
+                add.push_back("");
+                add.push_back("; Function Attrs: noreturn nounwind");
+                add.push_back("declare void @dx.op.acceptHitAndEndSearch(i32) #RQNR");
+            }
+        }
         if (binding) {
             // One overload serves every resource in the 6.6 form, because the
             // global is a handle whatever the resource is.
@@ -1753,6 +2146,13 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     // Nothing to do for Abort: returning has reported nothing,
                     // and there is no later invocation to gate.
                     if (op == kAbort) continue;
+                    if (op == kCommittedRayT) {
+                        // In an intersection shader RayTCurrent() IS the
+                        // committed t: the closest hit so far, or TMax (0.66.0).
+                        is.push_back("  " + i.result + " = call float @dx.op.rayTCurrent.f32(i32 154)"
+                                     "  ; RayTCurrent()");
+                        continue;
+                    }
                     if (RecordWord(op) >= 0) {
                         // The record answers, because nothing in the shader
                         // can. The local root signature bound this record's own
@@ -1840,6 +2240,11 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             // iteration, and correctness comes first.
             bool aborts = false;
             for (const Query* xp : loops) aborts = aborts || !xp->aborts.empty();
+            bool track = false;
+            for (const Query* xp : loops) track = track || xp->track;
+            auto entryOf = [](const Query* xp) {
+                return xp->track ? "%rq.e" + std::to_string(xp->qid) : xp->loop.header;
+            };
 
             std::vector<std::string> ah;
             ah.push_back("define void @" + e.anyhit + "(" + kPayload +
@@ -1849,6 +2254,10 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                          ", " + kAttrs + "* %attr, i32 0, i32 0");
             ah.push_back("  %rq.ab = load <2 x float>, <2 x float>* %rq.ap, align 4");
             for (const auto& c : carry) {
+                // Written by each iteration and read by the raygen.
+                if ((c.name.size() > 4 && c.name.compare(c.name.size() - 4, 4, ".out") == 0) ||
+                    c.name == "%rq.iter")
+                    continue;
                 const std::string f = std::to_string(c.field);
                 ah.push_back("  %rq.pac" + f + " = getelementptr inbounds " +
                              std::string(kPayload) + ", " + kPayload + "* %p, i32 0, i32 " + f);
@@ -1860,6 +2269,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                                  f + ", align 4");
                 }
             }
+
 
             // Recreate every resource handle the body uses, under the SAME SSA
             // name it had in the raygen, so the transplanted instructions need
@@ -1917,12 +2327,20 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     const std::string ns = std::to_string(n);
                     ah.push_back("  %rq.qc" + ns + " = icmp eq i32 %rq.qid, " +
                                  std::to_string(loops[n]->qid));
-                    ah.push_back("  br i1 %rq.qc" + ns + ", label " + loops[n]->loop.header +
+                    ah.push_back("  br i1 %rq.qc" + ns + ", label " + entryOf(loops[n]) +
                                  ", label %rq.qn" + ns);
                     ah.push_back("");
                     ah.push_back("rq.qn" + ns + ":");
                 }
-                ah.push_back("  br label " + loops[0]->loop.header);
+                ah.push_back("  br label " + entryOf(loops[0]));
+            }
+            for (const Query* xp : loops) {
+                if (!xp->track) continue;
+                if (multi) {
+                    ah.push_back("");
+                    ah.push_back("rq.e" + std::to_string(xp->qid) + ":");
+                }
+                for (const auto& l : Opacity(*xp, sm66)) ah.push_back(l);
             }
 
             for (const Query* xp : loops) {
@@ -1939,14 +2357,40 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     for (const auto& l : rest) order.push_back(l);
                 }
 
+                auto sit = states.find(&x);
+                LoopState* st = sit == states.end() ? nullptr : &sit->second;
+                // A phi in the body naming the header as a predecessor needs
+                // the header to be a block of its own (0.65.0).
+                bool named = x.track;
+                for (const auto& l : order) {
+                    if (l == x.loop.header) continue;
+                    const llm::Block* nb = fn.FindBlock(l);
+                    if (!nb) continue;
+                    for (const auto& i : nb->instrs)
+                        if (i.isPhi)
+                            for (const auto& in : i.phiIncoming)
+                                if (in.second == x.loop.header) named = true;
+                }
                 for (const auto& lbl : order) {
                     const llm::Block* b = fn.FindBlock(lbl);
                     if (!b) continue;
-                    if (multi || lbl != x.loop.header) {
+                    if (!multi && lbl == x.loop.header && named && !x.track)
+                        ah.push_back("  br label " + x.loop.header);
+                    if (multi || lbl != x.loop.header || named) {
                         ah.push_back("");
                         ah.push_back(lbl.substr(1) + ":");
                     }
+                    if (lbl == x.loop.header && st) {
+                        // An iteration ran: the body, not an opaque candidate
+                        // committed before it (0.66.0), and not an aborted one.
+                        const std::string f = std::to_string(st->iter);
+                        const std::string qn = std::to_string(x.qid);
+                        ah.push_back("  %rq.pit." + qn + " = getelementptr inbounds " + std::string(kPayload) +
+                                     ", " + kPayload + "* %p, i32 0, i32 " + f);
+                        ah.push_back("  store i32 1, i32* %rq.pit." + qn + ", align 4");
+                    }
                     for (const auto& i : b->instrs) {
+                        if (st && lbl == x.loop.header && i.isPhi) continue;   // loaded at entry
                         const int op = i.DxOp();
                         if (op == kCandidateType || op == kCommitNonOpaque ||
                             op == kCandidateProcNonOpaque) continue;
@@ -1966,6 +2410,15 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                                          "  ; HitKind()");
                             ah.push_back("  " + i.result + " = icmp eq i32 " + hk + ", " +
                                          std::to_string(kHitKindFront));
+                            continue;
+                        }
+                        if (x.track && PayloadField(op)) {
+                            for (const auto& l : CommittedRead(i)) ah.push_back(l);
+                            continue;
+                        }
+                        if (x.track && op == kRayFlags) {
+                            // The query's flags, as the raygen had them.
+                            ah.push_back("  " + i.result + " = add i32 %rq.oflags, 0");
                             continue;
                         }
                         if (RecordWord(op) >= 0) {
@@ -2002,15 +2455,23 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                                 line, std::regex(kv.first.substr(0, 1) == "%"
                                                  ? "\\" + kv.first + "\\b" : kv.first),
                                 kv.second);
-                        const std::string target =
+                        std::string target =
                             commitBlocks.count(lbl) ? "%rq.accept" : "%rq.reject";
-                        line = std::regex_replace(
-                            line, std::regex("label\\s+" + std::string("\\") + x.loop.latch +
-                                             "\\b"),
-                            "label " + target);
+                        const std::regex kToLatch("label\\s+" + std::string("\\") + x.loop.latch + "\\b");
+                        if (st && std::regex_search(line, kToLatch)) {
+                            // Through a tail that stores the state first.
+                            const std::string tail = "%rq.t" + std::to_string(x.qid) + "." + lbl.substr(1);
+                            const auto tp = std::make_pair(lbl, target);
+                            if (std::find(st->tails.begin(), st->tails.end(), tp) == st->tails.end())
+                                st->tails.push_back(tp);
+                            line = std::regex_replace(line, kToLatch, "label " + tail);
+                            target = tail;
+                        }
+                        line = std::regex_replace(line, kToLatch, "label " + target);
+                        const std::string tailPfx = "%rq.t" + std::to_string(x.qid) + ".";
                         for (const auto& s2 : Block_successors(line))
                             if (!x.loop.body.count(s2) && s2 != "%rq.accept" &&
-                                s2 != "%rq.reject") {
+                                s2 != "%rq.reject" && s2.rfind(tailPfx, 0) != 0) {
                                 r.error = "Proceed loop body branches to " + s2 +
                                           ", outside the loop; no lowering is defined "
                                           "for that";
@@ -2020,13 +2481,80 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     }
                 }
             }
+            // Per edge into the latch: the loop state as this iteration
+            // leaves it, then accept or reject as the edge did (0.65.0).
+            for (const Query* xp : loops) {
+                auto sit = states.find(xp);
+                if (sit == states.end()) continue;
+                const LoopState& st = sit->second;
+                const std::string qs = std::to_string(xp->qid);
+                for (const auto& tl : st.tails) {
+                    const std::string bl = tl.first.substr(1);
+                    ah.push_back("");
+                    ah.push_back("rq.t" + qs + "." + bl + ":");
+                    std::vector<std::tuple<int, std::string, std::string>> stores;
+                    for (const auto& p : st.phis) stores.emplace_back(p.field, p.ty, p.next);
+                    for (const auto& o : st.outs) stores.emplace_back(o.field, o.ty, o.name);
+                    // DXR_TIER11_STATE_POISON=1: no iteration stores its state, the
+                    // sensitivity check for rayquery_carryout (C++ only).
+                    static const bool statePoison = std::getenv("DXR_TIER11_STATE_POISON") != nullptr;
+                    if (statePoison) stores.clear();
+                    for (const auto& s : stores) {
+                        const std::string f = std::to_string(std::get<0>(s));
+                        const std::string& ty = std::get<1>(s);
+                        std::string v = std::get<2>(s);
+                        auto lp = st.latchPhis.find(v);
+                        if (lp != st.latchPhis.end()) {
+                            auto e2 = lp->second.find(tl.first);
+                            if (e2 != lp->second.end()) v = e2->second;
+                        }
+                        const std::string ptr = "%rq.s" + f + "." + qs + "." + bl;
+                        ah.push_back("  " + ptr + " = getelementptr inbounds " + std::string(kPayload) + ", " +
+                                     kPayload + "* %p, i32 0, i32 " + f);
+                        if (ty == "i1") {
+                            const std::string z = "%rq.z" + f + "." + qs + "." + bl;
+                            ah.push_back("  " + z + " = zext i1 " + v + " to i32");
+                            ah.push_back("  store i32 " + z + ", i32* " + ptr + ", align 4");
+                        } else {
+                            ah.push_back("  store " + ty + " " + v + ", " + ty + "* " + ptr + ", align 4");
+                        }
+                    }
+                    ah.push_back("  br label " + tl.second);
+                }
+            }
             ah.push_back("");
             ah.push_back("rq.accept:");
+            if (track) for (const auto& l : RecordCommit(q, sm66)) ah.push_back(l);
+            if (aborts) {
+                // Committed, then Abort(): this hit, and the search ends (0.67.0).
+                ah.push_back("  %rq.aa = load i32, i32* %rq.pab, align 4");
+                ah.push_back("  %rq.ac = icmp ne i32 %rq.aa, 0");
+                ah.push_back("  br i1 %rq.ac, label %rq.end, label %rq.ret");
+                ah.push_back("");
+                ah.push_back("rq.ret:");
+            }
             ah.push_back("  ret void");
             ah.push_back("");
             ah.push_back("rq.reject:");
+            bool abortTracked = false;
+            for (const Query* xp : loops) abortTracked = abortTracked || (!xp->aborts.empty() && xp->track);
+            if (aborts && !abortTracked) {
+                // A bare Abort() in a query that never reads committed state:
+                // ending the search commits a hit nothing reads (0.67.0).
+                ah.push_back("  %rq.ra = load i32, i32* %rq.pab, align 4");
+                ah.push_back("  %rq.rc = icmp ne i32 %rq.ra, 0");
+                ah.push_back("  br i1 %rq.rc, label %rq.end, label %rq.ign");
+                ah.push_back("");
+                ah.push_back("rq.ign:");
+            }
             ah.push_back("  call void @dx.op.ignoreHit(i32 155)  ; IgnoreHit()");
             ah.push_back("  unreachable");
+            if (aborts) {
+                ah.push_back("");
+                ah.push_back("rq.end:");
+                ah.push_back("  call void @dx.op.acceptHitAndEndSearch(i32 156)  ; AcceptHitAndEndSearch()");
+                ah.push_back("  unreachable");
+            }
             ah.push_back("}");
             std::string joined;
             for (size_t i = 0; i < ah.size(); ++i) {
@@ -2175,7 +2703,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 // `%CB* bitcast (%dx.types.Handle* @CB to %CB*)`, copied from
                 // DXC. The global holds a handle; the record still has to name
                 // the resource type, so it casts.
-                fields[1] = g.gty + "* bitcast (" + kHandleType + "* @" + g.sym +
+                fields[1] = g.gty + "* bitcast (" + BindingGty(g.gty, g.elem) + "* @" + g.sym +
                             " to " + g.gty + "*)";
             } else {
                 fields[1] = std::regex_replace(fields[1], std::regex(R"(\*\s+\S+$)"),
@@ -2327,7 +2855,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             if (payload) {
                 props.push_back("i32 6");
                 props.push_back("i32 " + std::to_string(
-                    kPayloadBytes + 4 * ((multi ? 1 : 0) + (int)carry.size())));
+                    PayloadBytesFor(multi, (int)carry.size())));
             }
             if (attrs) { props.push_back("i32 7"); props.push_back("i32 8"); }
             props.push_back("i32 5");
@@ -2397,7 +2925,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
 
     r.ok = true;
     r.text = out;
-    r.payloadBytes = kPayloadBytes + 4 * ((multi ? 1 : 0) + (int)carry.size());
+    r.payloadBytes = PayloadBytesFor(multi, (int)carry.size());
     r.carried = (int)carry.size();
     return r;
 }

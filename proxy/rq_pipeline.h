@@ -33,7 +33,15 @@
 
 namespace rq {
 // A hit group record's (geometryIndex, instanceContribution).
-using RecordPair = std::pair<uint32_t, uint32_t>;
+// A record's words: its geometry index, its instance contribution and, since
+// 0.66.0, whether it is opaque (for a query tracking committed state).
+struct RecordPair {
+    uint32_t first = 0, second = 0, third = 0;
+    bool operator==(const RecordPair& o) const {
+        return first == o.first && second == o.second && third == o.third;
+    }
+    bool operator!=(const RecordPair& o) const { return !(*this == o); }
+};
 }
 
 // Private IID, so a pipeline state can be recognised as ours through
@@ -100,6 +108,8 @@ public:
     // the acceleration structure tracker about. A shader that commits BOTH
     // kinds says true here as well: the slot it cannot serve is one holding
     // both kinds at once, whichever else it handles.
+    // The lowered query reads committed state inside its loop (0.66.0).
+    bool Tracks() const { return m_track; }
     bool CommitsProcedural() const { return m_servesProc; }
 
     // Where the lowered library's TraceRay calls take their scene from, read
@@ -243,6 +253,8 @@ private:
     // local root signature crashes the Pascal driver, see
     // phase5/cases/driver-crash/README.md.
     bool m_recordConstants = false;
+    // The lowered query reads committed state inside its loop (0.66.0).
+    bool m_track = false;
     gidx::Scenes m_scenes;
     ID3D12RootSignature* m_localRs = nullptr;   // owned; null without record data
     // What the current table's records point at, one pair per record.

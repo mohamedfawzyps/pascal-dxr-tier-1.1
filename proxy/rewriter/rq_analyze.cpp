@@ -242,7 +242,7 @@ std::string FindLoop(const llm::Function& fn, Query& q) {
     return "";
 }
 
-std::string RejectFunction(const llm::Function& fn, const Query& q) {
+std::string RejectFunction(const llm::Function& fn, Query& q) {
     for (const auto& b : fn.blocks) {
         for (const auto& i : b.instrs) {
             const int op = i.DxOp();
@@ -266,10 +266,32 @@ std::string RejectFunction(const llm::Function& fn, const Query& q) {
             const llm::Block* blk = fn.FindBlock(label);
             if (!blk) continue;
             for (const auto& i : blk->instrs)
-                if (IsCommittedOp(i.DxOp()))
-                    return "committed state is read inside the Proceed loop; the "
-                           "any-hit shader is a separate invocation and cannot see it";
+                if (IsCommittedOp(i.DxOp())) {
+                    q.committedInLoop = true;
+                    // An intersection shader has RayTCurrent(), which IS the
+                    // committed t, and no payload for the rest.
+                    if (!q.procCommits.empty() && i.DxOp() != kCommittedRayT)
+                        return "committed state other than CommittedRayT() is read inside a "
+                               "Proceed loop that becomes an intersection shader, which has no "
+                               "payload to read it from";
+                }
         }
+        // Committed state as it stands during traversal, 0.66.0: see
+        // _reject_function in rayquery.py.
+        if (q.committedInLoop && q.procCommits.empty() && !(q.RayFlags() & 1)) {
+            q.track = true;
+            q.needsRecordConstants = true;
+        }
+        // Abort(), exactly (0.67.0): see _reject_function in rayquery.py.
+        if (!q.aborts.empty() && !q.committedOps.empty() && q.procCommits.empty() &&
+            !(q.RayFlags() & 1)) {
+            q.track = true;
+            q.needsRecordConstants = true;
+        }
+        if (q.committedInLoop && !q.commits.empty() && !q.procCommits.empty())
+            return "committed state is read inside a Proceed loop that commits both kinds; "
+                   "a procedural commit is made in an intersection shader, which cannot "
+                   "record it in the payload";
     }
     return "";
 }

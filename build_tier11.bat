@@ -63,6 +63,14 @@ cl /nologo /EHsc /std:c++17 /O2 /W4 ^
    /link d3d12.lib dxgi.lib /INCREMENTAL:NO
 if errorlevel 1 exit /b 1
 
+rem Spec Tier 1.1 item 6: PIPELINE_CONFIG1 skip flags (0.64.0).
+cl /nologo /EHsc /std:c++17 /O2 /W4 ^
+   /I "%AGILITY%\build\native\include" /I "%DXC%\inc" ^
+   /Fo:"%OBJ%\\" ^
+   "%~dp0tier11\pflagtest.cpp" /Fe:"%~dp0pflagtest.exe" ^
+   /link d3d12.lib dxgi.lib /INCREMENTAL:NO
+if errorlevel 1 exit /b 1
+
 echo.
-echo Built gitest.exe, libsubprobe.exe, lrsprobe.exe, decodeprobe.exe and heapprobe.exe
+echo Built gitest.exe, libsubprobe.exe, lrsprobe.exe, decodeprobe.exe, heapprobe.exe and pflagtest.exe
 echo Run:  gitest.exe [--sm66] [layout ...]

@@ -71,6 +71,7 @@ _CALL = re.compile(r'\bcall\s+.*?@([\w.$"<>-]+|"[^"]+")\s*\((.*)\)\s*(?:#\d+)?'
                    r'(?:\s*,\s*![\w.$-]+\s+!\d+)*\s*$')
 _BR_COND = re.compile(r'^\s*br\s+i1\s+(\S+),\s*label\s+(%[\w.$-]+),\s*label\s+(%[\w.$-]+)')
 _BR_UNCOND = re.compile(r'^\s*br\s+label\s+(%[\w.$-]+)')
+_LABEL_USE = re.compile(r'label\s+(%[\w.$-]+)')
 _PHI_IN = re.compile(r'\[\s*([^,\]]+),\s*(%[\w.$-]+)\s*\]')
 
 
@@ -157,6 +158,18 @@ class Block(object):
         m = _BR_UNCOND.match(t.line)
         if m:
             return [m.group(1)]
+        # A switch spans lines: `switch i32 %x, label %default [`, one
+        # `i32 k, label %case` per case, then `]`. Until 0.65.0 its block had
+        # no successors, so what it reaches looked unreachable and a Proceed
+        # loop through one was not found.
+        for k in range(len(self.instrs) - 1, -1, -1):
+            if self.instrs[k].body.startswith('switch '):
+                out = []
+                for i in self.instrs[k:]:
+                    for lab in _LABEL_USE.findall(i.line):
+                        if lab not in out:
+                            out.append(lab)
+                return out
         return []
 
     def find(self, opcode):

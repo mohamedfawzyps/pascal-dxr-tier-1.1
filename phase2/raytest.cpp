@@ -398,6 +398,97 @@ static bool g_blasClone = false, g_tlasClone = false, g_deserialize = false;
 // top-level structure, whose instances only the driver's decode for tools
 // gives (0.61.0; until then not read, so refused).
 static bool g_tlasDeser = false;
+// --vformat N: the default scene's triangle stored as DXGI format N, one of
+// the vertex formats Tier 1.1 adds (spec item 7, 0.64.0): R16G16B16A16_UNORM
+// 11, R16G16_UNORM 35, R10G10B10A2_UNORM 24, R8G8B8A8_UNORM 28, R8G8_UNORM
+// 49, R8G8B8A8_SNORM 31, R8G8_SNORM 51; also any Tier 1.0 one. The triangle
+// is moved into [0, 1] so an UNORM format can hold it. --vstride S packs
+// the vertices S bytes apart (the spec's 3 and 6 byte strides).
+static DXGI_FORMAT g_vformat = DXGI_FORMAT_UNKNOWN;
+// With --geom (0.66.0): --opaquemix makes geometries 0 and 2 OPAQUE and 1 and
+// 3 not, so a query reading committed state inside its loop meets candidates
+// traversal commits by itself; --instflags F sets the instance flags (4 force
+// opaque, 8 force non-opaque); --stack adds a second instance of the same
+// structure in FRONT of the first, contribution 4 higher, so every ray meets
+// two candidates. --stackmix (0.67.0) is --stack with the BACK instance forced
+// opaque, so a ray meets a candidate of each kind (with --stack alone both
+// layers share one structure and so one opacity per quadrant).
+static bool g_opaqueMix = false;
+static UINT g_instFlags = 0;
+static bool g_stack = false;
+static bool g_stackMix = false;
+static UINT g_vstride = 0;
+
+// The three positions, encoded as `f`; the stride in *stride. Empty when the
+// format is not one this knows.
+static std::vector<uint8_t> EncodeVerts(const float* v, UINT n, DXGI_FORMAT f, UINT* stride) {
+    auto unorm = [](float x, int bits) { return (uint32_t)std::lround(x * (float)((1u << bits) - 1)); };
+    auto snorm = [](float x, int bits) {
+        return (uint32_t)(std::lround(x * (float)((1u << (bits - 1)) - 1)) & ((1u << bits) - 1));
+    };
+    auto half = [](float x) {
+        uint32_t b; std::memcpy(&b, &x, 4);
+        const uint32_t sgn = (b >> 16) & 0x8000u;
+        int e = (int)((b >> 23) & 0xFF) - 127 + 15;
+        uint32_t m = b & 0x7FFFFFu;
+        if ((b & 0x7FFFFFFFu) == 0) return (uint16_t)sgn;
+        if (e <= 0) return (uint16_t)sgn;   // no denormals needed here
+        return (uint16_t)(sgn | (e << 10) | ((m + 0x1000u) >> 13));
+    };
+    UINT elem = 0;
+    switch (f) {
+    case DXGI_FORMAT_R32G32B32_FLOAT: elem = 12; break;
+    case DXGI_FORMAT_R32G32_FLOAT: elem = 8; break;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_SNORM: elem = 8; break;
+    case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16_UNORM: case DXGI_FORMAT_R16G16_SNORM:
+    case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_SNORM: elem = 4; break;
+    case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_SNORM: elem = 2; break;
+    default: return {};
+    }
+    const UINT st = g_vstride ? g_vstride : elem;
+    *stride = st;
+    std::vector<uint8_t> out((size_t)st * (n - 1) + elem + 8, 0);
+    for (UINT i = 0; i < n; ++i) {
+        uint8_t* d = out.data() + (size_t)i * st;
+        const float x = v[3 * i], y = v[3 * i + 1], z = v[3 * i + 2];
+        switch (f) {
+        case DXGI_FORMAT_R32G32B32_FLOAT: std::memcpy(d, v + 3 * i, 12); break;
+        case DXGI_FORMAT_R32G32_FLOAT: std::memcpy(d, v + 3 * i, 8); break;
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16_FLOAT: {
+            const uint16_t h[3] = { half(x), half(y), half(z) };
+            std::memcpy(d, h, f == DXGI_FORMAT_R16G16_FLOAT ? 4 : 6);
+            break;
+        }
+        case DXGI_FORMAT_R16G16B16A16_UNORM: case DXGI_FORMAT_R16G16_UNORM: {
+            const uint16_t h[3] = { (uint16_t)unorm(x, 16), (uint16_t)unorm(y, 16), (uint16_t)unorm(z, 16) };
+            std::memcpy(d, h, f == DXGI_FORMAT_R16G16_UNORM ? 4 : 6);
+            break;
+        }
+        case DXGI_FORMAT_R16G16B16A16_SNORM: case DXGI_FORMAT_R16G16_SNORM: {
+            const uint16_t h[3] = { (uint16_t)snorm(x, 16), (uint16_t)snorm(y, 16), (uint16_t)snorm(z, 16) };
+            std::memcpy(d, h, f == DXGI_FORMAT_R16G16_SNORM ? 4 : 6);
+            break;
+        }
+        case DXGI_FORMAT_R10G10B10A2_UNORM: {
+            const uint32_t w = unorm(x, 10) | (unorm(y, 10) << 10) | (unorm(z, 10) << 20);
+            std::memcpy(d, &w, 4);
+            break;
+        }
+        case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8_UNORM:
+            d[0] = (uint8_t)unorm(x, 8); d[1] = (uint8_t)unorm(y, 8);
+            if (f == DXGI_FORMAT_R8G8B8A8_UNORM) d[2] = (uint8_t)unorm(z, 8);
+            break;
+        case DXGI_FORMAT_R8G8B8A8_SNORM: case DXGI_FORMAT_R8G8_SNORM:
+            d[0] = (uint8_t)snorm(x, 8); d[1] = (uint8_t)snorm(y, 8);
+            if (f == DXGI_FORMAT_R8G8B8A8_SNORM) d[2] = (uint8_t)snorm(z, 8);
+            break;
+        default: break;
+        }
+    }
+    return out;
+}
 // With --geom: a second instance whose AccelerationStructure is NULL, as
 // Unreal writes a culled instance. The spec calls it legal but inactive,
 // discarded at build: it reaches no record and nothing is refused for it.
@@ -900,8 +991,8 @@ static Scene BuildSceneGeom(Gpu& g, bool opaque) {
     D3D12_RAYTRACING_GEOMETRY_DESC geo[4]{};
     for (int q = 0; q < 4; ++q) {
         geo[q].Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-        geo[q].Flags = opaque ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE
-                              : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+        geo[q].Flags = opaque || (g_opaqueMix && (q % 2) == 0) ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE
+                                                                : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
         geo[q].Triangles.VertexBuffer.StartAddress =
             s.vb->GetGPUVirtualAddress() + q * 6 * sizeof(float) * 3;
         geo[q].Triangles.VertexBuffer.StrideInBytes = sizeof(float) * 3;
@@ -940,9 +1031,17 @@ static Scene BuildSceneGeom(Gpu& g, bool opaque) {
     inst.InstanceMask = 0xFF;
     if (g_contrib) inst.InstanceContributionToHitGroupIndex = 2;
     inst.AccelerationStructure = s.blas->GetGPUVirtualAddress();
+    inst.Flags = g_instFlags;
     D3D12_RAYTRACING_INSTANCE_DESC insts[2] = { inst, inst };
     insts[1].AccelerationStructure = 0;
     insts[1].InstanceContributionToHitGroupIndex = 7;
+    if (g_stack) {
+        // The same structure 0.5 nearer the camera, its own four records.
+        insts[1] = inst;
+        insts[1].Transform[2][3] = 0.5f;
+        insts[1].InstanceContributionToHitGroupIndex = inst.InstanceContributionToHitGroupIndex + 4;
+        if (g_stackMix) insts[0].Flags |= D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
+    }
     if (g_overlap) {
         for (int i = 0; i < 2; ++i) {
             insts[i] = inst;
@@ -951,7 +1050,7 @@ static Scene BuildSceneGeom(Gpu& g, bool opaque) {
         }
         insts[1].InstanceContributionToHitGroupIndex = inst.InstanceContributionToHitGroupIndex + 1;
     }
-    const UINT numInst = g_nullInst || g_overlap ? 2 : 1;
+    const UINT numInst = g_nullInst || g_overlap || g_stack ? 2 : 1;
     auto instBuf = CreateBuffer(g.device.Get(), sizeof(insts), D3D12_HEAP_TYPE_UPLOAD,
         D3D12_RESOURCE_STATE_GENERIC_READ);
     HR(instBuf->Map(0, &none, &p), "map inst"); std::memcpy(p, insts, sizeof(insts));
@@ -1116,16 +1215,32 @@ static void MoveTlas(Gpu& g, Scene& s) {
 
 static Scene BuildScene(Gpu& g, bool opaque) {
     Scene s;
-    // One triangle at z=0.
-    const float verts[9] = {
+    // One triangle at z=0; with --vformat inside [0, 1] and at z = 0.25, so
+    // an UNORM format can hold it and a third component that is read (or
+    // wrongly assumed 0) shows.
+    float verts[9] = {
         0.0f,  1.0f, 0.0f,
         1.0f, -1.0f, 0.0f,
        -1.0f, -1.0f, 0.0f,
     };
-    s.vb = CreateBuffer(g.device.Get(), sizeof(verts), D3D12_HEAP_TYPE_UPLOAD,
+    std::vector<uint8_t> enc;
+    UINT vstride = sizeof(float) * 3;
+    if (g_vformat != DXGI_FORMAT_UNKNOWN) {
+        const bool two = g_vformat == DXGI_FORMAT_R32G32_FLOAT || g_vformat == DXGI_FORMAT_R16G16_FLOAT ||
+                         g_vformat == DXGI_FORMAT_R16G16_UNORM || g_vformat == DXGI_FORMAT_R16G16_SNORM ||
+                         g_vformat == DXGI_FORMAT_R8G8_UNORM || g_vformat == DXGI_FORMAT_R8G8_SNORM;
+        const float z = two ? 0.0f : 0.25f;
+        const float in01[9] = { 0.5f, 0.9f, z, 0.9f, 0.1f, z, 0.1f, 0.1f, z };
+        std::memcpy(verts, in01, sizeof(verts));
+        enc = EncodeVerts(verts, 3, g_vformat, &vstride);
+        if (enc.empty()) { std::printf("--vformat %d: not a vertex format this knows\n", (int)g_vformat); std::exit(2); }
+    } else {
+        enc.assign(reinterpret_cast<const uint8_t*>(verts), reinterpret_cast<const uint8_t*>(verts) + sizeof(verts));
+    }
+    s.vb = CreateBuffer(g.device.Get(), enc.size(), D3D12_HEAP_TYPE_UPLOAD,
         D3D12_RESOURCE_STATE_GENERIC_READ);
     void* p = nullptr; D3D12_RANGE none{ 0, 0 };
-    HR(s.vb->Map(0, &none, &p), "map vb"); std::memcpy(p, verts, sizeof(verts));
+    HR(s.vb->Map(0, &none, &p), "map vb"); std::memcpy(p, enc.data(), enc.size());
     s.vb->Unmap(0, nullptr);
 
     // BLAS
@@ -1134,9 +1249,9 @@ static Scene BuildScene(Gpu& g, bool opaque) {
     geo.Flags = opaque ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE
                        : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
     geo.Triangles.VertexBuffer.StartAddress = s.vb->GetGPUVirtualAddress();
-    geo.Triangles.VertexBuffer.StrideInBytes = sizeof(float) * 3;
+    geo.Triangles.VertexBuffer.StrideInBytes = vstride;
     geo.Triangles.VertexCount = 3;
-    geo.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+    geo.Triangles.VertexFormat = g_vformat != DXGI_FORMAT_UNKNOWN ? g_vformat : DXGI_FORMAT_R32G32B32_FLOAT;
     geo.Triangles.IndexFormat = DXGI_FORMAT_UNKNOWN;
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS bi{};
     bi.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
@@ -2154,6 +2269,28 @@ int main(int argc, char** argv) {
                 g_nullInst = true;
                 for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
                 --argc; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--opaquemix") == 0 || std::strcmp(argv[i], "--stack") == 0 ||
+                std::strcmp(argv[i], "--stackmix") == 0) {
+                if (argv[i][2] == 'o') g_opaqueMix = true;
+                else { g_stack = true; if (argv[i][7] == 'm') g_stackMix = true; }
+                for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+                --argc; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--instflags") == 0 && i + 1 < argc) {
+                g_instFlags = (UINT)std::strtoul(argv[i + 1], nullptr, 0);
+                for (int j = i; j + 2 < argc; ++j) argv[j] = argv[j + 2];
+                argc -= 2; --i;
+                continue;
+            }
+            if ((std::strcmp(argv[i], "--vformat") == 0 || std::strcmp(argv[i], "--vstride") == 0) &&
+                i + 1 < argc) {
+                if (argv[i][3] == 'f') g_vformat = (DXGI_FORMAT)std::atoi(argv[i + 1]);
+                else g_vstride = (UINT)std::atoi(argv[i + 1]);
+                for (int j = i; j + 2 < argc; ++j) argv[j] = argv[j + 2];
+                argc -= 2; --i;
                 continue;
             }
             if (std::strcmp(argv[i], "--tlasdeser") == 0) {

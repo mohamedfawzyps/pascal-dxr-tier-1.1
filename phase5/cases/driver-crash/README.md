@@ -144,3 +144,34 @@ The record constants are baked into one copy of the hit shaders per
 Measured in one session, cache cleared before every trial. Across the fifteen
 Unreal libraries from one Escher run that read record constants, baked: 0 of
 225. One of them baked with 27 pairs, what Escher's scene asked for: 0 of 15.
+
+## 0.67.0: a payload of exactly 124 bytes
+
+A second, unrelated driver crash, found when `rayquery_abortstack.hlsl` first
+ran on the 1070. An any-hit that reads the LAST dword of a payload of exactly
+124 bytes access-violates inside `CreateStateObject`, every time. WARP builds
+the same library.
+
+    phase5out\sotest.exe abortstack_066.out.dxil abortstack_066.rs.bin hw
+
+`abortstack_066` is the library 0.67.0 generated before the fix. `pay124` is
+it with the any-hit cut down to: read the last field (byte 120), then accept
+or reject. `pay128` is the same read with one unused field appended, the
+payload declared 128; `pay120` is the same read with the payload shrunk to 120.
+
+    abortstack_066   124 bytes                          3 of 3 crash
+    pay124           124 bytes, last field read          3 of 3 crash
+    pay128           128 bytes, same field read          0 of 3
+    pay120           120 bytes, last field read          0 of 3
+
+Swept: reading the last field of a payload of 80 to 260 bytes, in steps of 4,
+crashes at 124 only. In a 124 byte payload, reading the field at 116 instead
+builds. Declaring a larger `MaxPayloadSizeInBytes` (128, 132, 256) does not
+help: it is the payload type's size. Not cache related: the result is the
+same every run.
+
+`pay128` BUILDS, but a 128 byte payload REMOVES THE DEVICE when dispatched:
+`rayquery_carry128.hlsl` (128 bytes by itself) and `abortstack` padded to 128
+both did, every run, in the dispatch path. 120, and 132 to 156, run and
+match WARP. So the lowering never emits 124 or 128: both get unused fields up
+to 132 (`_payload_pad` in `lower.py`, `PayloadBytesFor` in `rq_lower.cpp`).

@@ -210,6 +210,10 @@ class Query(object):
         # only then may it be declared, since an unused declare is itself a
         # validation error.
         self.rayflags_in_loop = False
+        # Committed state read inside the Proceed loop (0.66.0). With `track`
+        # the any-hit keeps it in the payload as it changes; see lower.py.
+        self.committed_in_loop = False
+        self.track = False
         # Several queries in one entry point, 0.43.0: the first is returned and
         # carries the rest here. Each names its raygen values with its own
         # prefix, so two traces never define the same %name; the first keeps
@@ -506,7 +510,35 @@ def _reject_function(fn, q):
             blk = fn.block(label)
             for instr in blk.instrs:
                 if instr.dxop in COMMITTED_OPS:
-                    raise Unsupported(
-                        'committed state is read inside the Proceed loop; the '
-                        'any-hit shader is a separate invocation and cannot '
-                        'see it')
+                    q.committed_in_loop = True
+                    # An intersection shader has RayTCurrent(), which IS the
+                    # committed t, and no payload for the rest.
+                    if q.needs_intersection and instr.dxop != COMMITTED_RAY_T:
+                        raise Unsupported(
+                            'committed state other than CommittedRayT() is read '
+                            'inside a Proceed loop that becomes an intersection '
+                            'shader, which has no payload to read it from')
+        # Committed state as it stands during traversal, 0.66.0: the any-hit
+        # keeps it in the payload, and since an OPAQUE candidate would be
+        # committed without reaching an any-hit, the ray is traced forced
+        # non-opaque and the any-hit applies the original flags itself, with
+        # each record saying whether its geometry is opaque. A query forced
+        # opaque never runs its loop, so has nothing to track.
+        if q.committed_in_loop and not q.needs_intersection and not (q.ray_flags & 1):
+            q.track = True
+            q.needs_record_constants = True
+        # Abort(), exactly (0.67.0). Traversal carries on after it, so an
+        # OPAQUE candidate met later would be committed by traversal itself,
+        # which RayQuery never does. That matters only where committed state
+        # is read; there the query is tracked, so every candidate reaches the
+        # any-hit, which rejects them all once aborted. Where it is not read,
+        # the any-hit ends the search instead (lower.py).
+        if (q.aborts and q.committed_ops and not q.needs_intersection
+                and not (q.ray_flags & 1)):
+            q.track = True
+            q.needs_record_constants = True
+        if q.committed_in_loop and q.needs_both:
+            raise Unsupported(
+                'committed state is read inside a Proceed loop that commits both '
+                'kinds; a procedural commit is made in an intersection shader, '
+                'which cannot record it in the payload')

@@ -123,6 +123,15 @@ def _record_read(tag, word, result, sm66=False):
             '  %%rq.cbh%s = call %%dx.types.Handle @%s(i32 160, %s %%rq.cbv%s)'
             '  ; CreateHandleForLib(Resource)' % (tag, RECORD_HANDLE_FN, RECORD_TYPE, tag),
         ]
+    if word == 2:
+        # The record's third word, whether its geometry is opaque (0.66.0).
+        return handle + [
+            '  %%rq.cbr%s = call %s @dx.op.rawBufferLoad.i32(i32 139, '
+            '%%dx.types.Handle %%rq.cbh%s, i32 8, i32 undef, i8 1, i32 4)'
+            '  ; RawBufferLoad(srv,index,elementOffset,mask,alignment)'
+            % (tag, RESRET, tag),
+            '  %s = extractvalue %s %%rq.cbr%s, 0' % (result, RESRET, tag),
+        ]
     return handle + [
         '  %%rq.cbr%s = call %s @dx.op.rawBufferLoad.i32(i32 139, '
         '%%dx.types.Handle %%rq.cbh%s, i32 0, i32 undef, i8 3, i32 4)'
@@ -471,6 +480,16 @@ def _plan_globals(table):
     return g
 
 
+def _binding_gty(gty, elem):
+    """The global a Shader Model 6.6 binding lowers to: a handle, or for a
+    resource ARRAY an array of handles, `[4 x %dx.types.Handle]` (read off DXC,
+    phase5/cases/reference/lib_sm66_dynarray_ref.hlsl)."""
+    m = re.match(r'^\[(\d+) x ', gty)
+    if gty != elem and m:
+        return '[%s x %s]' % (m.group(1), HANDLE_TYPE)
+    return HANDLE_TYPE
+
+
 def _handle_text(instr, table, globals_, binds=None):
     """The load + createHandleForLib that replaces one handle creation.
 
@@ -488,25 +507,46 @@ def _handle_text(instr, table, globals_, binds=None):
             raise LowerError(
                 'createHandleFromBinding names class %d space %d register %d, '
                 'which !dx.resources does not describe' % (cls, space, lower))
-        sym, _, _, _ = globals_[(cls, nid)]
-        idx = re.match(r'i32\s+(\d+)$', instr.args[2].strip())
-        if not idx:
-            # The 6.5 path DOES support this, through a getelementptr on the
-            # array global. The 6.6 form is refused only because the shape of
-            # an ARRAY global in the binding form has not been measured off
-            # DXC, and guessing it is how a lowering goes silently wrong.
-            # phase5/cases/reference/ is where that question gets answered.
-            raise rq.Unsupported(
-                'resource handle %s comes from an array binding indexed '
-                'dynamically (%s); the Shader Model 6.6 form of that has not '
-                'been measured, and the 6.5 form is what this lowers'
-                % (instr.result, instr.args[2].strip()))
+        sym, gty, elem, _ = globals_[(cls, nid)]
+        a2 = instr.args[2].strip()
+        idx = re.match(r'i32\s+(-?\d+)$', a2)
         raw = '%%rq.raw.%s' % instr.result[1:]
-        return (
-            '  {raw} = load {h}, {h}* @{sym}, align 4\n'
+        pre = ''
+        if gty == elem:
+            if not idx:
+                raise LowerError('createHandleFromBinding indexes a resource that '
+                                 'is not an array (%s)' % a2)
+            src = '%s* @%s' % (HANDLE_TYPE, sym)
+        else:
+            # A resource ARRAY (0.65.0; until then refused dynamically and,
+            # indexed by a constant, silently bound its first element). The
+            # binding's index is the REGISTER, the array's element is that
+            # less the range's lower bound; read off DXC,
+            # phase5/cases/reference/lib_sm66_dynarray_ref.hlsl.
+            arr = _binding_gty(gty, elem)
+            if idx:
+                src = ('{h}* getelementptr inbounds ({arr}, {arr}* @{sym}, i32 0, '
+                       'i32 {i})').format(h=HANDLE_TYPE, arr=arr, sym=sym,
+                                          i=int(idx.group(1)) - lower)
+            else:
+                ix = a2
+                if lower:
+                    sub = '%%rq.ix.%s' % instr.result[1:]
+                    pre += '  %s = sub i32 %s, %d\n' % (sub, a2.split()[-1], lower)
+                    ix = 'i32 ' + sub
+                nonuni = (len(instr.args) > 3 and
+                          instr.args[3].strip() not in ('i1 false', 'i1 0'))
+                gep = '%%rq.gep.%s' % instr.result[1:]
+                pre += ('  {gep} = getelementptr inbounds {arr}, {arr}* @{sym}, '
+                        'i32 0, {ix}{tag}\n').format(
+                            gep=gep, arr=arr, sym=sym, ix=ix,
+                            tag=', !dx.nonuniform !RQNU' if nonuni else '')
+                src = '%s* %s' % (HANDLE_TYPE, gep)
+        return pre + (
+            '  {raw} = load {h}, {src}, align 4\n'
             '  {res} = call {h} @dx.op.createHandleForLib.dx.types.Handle'
             '(i32 160, {h} {raw})  ; CreateHandleForLib(Resource)'
-        ).format(raw=raw, h=HANDLE_TYPE, sym=sym, res=instr.result)
+        ).format(raw=raw, h=HANDLE_TYPE, src=src, res=instr.result)
 
     cls = int(re.match(r'i8\s+(\d+)', instr.args[1].strip()).group(1))
     rid = int(re.match(r'i32\s+(\d+)', instr.args[2].strip()).group(1))
@@ -689,13 +729,25 @@ def _edit_query(module, q, edits, exports, fields, base, multi=False):
 
     ra = q.ray_args
     exit_label = None
+    q.state = None
     if q.loop:
         header, latch, body = q.loop
         exit_label = _loop_exit(fn, header, latch, body)
-        outside = _check_loop_isolated(fn, q, header, latch, body,
-                                       _type_names(module.text))
+        outside, escapes = _check_loop_isolated(fn, q, header, latch, body,
+                                                _type_names(module.text))
         q.carry = _plan_carry(fn, q, outside, fields, base)
+        q.state = _plan_state(fn, q, header, latch, body, escapes, fields, base)
+        q.carry_fields_ref = fields
+        if q.track:
+            if '%rq.oflags' not in fields:
+                fields['%rq.oflags'] = ('i32', base + len(fields))
+            if len(fields) > MAX_CARRY:
+                raise rq.Unsupported(
+                    'the Proceed loops carry %d values between them; more than the %d '
+                    'the payload carries' % (len(fields), MAX_CARRY))
         _check_loop_side_effects(module, fn, q, body)
+        if q.state:
+            _edit_exit_phis(fn, q, exit_label, latch, edits)
 
     edits[q.trace.index] = _trace_block(q, ra, exit_label, multi)
 
@@ -747,6 +799,9 @@ def _trace_block(q, ra, exit_label, multi=False):
                            (9, 'i32', 4), (10, 'i32', 4)]:
         zero = '0.000000e+00' if ty == 'float' else (
             'zeroinitializer' if (ty.startswith('<') or ty.startswith('[')) else '0')
+        if idx == 0 and q.track:
+            # CommittedRayT() is TMax until something is committed.
+            zero = rq_operand(ra['tmax'])
         lines.append('  %%%s.pl%d = getelementptr inbounds %s, %s* %%%s.pl, i32 0, i32 %d'
                      % (q.pfx, idx, PAYLOAD, PAYLOAD, q.pfx, idx))
         lines.append('  store %s %s, %s* %%%s.pl%d, align %d'
@@ -766,7 +821,39 @@ def _trace_block(q, ra, exit_label, multi=False):
         else:
             lines.append('  store %s %s, %s* %%%s.plc%d, align 4'
                          % (ty, name, ty, q.pfx, field))
+    st = q.state
+    if st:
+        # Loop state (0.65.0): each header phi starts at its value from before
+        # the loop, and the iteration flag at 0.
+        for name, ty, field, init, _latch in st['phis']:
+            lines.append('  %%%s.plc%d = getelementptr inbounds %s, %s* %%%s.pl, i32 0, i32 %d'
+                         % (q.pfx, field, PAYLOAD, PAYLOAD, q.pfx, field))
+            if ty == 'i1':
+                lines.append('  %%%s.plz%d = zext i1 %s to i32' % (q.pfx, field, init))
+                lines.append('  store i32 %%%s.plz%d, i32* %%%s.plc%d, align 4'
+                             % (q.pfx, field, q.pfx, field))
+            else:
+                lines.append('  store %s %s, %s* %%%s.plc%d, align 4'
+                             % (ty, init, ty, q.pfx, field))
+        lines.append('  %%%s.plc%d = getelementptr inbounds %s, %s* %%%s.pl, i32 0, i32 %d'
+                     % (q.pfx, st['iter'], PAYLOAD, PAYLOAD, q.pfx, st['iter']))
+        lines.append('  store i32 0, i32* %%%s.plc%d, align 4' % (q.pfx, st['iter']))
     lines += flag_setup
+    if q.track:
+        # The original flags go to the any-hit, which applies the opacity
+        # ones itself; the ray is traced forced non-opaque, without them, so
+        # every triangle candidate reaches it (0.66.0).
+        f = q.carry_fields_ref['%rq.oflags'][1]
+        v = flag_text.split()[-1]
+        lines.append('  %%%s.plc%d = getelementptr inbounds %s, %s* %%%s.pl, i32 0, i32 %d'
+                     % (q.pfx, f, PAYLOAD, PAYLOAD, q.pfx, f))
+        lines.append('  store i32 %s, i32* %%%s.plc%d, align 4' % (v, q.pfx, f))
+        if re.match(r'^-?\d+$', v):
+            flag_text = 'i32 %d' % ((int(v) & ~0xC3) | 2)
+        else:
+            lines.append('  %%%s.tf0 = and i32 %s, -196' % (q.pfx, v))
+            lines.append('  %%%s.tf = or i32 %%%s.tf0, 2' % (q.pfx, q.pfx))
+            flag_text = 'i32 %%%s.tf' % q.pfx
     lines += [
         '  call void @dx.op.traceRay.%s(i32 157, %%dx.types.Handle %s, %s, '
         '%s, i32 0, i32 %d, i32 0, %s, %s, %s, %s, %s, %s, %s, %s, %s* nonnull %%%s.pl)'
@@ -776,7 +863,26 @@ def _trace_block(q, ra, exit_label, multi=False):
             ra['direction'][0], ra['direction'][1], ra['direction'][2], ra['tmax'],
             PAYLOAD, q.pfx),
     ]
-    if exit_label:
+    if st:
+        # What left the loop, as the last iteration stored it; then the
+        # guard's two ways on, by whether any iteration ran. With none, the
+        # original took the guard's other edge, so this does too.
+        for name, ty, field in st['outs']:
+            lines.append('  %%%s.plc%d = getelementptr inbounds %s, %s* %%%s.pl, i32 0, i32 %d'
+                         % (q.pfx, field, PAYLOAD, PAYLOAD, q.pfx, field))
+            if ty == 'i1':
+                lines.append('  %%%s.plv%d = load i32, i32* %%%s.plc%d, align 4'
+                             % (q.pfx, field, q.pfx, field))
+                lines.append('  %s = icmp ne i32 %%%s.plv%d, 0' % (name, q.pfx, field))
+            else:
+                lines.append('  %s = load %s, %s* %%%s.plc%d, align 4'
+                             % (name, ty, ty, q.pfx, field))
+        lines.append('  %%%s.it = load i32, i32* %%%s.plc%d, align 4'
+                     % (q.pfx, q.pfx, st['iter']))
+        lines.append('  %%%s.itc = icmp ne i32 %%%s.it, 0' % (q.pfx, q.pfx))
+        lines.append('  br i1 %%%s.itc, label %s, label %s'
+                     % (q.pfx, exit_label, st['guard_false']))
+    elif exit_label:
         lines.append('  br label %s' % exit_label)
     return '\n'.join(lines)
 
@@ -1097,23 +1203,24 @@ def _check_loop_side_effects(module, fn, q, body):
             writes.append(i)
             if i.dxop == BUFFER_UPDATE_COUNTER and i.result:
                 counters.add(i.result)
+    # Any write, 0.67.0. An any-hit runs once per candidate RayQuery would
+    # yield (NO_DUPLICATE_ANYHIT_INVOCATION on every geometry, set by the
+    # proxy), not at all after an Abort() (its flag is checked first), and in
+    # an order that is implementation-defined for RayQuery too: the same
+    # writes. An intersection shader the spec lets run more than once per
+    # primitive, so there a write could happen twice.
     for i in writes:
         if i.dxop == BUFFER_UPDATE_COUNTER:
             continue
         if (i.dxop in APPEND_STORES and len(i.args) > 2
                 and i.args[2].split()[-1] in counters):
             continue
-        raise rq.Unsupported(
-            'Proceed loop body has a side effect (%s, opcode %s); the '
-            'any-hit shader it becomes runs a different number of times '
-            'than the loop body does, and in an implementation-defined '
-            'order, so the write would not be the same write'
-            % (i.callee, i.dxop if i.dxop is not None else '?'))
-    if writes and q.aborts:
-        raise rq.Unsupported(
-            'Proceed loop body appends to a buffer and the query calls Abort(); '
-            'this lowering lets traversal continue after an abort, so it would '
-            'append records RayQuery would not')
+        if q.needs_intersection:
+            raise rq.Unsupported(
+                'Proceed loop body has a side effect (%s, opcode %s) and becomes '
+                'an intersection shader, which the spec lets run more than once '
+                'per primitive, so the write could happen more than once'
+                % (i.callee, i.dxop if i.dxop is not None else '?'))
     if writes and q.needs_intersection:
         raise rq.Unsupported(
             'Proceed loop body appends to a buffer and becomes an intersection '
@@ -1131,6 +1238,11 @@ def _check_loop_isolated(fn, q, header, latch, body, types):
         for i in blk.instrs:
             if i.result:
                 defined.add(i.result)
+            # A header phi is loop STATE (0.65.0): its start is stored by the
+            # raygen and its next value by each iteration, so what it reads
+            # is not read by the any-hit.
+            if label == header and i.is_phi:
+                continue
             used.update(_operands(i, types))
 
     # A resource handle read inside the loop is NOT caller state. It names a
@@ -1154,15 +1266,107 @@ def _check_loop_isolated(fn, q, header, latch, body, types):
                 % (i.result, _dynamic_index(i)))
     outside = sorted(u for u in used
                      if u not in defined and u != q.handle and u not in handles)
+    # A value the loop defines and code after it reads leaves through the
+    # payload (0.65.0; until then refused).
+    escapes = []
     for b, i in fn.instrs():
         if b.label in body:
             continue
         for u in _operands(i, types):
-            if u in defined:
-                raise rq.Unsupported(
-                    'value %s defined in the Proceed loop is used after it; '
-                    'the any-hit shader cannot return it' % u)
-    return outside
+            if u in defined and u not in escapes:
+                escapes.append(u)
+    return outside, escapes
+
+
+def _plan_state(fn, q, header, latch, body, escapes, fields, base):
+    """The loop's state and what leaves it, in the payload (0.65.0).
+
+    An any-hit invocation is one iteration of the Proceed loop, and the spec
+    keeps an any-hit's payload writes even when it ignores its hit ("Any
+    modifications made to the ray payload up to this point in the any hit
+    shader are preserved"). So a header phi is a field: the raygen stores its
+    start, each iteration loads it at entry and stores its next value on the
+    way out. A value leaving the loop is a field each iteration stores and the
+    raygen loads after TraceRay. A flag says whether any iteration ran, which
+    picks the guard's edge the original would have taken.
+
+    None when the loop carries nothing."""
+    hdr = fn.block(header)
+    phis = [i for i in hdr.instrs if i.is_phi]
+    if not phis and not escapes:
+        return None
+    if q.needs_intersection:
+        raise rq.Unsupported(
+            'Proceed loop carries state across candidates or out of the loop (%s) '
+            'and becomes an intersection shader, which has no payload to carry it in'
+            % ', '.join([i.result for i in phis] + escapes))
+    defs = {i.result: (b, i) for b, i in fn.instrs() if i.result}
+    lat = fn.block(latch)
+    for i in lat.instrs:
+        if not i.is_phi and i.dxop != rq.PROCEED and not i.body.startswith('br '):
+            raise rq.Unsupported(
+                'the Proceed loop latch computes %s itself; the any-hit shader has '
+                'no latch to compute it in' % (i.result or i.body[:40]))
+
+    def typed(name):
+        ty = _result_type(defs[name][1]) if name in defs else None
+        if ty not in _CARRY_TYPES:
+            raise rq.Unsupported(
+                'Proceed loop state %s is of type %s; the payload carries i32, float '
+                'and i1' % (name, ty))
+        return ty
+
+    def field(key, ty):
+        if key not in fields:
+            fields[key] = (ty, base + len(fields))
+        return fields[key][1]
+
+    st = {'phis': [], 'outs': [], 'iter': None, 'guard_false': None}
+    for p in phis:
+        ty = typed(p.result)
+        inits = [v for v, b in p.phi_incoming if b != latch]
+        nexts = [v for v, b in p.phi_incoming if b == latch]
+        if len(inits) != 1 or len(nexts) != 1:
+            raise rq.Unsupported('Proceed loop header phi %s has an unexpected shape'
+                                 % p.result)
+        st['phis'].append((p.result, ty, field(p.result, ty), inits[0].strip(),
+                           nexts[0].strip()))
+    for e in escapes:
+        ty = typed(e)
+        st['outs'].append((e, ty, field(e + '.out', ty)))
+    st['iter'] = field('%rq.iter', 'i32')
+    if len(fields) > MAX_CARRY:
+        raise rq.Unsupported(
+            'the Proceed loops carry %d values between them; more than the %d the '
+            'payload carries' % (len(fields), MAX_CARRY))
+    # The guard: the Proceed before the loop, whose other edge skips it.
+    pre = _preheader(fn, q, header, body)
+    guard = [b for b, _ in q.proceeds if b.label != latch]
+    if not guard:
+        raise rq.Unsupported('Proceed loop carries state but has no guard Proceed')
+    others = [s for s in guard[0].successors() if s not in body and s != pre]
+    if len(others) != 1:
+        raise rq.Unsupported('the guard Proceed has an unexpected shape')
+    st['guard_false'] = others[0]
+    # Per edge into the latch, the value each field takes: a latch phi's
+    # incoming for that edge, anything else itself.
+    latch_phis = {i.result: dict((b, v.strip()) for v, b in i.phi_incoming)
+                  for i in lat.instrs if i.is_phi}
+    st['latch_phis'] = latch_phis
+    return st
+
+
+def _edit_exit_phis(fn, q, exit_label, latch, edits):
+    """The loop's exit block now follows the trace block, not the latch."""
+    blk = fn.block(exit_label)
+    tb = q.trace_block.label
+    for i in blk.instrs:
+        if not i.is_phi or not re.search(re.escape(latch) + r'\s*\]', i.line):
+            continue
+        if not tb:
+            raise rq.Unsupported('the Proceed loop exit has a phi and the trace is in '
+                                 'the entry block, which has no label to name')
+        edits[i.index] = re.sub(re.escape(latch) + r'(\s*\])', tb + r'\1', i.line)
 
 
 # Values the loop body reads from before it and the hit shader cannot rebuild,
@@ -1280,11 +1484,30 @@ def _payload_type(q):
     extra = ', i32' if q.others else ''
     for _, (ty, _f) in sorted(q.carry_fields.items(), key=lambda kv: kv[1][1]):
         extra += ', i32' if ty == 'i1' else ', ' + ty
+    extra += ', i32' * _payload_pad(q)
     return PAYLOAD_TYPE[:-2] + extra + ' }'
 
 
+# DRIVER FACTS, 0.67.0, on the GTX 1070; WARP runs all of these.
+#   124 bytes: an any-hit reading the LAST dword access-violates inside
+#     CreateStateObject, every time. Reading the last field of payloads from 80
+#     to 260 bytes in steps of 4, only 124 crashes; reading 116 of 124 builds.
+#   128 bytes: builds, and REMOVES THE DEVICE when dispatched (a carried-value
+#     case, and a tracked one whose opaque hits skip the any-hit). 120, and 132
+#     to 156, match WARP.
+# So a payload that would be 124 or 128 bytes gets unused fields up to 132.
+DRIVER_BAD_PAYLOAD_BYTES = (124, 128)
+DRIVER_SAFE_PAYLOAD_BYTES = 132
+
+
+def _payload_pad(q):
+    n = PAYLOAD_BYTES + 4 * ((1 if q.others else 0) + len(q.carry_fields))
+    return (DRIVER_SAFE_PAYLOAD_BYTES - n) // 4 if n in DRIVER_BAD_PAYLOAD_BYTES else 0
+
+
 def _payload_bytes(q):
-    return PAYLOAD_BYTES + 4 * ((1 if q.others else 0) + len(q.carry_fields))
+    n = PAYLOAD_BYTES + 4 * ((1 if q.others else 0) + len(q.carry_fields))
+    return n + 4 * _payload_pad(q)
 
 
 def _loops(q):
@@ -1308,7 +1531,10 @@ def _edit_ray_flags(q, edits):
         # dx.op.rayFlags IS legal. Overwriting that entry would resurrect the
         # instruction in the raygen as well as the any-hit.
         if instr.index in edits:
-            q.rayflags_in_loop = True
+            # With `track` the any-hit reads the query's flags from the
+            # payload instead (0.66.0).
+            if not q.track:
+                q.rayflags_in_loop = True
             continue
         if q.dyn_flags is not None:
             edits[instr.index] = '  %s = add i32 %d, 0' % (instr.result, q.ray_flags)
@@ -1323,6 +1549,8 @@ def _edit_ray_flags(q, edits):
 def _edit_committed(q, edits):
     """Committed accessors become payload reads."""
     for block, instr in q.committed_ops:
+        if q.loop and block.label in q.loop[2]:
+            continue   # read by a generated hit shader, 0.66.0
         idx, ty, align = PAYLOAD_FIELD[instr.dxop]
         if instr.dxop == rq.COMMITTED_FRONT_FACE:
             tmp = '%%rq.ff%s' % instr.result[1:]
@@ -1378,7 +1606,7 @@ def _add_types_and_globals(text, globals_, needs_record=False, binding=False,
         # is; the RECORD bitcasts it back to the resource type. Copied from
         # DXC: `@CB = external constant %dx.types.Handle`.
         decls.append('@%s = external constant %s, align 4'
-                     % (sym, HANDLE_TYPE if binding else gty))
+                     % (sym, _binding_gty(gty, elem) if binding else gty))
     anchor = re.search(r'^%dx\.types\.Handle = type .*$', text, re.M)
     if not anchor:
         raise LowerError('cannot find %dx.types.Handle to anchor declarations')
@@ -1479,6 +1707,9 @@ def _swap_declarations(text, q, globals_, binding=False):
     # AnyHitNull always does and it is nothing but an IgnoreHit.
     new += ['', '; Function Attrs: noreturn nounwind',
             'declare void @dx.op.ignoreHit(i32) #RQNR']
+    if any(x.aborts for x in _loops(q)) and (not q.needs_intersection or q.needs_both):
+        new += ['', '; Function Attrs: noreturn nounwind',
+                'declare void @dx.op.acceptHitAndEndSearch(i32) #RQNR']
     if binding:
         # One overload serves every resource in the 6.6 form, because the
         # global is a handle whatever the resource is.
@@ -1718,6 +1949,12 @@ def _intersection(module, q, exports, table, globals_, binds=None):
                 # Nothing to set: an intersection shader that returns has
                 # reported nothing, and there is no later invocation to gate.
                 continue
+            if i.dxop == rq.COMMITTED_RAY_T:
+                # In an intersection shader RayTCurrent() IS the committed t:
+                # the closest hit so far, or TMax (0.66.0).
+                out.append('  %s = call float @dx.op.rayTCurrent.f32(i32 154)'
+                           '  ; RayTCurrent()' % i.result)
+                continue
             if i.dxop in RECORD_WORD:
                 # The record answers, because nothing in the shader can. The
                 # local root signature bound this record's own constants.
@@ -1796,12 +2033,15 @@ def _anyhit(module, q, exports, table, globals_, binds=None):
     # only after proving the commit dominates the abort in the same iteration,
     # and correctness comes first here.
     aborts = any(x.aborts for x in loops)
+    track = any(x.track for x in loops)
 
     out = ['define void @%s(%s* noalias nocapture %%p, %s* nocapture readonly %%attr) #RQNW {'
            % (exports['anyhit'], PAYLOAD, ATTRS),
            '  %rq.ap = getelementptr inbounds {at}, {at}* %attr, i32 0, i32 0'.format(at=ATTRS),
            '  %rq.ab = load <2 x float>, <2 x float>* %rq.ap, align 4']
     for name, (ty, field) in sorted(q.carry_fields.items(), key=lambda kv: kv[1][1]):
+        if name.endswith('.out') or name == '%rq.iter':
+            continue   # written by each iteration, read by the raygen
         out.append('  %%rq.pac%d = getelementptr inbounds %s, %s* %%p, i32 0, i32 %d'
                    % (field, PAYLOAD, PAYLOAD, field))
         if ty == 'i1':
@@ -1843,6 +2083,9 @@ def _anyhit(module, q, exports, table, globals_, binds=None):
         out.append('')
         out.append('rq.body:')
 
+    def entry_of(x):
+        return '%%rq.e%d' % x.qid if x.track else x.loop[0]
+
     if multi:
         # Which query's trace this is, set by the raygen before TraceRay.
         out.append('  %%rq.pq = getelementptr inbounds %s, %s* %%p, i32 0, i32 %d'
@@ -1851,10 +2094,16 @@ def _anyhit(module, q, exports, table, globals_, binds=None):
         for n, x in enumerate(loops[1:], 1):
             nxt = '%%rq.qn%d' % n
             out.append('  %%rq.qc%d = icmp eq i32 %%rq.qid, %d' % (n, x.qid))
-            out.append('  br i1 %%rq.qc%d, label %s, label %s' % (n, x.loop[0], nxt))
+            out.append('  br i1 %%rq.qc%d, label %s, label %s' % (n, entry_of(x), nxt))
             out.append('')
             out.append('%s:' % nxt[1:])
-        out.append('  br label %s' % loops[0].loop[0])
+        out.append('  br label %s' % entry_of(loops[0]))
+    for x in loops:
+        if x.track:
+            if multi:
+                out.append('')
+                out.append('rq.e%d:' % x.qid)
+            out += _opacity(x, x.loop[0])
 
     for x in loops:
         header, latch, body = x.loop
@@ -1862,22 +2111,151 @@ def _anyhit(module, q, exports, table, globals_, binds=None):
         order = [header] + sorted(l for l in body if l not in (header, latch))
         _anyhit_body(fn, x, order, header, latch, body, commit_blocks, subst,
                      multi, out)
+    for x in loops:
+        _anyhit_tails(x, out)
 
-    out += ['', 'rq.accept:', '  ret void',
-            '', 'rq.reject:',
-            '  call void @dx.op.ignoreHit(i32 155)  ; IgnoreHit()',
-            '  unreachable', '}']
+    out += ['', 'rq.accept:']
+    if track:
+        out += _record_commit(q, loops)
+    if aborts:
+        # Committed, then Abort() in the same iteration: this hit, and the
+        # search ends, exactly as RayQuery (0.67.0).
+        out += ['  %rq.aa = load i32, i32* %rq.pab, align 4',
+                '  %rq.ac = icmp ne i32 %rq.aa, 0',
+                '  br i1 %rq.ac, label %rq.end, label %rq.ret',
+                '', 'rq.ret:']
+    out += ['  ret void', '', 'rq.reject:']
+    if aborts and not any(x.aborts and x.track for x in loops):
+        # A bare Abort() in a query that never reads committed state: ending
+        # the search on this candidate commits it, which nothing reads, and
+        # stops traversal at once (0.67.0; until then it ran to the end).
+        out += ['  %rq.ra = load i32, i32* %rq.pab, align 4',
+                '  %rq.rc = icmp ne i32 %rq.ra, 0',
+                '  br i1 %rq.rc, label %rq.end, label %rq.ign',
+                '', 'rq.ign:']
+    out += ['  call void @dx.op.ignoreHit(i32 155)  ; IgnoreHit()', '  unreachable']
+    if aborts:
+        out += ['', 'rq.end:',
+                '  call void @dx.op.acceptHitAndEndSearch(i32 156)  ; AcceptHitAndEndSearch()',
+                '  unreachable']
+    out += ['}']
     return '\n'.join(out)
+
+
+def _opacity(q, header):
+    """The any-hit's first act when it tracks committed state (0.66.0): the
+    ray was traced forced non-opaque, so this candidate may be one the
+    original flags make OPAQUE (the ray's, else the record's word 2, the
+    instance's and geometry's flags as the shim read them). Culled by the
+    original flags: rejected. Opaque: committed without running the body, as
+    traversal would have done. Otherwise the body."""
+    t = 'o%d' % q.qid
+    out = _record_read(t, 2, '%%rq.%s.w' % t, q.record_sm66)
+    out += [
+        '  %%rq.%s.fo = and i32 %%rq.oflags, 1' % t,
+        '  %%rq.%s.fn = and i32 %%rq.oflags, 2' % t,
+        '  %%rq.%s.a = icmp ne i32 %%rq.%s.fo, 0' % (t, t),
+        '  %%rq.%s.b = icmp ne i32 %%rq.%s.fn, 0' % (t, t),
+        '  %%rq.%s.c = icmp ne i32 %%rq.%s.w, 0' % (t, t),
+        '  %%rq.%s.d = select i1 %%rq.%s.b, i1 false, i1 %%rq.%s.c' % (t, t, t),
+        '  %%rq.%s.op = select i1 %%rq.%s.a, i1 true, i1 %%rq.%s.d' % (t, t, t),
+        '  %%rq.%s.co = and i32 %%rq.oflags, 64' % t,
+        '  %%rq.%s.cn = and i32 %%rq.oflags, 128' % t,
+        '  %%rq.%s.cu = select i1 %%rq.%s.op, i32 %%rq.%s.co, i32 %%rq.%s.cn' % (t, t, t, t),
+        '  %%rq.%s.cl = icmp ne i32 %%rq.%s.cu, 0' % (t, t),
+        '  br i1 %%rq.%s.cl, label %%rq.reject, label %%rq.%s.k' % (t, t),
+        '',
+        'rq.%s.k:' % t,
+        '  br i1 %%rq.%s.op, label %%rq.accept, label %s' % (t, header),
+    ]
+    return out
+
+
+def _record_commit(q, loops):
+    """What the closest-hit would record, recorded on every accept, so the
+    committed accessors read inside the loop see the state as it stands."""
+    out = ['  %rq.ct = call float @dx.op.rayTCurrent.f32(i32 154)  ; RayTCurrent()',
+           '  %%rq.cp0 = getelementptr inbounds %s, %s* %%p, i32 0, i32 0' % (PAYLOAD, PAYLOAD),
+           '  store float %rq.ct, float* %rq.cp0, align 4',
+           '  %%rq.cp1 = getelementptr inbounds %s, %s* %%p, i32 0, i32 1' % (PAYLOAD, PAYLOAD),
+           '  store <2 x float> %rq.ab, <2 x float>* %rq.cp1, align 4',
+           '  %%rq.cp2 = getelementptr inbounds %s, %s* %%p, i32 0, i32 2' % (PAYLOAD, PAYLOAD),
+           '  store i32 1, i32* %rq.cp2, align 4']
+    for idx, (ty, call) in sorted(CH_SOURCE.items()):
+        out.append('  %%rq.ci%d = %s' % (idx, call))
+        out.append('  %%rq.cp%d = getelementptr inbounds %s, %s* %%p, i32 0, i32 %d'
+                   % (idx, PAYLOAD, PAYLOAD, idx))
+        out.append('  store %s %%rq.ci%d, %s* %%rq.cp%d, align 4' % (ty, idx, ty, idx))
+    if q.needs_record_constants:
+        out += _record_read('c', 0, '%rq.cg', q.record_sm66)
+        out.append('  %%rq.cp5 = getelementptr inbounds %s, %s* %%p, i32 0, i32 5' % (PAYLOAD, PAYLOAD))
+        out.append('  store i32 %rq.cg, i32* %rq.cp5, align 4')
+        out.append('  %%rq.cc = extractvalue %s %%rq.cbrc, 1' % RESRET)
+        out.append('  %%rq.cp10 = getelementptr inbounds %s, %s* %%p, i32 0, i32 10' % (PAYLOAD, PAYLOAD))
+        out.append('  store i32 %rq.cc, i32* %rq.cp10, align 4')
+    if any(i.dxop == rq.COMMITTED_WORLD_TO_OBJECT
+           for x in [q] + q.others for _, i in x.committed_ops):
+        out.append('  %%rq.cp8 = getelementptr inbounds %s, %s* %%p, i32 0, i32 8' % (PAYLOAD, PAYLOAD))
+        for r in range(3):
+            for c in range(4):
+                s = r * 4 + c
+                out.append('  %%rq.cw%d = call float @dx.op.worldToObject.f32'
+                           '(i32 152, i32 %d, i8 %d)  ; WorldToObject(row,col)' % (s, r, c))
+                out.append('  %%rq.cq%d = getelementptr inbounds [12 x float], '
+                           '[12 x float]* %%rq.cp8, i32 0, i32 %d' % (s, s))
+                out.append('  store float %%rq.cw%d, float* %%rq.cq%d, align 4' % (s, s))
+    return out
+
+
+def _committed_read(i):
+    """A committed accessor read inside the loop, from the payload as the
+    any-hit keeps it (0.66.0)."""
+    idx, ty, align = PAYLOAD_FIELD[i.dxop]
+    r = i.result[1:]
+    ptr = '%%rq.cq%s' % r
+    out = ['  %s = getelementptr inbounds %s, %s* %%p, i32 0, i32 %d' % (ptr, PAYLOAD, PAYLOAD, idx)]
+    if i.dxop == rq.COMMITTED_FRONT_FACE:
+        out.append('  %%rq.cf%s = load i32, i32* %s, align 4' % (r, ptr))
+        out.append('  %s = icmp eq i32 %%rq.cf%s, %d' % (i.result, r, HIT_KIND_FRONT))
+    elif i.dxop == rq.COMMITTED_WORLD_TO_OBJECT:
+        row = re.match(r'i32\s+(\d+)', i.args[2].strip()).group(1)
+        col = re.match(r'i8\s+(\d+)', i.args[3].strip()).group(1)
+        out.append('  %%rq.cw%s = getelementptr inbounds [12 x float], [12 x float]* %s, i32 0, i32 %d'
+                   % (r, ptr, int(row) * 4 + int(col)))
+        out.append('  %s = load float, float* %%rq.cw%s, align 4' % (i.result, r))
+    elif i.dxop == rq.COMMITTED_BARY:
+        comp = re.match(r'i8\s+(\d+)', i.args[2].strip()).group(1)
+        out.append('  %%rq.cb%s = load <2 x float>, <2 x float>* %s, align 4' % (r, ptr))
+        out.append('  %s = extractelement <2 x float> %%rq.cb%s, i32 %s' % (i.result, r, comp))
+    else:
+        out.append('  %s = load %s, %s* %s, align %d' % (i.result, ty, ty, ptr, align))
+    return out
 
 
 def _anyhit_body(fn, q, order, header, latch, body, commit_blocks, subst, multi, out):
     """One query's loop body, as blocks of the any-hit."""
+    q.tails = []
+    # A phi in the body naming the header as a predecessor needs the header to
+    # be a block of its own, not the entry (0.65.0; loop state makes these).
+    named = any(i.is_phi and any(b == header for _v, b in i.phi_incoming)
+                for l in order if l != header for i in fn.block(l).instrs) or q.track
     for label in order:
         blk = fn.block(label)
-        if multi or label != header:
+        if not multi and label == header and named and not q.track:
+            out.append('  br label %s' % header)
+        if multi or label != header or named:
             out.append('')
             out.append('%s:' % label[1:])
+        if label == header and q.state:
+            # An iteration ran: the body, not an opaque candidate committed
+            # before it (0.66.0), and not an aborted one.
+            f = q.state['iter']
+            out.append('  %%rq.pit.%d = getelementptr inbounds %s, %s* %%p, i32 0, i32 %d'
+                       % (q.qid, PAYLOAD, PAYLOAD, f))
+            out.append('  store i32 1, i32* %%rq.pit.%d, align 4' % q.qid)
         for i in blk.instrs:
+            if q.state and label == header and i.is_phi:
+                continue   # loaded from the payload at entry
             if i.dxop in (rq.CANDIDATE_TYPE, rq.COMMIT_NON_OPAQUE,
                           rq.CANDIDATE_PROC_NON_OPAQUE):
                 continue
@@ -1901,6 +2279,13 @@ def _anyhit_body(fn, q, order, header, latch, body, commit_blocks, subst, multi,
                            '  ; HitKind()' % hk)
                 out.append('  %s = icmp eq i32 %s, %d' % (i.result, hk, HIT_KIND_FRONT))
                 continue
+            if q.track and i.dxop in PAYLOAD_FIELD:
+                out += _committed_read(i)
+                continue
+            if q.track and i.dxop == rq.RAY_FLAGS:
+                # The query's flags, as the raygen had them, not the forced ones.
+                out.append('  %s = add i32 %%rq.oflags, 0' % i.result)
+                continue
             if i.dxop in RECORD_WORD:
                 # The record answers, because nothing in the shader can. The
                 # local root signature bound this record's own constants.
@@ -1920,13 +2305,47 @@ def _anyhit_body(fn, q, order, header, latch, body, commit_blocks, subst, multi,
             # An edge to the latch leaves the loop body: through a commit it
             # means the candidate was accepted, otherwise rejected.
             target = '%rq.accept' if label in commit_blocks else '%rq.reject'
+            if q.state and re.search(r'label\s+' + re.escape(latch) + r'\b', line):
+                # Through a tail that stores the state first.
+                tail = '%%rq.t%d.%s' % (q.qid, label[1:])
+                if (label, target) not in q.tails:
+                    q.tails.append((label, target))
+                line = re.sub(r'label\s+' + re.escape(latch) + r'\b', 'label ' + tail, line)
+                target = tail
             line = re.sub(r'label\s+' + re.escape(latch) + r'\b', 'label ' + target, line)
             for s in Block_successors(line):
-                if s not in body and s not in ('%rq.accept', '%rq.reject'):
+                if s not in body and s not in ('%rq.accept', '%rq.reject') and \
+                        not s.startswith('%%rq.t%d.' % q.qid):
                     raise rq.Unsupported(
                         'Proceed loop body branches to %s, outside the loop; '
                         'no lowering is defined for that' % s)
             out.append(line)
+
+
+def _anyhit_tails(q, out):
+    """Per edge into the latch: the loop state as this iteration leaves it,
+    then accept or reject as the edge did (0.65.0)."""
+    st = q.state
+    if not st:
+        return
+    for label, target in q.tails:
+        tail = 'rq.t%d.%s' % (q.qid, label[1:])
+        out.append('')
+        out.append('%s:' % tail)
+        stores = [(f, ty, nxt) for _n, ty, f, _i, nxt in st['phis']] + \
+                 [(f, ty, n) for n, ty, f in st['outs']]
+        for f, ty, v in stores:
+            v = st['latch_phis'].get(v, {}).get(label, v)
+            ptr = '%%rq.s%d.%d.%s' % (f, q.qid, label[1:])
+            out.append('  %s = getelementptr inbounds %s, %s* %%p, i32 0, i32 %d'
+                       % (ptr, PAYLOAD, PAYLOAD, f))
+            if ty == 'i1':
+                z = '%%rq.z%d.%d.%s' % (f, q.qid, label[1:])
+                out.append('  %s = zext i1 %s to i32' % (z, v))
+                out.append('  store i32 %s, i32* %s, align 4' % (z, ptr))
+            else:
+                out.append('  store %s %s, %s* %s, align 4' % (ty, v, ty, ptr))
+        out.append('  br label %s' % target)
 
 
 def Block_successors(line):
@@ -1942,7 +2361,7 @@ def _rewrite_metadata(text, md, table, globals_, q, exports, binding=False):
             # The global holds a handle; the record still has to name the
             # resource type, so it casts.
             fields[1] = ('%s* bitcast (%s* @%s to %s*)'
-                         % (gty, HANDLE_TYPE, sym, gty))
+                         % (gty, _binding_gty(gty, elem), sym, gty))
         else:
             fields[1] = re.sub(r'\*\s+\S+$', '* @%s' % sym, fields[1])
         fields[2] = '!"%s"' % name

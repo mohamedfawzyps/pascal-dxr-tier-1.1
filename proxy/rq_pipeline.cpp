@@ -53,6 +53,8 @@ struct Xform {
     // Does the shader ask what geometry or what instance contribution it hit?
     // Only then do the hit records carry a pointer to their pair.
     bool needsRecordConstants = false;
+    // A query reads committed state inside its loop (0.66.0).
+    bool track = false;
     // The loop body appends to a buffer; see rq::LowerResult::appends.
     bool appends = false;
     UINT payloadBytes = kPayloadBytes;   // grows with values the payload carries
@@ -94,6 +96,8 @@ bool DoLower(const std::string& in, std::string* out, std::string* why, void* ct
     x->hasIntersection = a.query.NeedsIntersection();
     x->needsBoth = a.query.NeedsBoth();
     x->needsRecordConstants = a.query.needsRecordConstants;
+    x->track = a.query.track;
+    for (const auto& o : a.query.others) x->track = x->track || o.track;
     x->appends = l.appends;
     x->payloadBytes = (UINT)l.payloadBytes;
     x->carried = l.carried;
@@ -702,6 +706,7 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
     self->m_hasIntersection = x.hasIntersection;
     self->m_needsBoth = x.needsBoth;
     self->m_recordConstants = x.needsRecordConstants;
+    self->m_track = x.track;
     self->m_scenes = x.scenes;
     self->m_localRs = b.localRs;   // owned now, released in the destructor
     self->m_lib = lib;             // for the shim's own layout, built on need
@@ -805,7 +810,7 @@ bool Dxr11RayQueryPso::BuildTable(const std::vector<uint8_t>& kinds,
     const UINT slot = AlignUp(kIdSize, kTableAlign);
     const UINT hitBytes = AlignUp(stride * tableRecords, kTableAlign);
     const UINT pairsOff = slot * 2 + hitBytes;
-    const UINT pairsBytes = m_recordConstants ? tableRecords * 8u : 0u;
+    const UINT pairsBytes = m_recordConstants ? tableRecords * 12u : 0u;
     const UINT64 size = static_cast<UINT64>(pairsOff) + pairsBytes;
 
     D3D12_HEAP_PROPERTIES hp{};
@@ -895,10 +900,13 @@ bool Dxr11RayQueryPso::BuildTable(const std::vector<uint8_t>& kinds,
         const D3D12_GPU_VIRTUAL_ADDRESS pairsVa = sbt->GetGPUVirtualAddress() + pairsOff;
         for (UINT i = 0; i < tableRecords; ++i) {
             if (i < hitRecords && i < recPairs.size()) {
-                const uint32_t pair[2] = { recPairs[i].first, recPairs[i].second };
-                std::memcpy(p + pairsOff + i * 8u, pair, sizeof(pair));
+                // DXR_TIER11_OPACITY_POISON=1: every record says not opaque, the
+                // sensitivity check for rayquery_committed (0.66.0).
+                static const bool opPoison = GetEnvironmentVariableA("DXR_TIER11_OPACITY_POISON", nullptr, 0) != 0;
+                const uint32_t pair[3] = { recPairs[i].first, recPairs[i].second, opPoison ? 0u : recPairs[i].third };
+                std::memcpy(p + pairsOff + i * 12u, pair, sizeof(pair));
             }
-            const D3D12_GPU_VIRTUAL_ADDRESS va = pairsVa + static_cast<UINT64>(i) * 8u;
+            const D3D12_GPU_VIRTUAL_ADDRESS va = pairsVa + static_cast<UINT64>(i) * 12u;
             std::memcpy(p + 2 * slot + i * stride + kIdSize, &va, sizeof(va));
         }
     }
@@ -979,7 +987,7 @@ void Dxr11RayQueryPso::DispatchAsRays(ID3D12GraphicsCommandList4* cl,
         const std::vector<astrack::RecordConstants> consts = astrack::RecordConstantsTable(scenes);
         recPairs.resize(recordKinds.size());
         for (size_t i = 0; i < recPairs.size() && i < consts.size(); ++i)
-            recPairs[i] = { consts[i].geometryIndex, consts[i].instanceContribution };
+            recPairs[i] = { consts[i].geometryIndex, consts[i].instanceContribution, consts[i].opaque };
     }
 
     // Rebuild when the scene's layout is not what the table was built for,
@@ -1341,6 +1349,12 @@ bool Dxr11RayQueryPso::DispatchOwn(ID3D12GraphicsCommandList4* cl, ID3D12Device5
                 *why = "an instance with more geometries than its scene copy has room for";
                 return false;
             }
+            if (m_track && !r.opacityKnown) {
+                *why = "the query reads committed state inside its loop, which needs every "
+                       "candidate's opacity, and an instance's bottom-level structure is "
+                       "DESERIALIZED, whose decode drops geometry flags on this driver";
+                return false;
+            }
         }
     }
 
@@ -1398,6 +1412,12 @@ bool Dxr11RayQueryPso::DispatchOwn(ID3D12GraphicsCommandList4* cl, ID3D12Device5
             key.push_back(r.active ? (1ull << 63) | ((uint64_t)r.contribution << 24) |
                                          ((uint64_t)r.geometries << 8) | r.reach
                                    : 0ull);
+        for (const auto& r : rows[x]) {
+            uint64_t bits = 0;
+            for (size_t g = 0; g < r.opaque.size() && g < 64; ++g)
+                if (r.opaque[g]) bits |= 1ull << g;
+            key.push_back(bits);
+        }
     }
 
     ID3D12StateObject* so = nullptr;
@@ -1422,7 +1442,7 @@ bool Dxr11RayQueryPso::DispatchOwn(ID3D12GraphicsCommandList4* cl, ID3D12Device5
         const UINT stride = AlignUp(kIdSize + (m_recordConstants ? 8u : 0u), kRecAlign);
         const UINT hitOff = rgSlot + missSlot;
         const UINT pairsOff = hitOff + AlignUp(stride * records, kTableAlign);
-        const UINT pairsBytes = m_recordConstants ? records * 8u : 0u;
+        const UINT pairsBytes = m_recordConstants ? records * 12u : 0u;
         const UINT keysOff = AlignUp(pairsOff + pairsBytes, 256);
         const UINT64 size = (UINT64)keysOff + kt.size() * 4u;
 
@@ -1489,8 +1509,9 @@ bool Dxr11RayQueryPso::DispatchOwn(ID3D12GraphicsCommandList4* cl, ID3D12Device5
                     const UINT r = base[x] + i * gmax + g;
                     std::memcpy(p + hitOff + r * stride, idFor(row.reach), kIdSize);
                     if (!m_recordConstants) continue;
-                    const uint32_t pair[2] = { g, poison == 1 ? first : row.contribution };
-                    std::memcpy(p + pairsOff + r * 8u, pair, sizeof(pair));
+                    const uint32_t pair[3] = { g, poison == 1 ? first : row.contribution,
+                                               g < row.opaque.size() && !GetEnvironmentVariableA("DXR_TIER11_OPACITY_POISON", nullptr, 0) ? row.opaque[g] : 0u };
+                    std::memcpy(p + pairsOff + r * 12u, pair, sizeof(pair));
                 }
             }
         }
@@ -1498,7 +1519,7 @@ bool Dxr11RayQueryPso::DispatchOwn(ID3D12GraphicsCommandList4* cl, ID3D12Device5
         // at zeros their hit groups never read.
         if (m_recordConstants)
             for (UINT r = 0; r < records; ++r) {
-                const D3D12_GPU_VIRTUAL_ADDRESS pa = va + pairsOff + (UINT64)r * 8u;
+                const D3D12_GPU_VIRTUAL_ADDRESS pa = va + pairsOff + (UINT64)r * 12u;
                 std::memcpy(p + hitOff + r * stride + kIdSize, &pa, sizeof(pa));
             }
         sbt->Unmap(0, nullptr);

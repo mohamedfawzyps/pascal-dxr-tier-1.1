@@ -371,7 +371,7 @@ void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) {
         std::string why;
         int layout = -1;
         const bool wrong = astrack::TableWouldBeWrong(m_rqPso->CommitsProcedural(), &why, only,
-                                                      exact ? &layout : nullptr);
+                                                      exact ? &layout : nullptr, m_rqPso->Tracks());
         // A layout the table cannot serve: the shim's own, where every
         // (instance, geometry) has a record (0.61.0; until then refused).
         if (exact && (wrong ? layout >= 0 : RayQueryOwnForced())) {
@@ -1680,7 +1680,8 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
                 std::string why;
                 int layout = -1;
                 const bool wrong = astrack::TableWouldBeWrong(pend.rq->CommitsProcedural(), &why,
-                                                              only, only ? &layout : nullptr);
+                                                              only, only ? &layout : nullptr,
+                                                              pend.rq->Tracks());
                 if (only && (wrong ? layout >= 0 : RayQueryOwnForced())) {
                     rqOwn = true;
                     rqLayout = wrong ? layout : -1;

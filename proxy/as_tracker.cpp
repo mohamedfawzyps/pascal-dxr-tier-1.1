@@ -226,12 +226,28 @@ void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
         t.rows[i].reach = bits;
         t.rows[i].geometries = bi->kind == Kind::kUnknown ? 0u : geoms;
         t.classes.emplace_back(ic, geoms);
+        // Opaque as the instance's flags, then its geometry's, make each one
+        // (0.66.0); the instance's force flags answer without the geometry's.
+        const UINT iflags = d[i].Flags;
+        const bool forced = (iflags & (D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE |
+                                       D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_NON_OPAQUE)) != 0;
+        t.rows[i].opacityKnown = forced || (bi->opacityKnown && bi->opaque.size() >= geoms);
+        if (!t.rows[i].opacityKnown) t.opacityUnknown = true;
+        t.rows[i].opaque.assign(geoms, 0);
+        for (UINT gi = 0; gi < geoms; ++gi)
+            t.rows[i].opaque[gi] = (iflags & D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_NON_OPAQUE) ? 0
+                                 : (iflags & D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE)   ? 1
+                                 : gi < bi->opaque.size() ? bi->opaque[gi] : 0;
         for (UINT gi = 0; gi < geoms; ++gi) {
             const UINT slot = ic + gi;
             if (slot >= t.recordCount) break;
             t.reach[slot] |= bits;
 
             RecordConstants& rc = t.constants[slot];
+            if (rc.assigned && rc.opaque != t.rows[i].opaque[gi] && !t.opacityConflict) {
+                t.opacityConflict = true;
+                t.opacitySlot = slot;
+            }
             if (rc.assigned) {
                 // Same slot, different meaning. Detected, never averaged.
                 if (rc.geometryIndex != gi || rc.instanceContribution != ic) {
@@ -256,6 +272,7 @@ void ParseLocked(D3D12_GPU_VIRTUAL_ADDRESS tlas,
                 rc.geometryIndex = gi;
                 rc.instanceContribution = ic;
                 rc.assigned = true;
+                rc.opaque = t.rows[i].opaque[gi];
             }
         }
     }
@@ -428,6 +445,7 @@ void NoteBuild(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc) {
     for (UINT i = 0; i < in.NumDescs; ++i) {
         const D3D12_RAYTRACING_GEOMETRY_DESC* g =
             ptrs ? in.ppGeometryDescs[i] : &in.pGeometryDescs[i];
+        info.opaque.push_back(g && (g->Flags & D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE) ? 1 : 0);
         if (!g) continue;
         if (g->Type == D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS)
             sawProc = true;
@@ -831,11 +849,13 @@ bool ApplyDecoded(D3D12_GPU_VIRTUAL_ADDRESS dst, const DeserializedAt& at, const
             D3D12_RAYTRACING_GEOMETRY_DESC gd{};
             std::memcpy(&gd, data + at, sizeof(gd));
             (gd.Type == D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES ? tri : proc) = true;
+            bi.opaque.push_back((gd.Flags & D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE) ? 1 : 0);
             at += sizeof(gd);
         }
         bi.kind = tri && proc ? Kind::kMixed : tri ? Kind::kTriangles : proc ? Kind::kProcedural
                                                                         : Kind::kUnknown;
         bi.origin = 2;
+        bi.opacityKnown = false;   // the GTX 1070's decode drops geometry flags
         // Its entry from the deserialize, and its current state if nothing
         // has been built there since.
         auto& h = g_blasHist[dst];
@@ -1063,7 +1083,8 @@ bool Rows(D3D12_GPU_VIRTUAL_ADDRESS tlas, std::vector<TlasInfo::Row>* rows) {
 }
 
 bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why,
-                       const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* only, int* layout) {
+                       const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* only, int* layout,
+                       bool needsOpacity) {
     // A layout refusal: counted here, or handed to the caller to count.
     auto refuseLayout = [layout](dstats::Counter c) {
         if (layout) *layout = (int)c;
@@ -1098,6 +1119,23 @@ bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why,
                            t.unknownDetail;
                 return true;
             }
+            if (needsOpacity && t.opacityUnknown) {
+                dstats::Add(dstats::kRefusedUnknownBlas);
+                if (why)
+                    *why = "the lowered query reads committed state inside its Proceed loop, "
+                           "which needs every candidate's opacity, and an instance's "
+                           "bottom-level structure is DESERIALIZED, whose decode drops geometry "
+                           "flags on this driver";
+                return true;
+            }
+            if (needsOpacity && t.opacityConflict) {
+                refuseLayout(dstats::kRefusedOneTlas);
+                if (why)
+                    *why = "two instances disagree about whether hit group record " +
+                           std::to_string(t.opacitySlot) + " is opaque, which a query "
+                           "reading committed state inside its loop needs one answer to";
+                return true;
+            }
             if (t.constantsConflict) {
                 refuseLayout(dstats::kRefusedOneTlas);
                 if (why)
@@ -1121,7 +1159,8 @@ bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why,
                 if (!a.assigned) continue;
                 if (!m.assigned) { m = a; from[i] = kv.first; continue; }
                 if (m.geometryIndex != a.geometryIndex ||
-                    m.instanceContribution != a.instanceContribution) {
+                    m.instanceContribution != a.instanceContribution ||
+                    (needsOpacity && m.opaque != a.opaque)) {
                     refuseLayout(dstats::kRefusedCrossLive);
                     // Which two, once per pair of addresses: whether they are
                     // one scene double-buffered or two different scenes decides

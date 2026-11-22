@@ -55,6 +55,12 @@ struct BlasInfo {
     // How the shim learned it: 0 built, 1 CLONE or COMPACT of a known one,
     // 2 DESERIALIZE, 3 a copy of something unknown. Said when refusing.
     uint8_t origin = 0;
+    // Per geometry, its D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE: what a lowered
+    // query that reads committed state inside its loop needs to know which
+    // candidates traversal commits by itself (0.66.0). Not known for a
+    // DESERIALIZED structure: the GTX 1070's decode drops geometry flags.
+    std::vector<uint8_t> opaque;
+    bool opacityKnown = true;
 };
 
 // Remember what a bottom-level build contains. Safe to call for any build;
@@ -106,6 +112,9 @@ struct RecordConstants {
     UINT geometryIndex = 0;
     UINT instanceContribution = 0;
     bool assigned = false;
+    // Opaque, as the instance's flags and its geometry's make it: the record's
+    // third word (0.66.0).
+    uint8_t opaque = 0;
 };
 
 struct TlasInfo {
@@ -128,6 +137,12 @@ struct TlasInfo {
     // geometry counts precisely so records do not collide.
     bool constantsConflict = false;
     UINT conflictSlot = 0;
+    // Two instances disagree about whether a record is opaque, or an
+    // instance's opacity is not known (0.66.0). Only a query that tracks
+    // committed state asks.
+    bool opacityConflict = false;
+    UINT opacitySlot = 0;
+    bool opacityUnknown = false;
     // Who collides there, for the log: the pair already on the record, and
     // the instance that brought the other one, with its structure.
     std::string conflictDetail;
@@ -156,6 +171,10 @@ struct TlasInfo {
         UINT contribution = 0;
         UINT geometries = 0;          // 0: its structure is not known
         uint8_t reach = kReachNone;   // the kind its geometries are
+        // Per geometry, opaque as the instance and geometry flags make it;
+        // `opacityKnown` false when its structure's flags are not (0.66.0).
+        std::vector<uint8_t> opaque;
+        bool opacityKnown = true;
     };
     std::vector<Row> rows;
 };
@@ -365,9 +384,11 @@ bool WantInstances(D3D12_GPU_VIRTUAL_ADDRESS tlas, UINT numDescs, bool cheap);
 // own layout (Dxr11RayQueryPso::DispatchOwn), where every (instance,
 // geometry) has a record of its own, and counts the refusal only if that
 // fails. An unknown bottom-level structure is refused either way.
+// `needsOpacity`: the query tracks committed state (0.66.0), so each record's
+// opacity has to be one answer too, and known.
 bool TableWouldBeWrong(bool shaderCommitsProcedural, std::string* why,
                        const std::vector<D3D12_GPU_VIRTUAL_ADDRESS>* only = nullptr,
-                       int* layout = nullptr);
+                       int* layout = nullptr, bool needsOpacity = false);
 
 // True when at least one of `scenes` is a top-level structure whose instance
 // data has been read.

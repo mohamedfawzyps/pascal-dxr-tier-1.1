@@ -33,9 +33,11 @@ $cases = @(
     @{ name = 'proc'; src = 'phase5\cases\rayquery_proc.ll'; pat = 'alpha'; flags = @('--proc');
        gt = @('--cs', 'phase5\cases\rayquery_proc.hlsl', '--proc');
        desc = 'procedural primitives, generated INTERSECTION shader' },
+    # Abort() is exact since 0.67.0: traced forced non-opaque, the any-hit
+    # applying each record's opacity word, so it renders only through the
+    # proxy, which binds the records (the dispatch suite's `abort` case).
     @{ name = 'abort'; src = 'phase5\cases\rayquery_abort.ll'; pat = 'alpha'; flags = @('--multi');
-       gt = @('--cs', 'phase5\cases\rayquery_abort.hlsl', '--multi');
-       desc = 'Abort(), observing only the order-INDEPENDENT hit flag' },
+       norender = $true; desc = 'Abort(), observing only the order-INDEPENDENT hit flag' },
     @{ name = 'acc'; src = 'phase5\cases\rayquery_acc.ll'; pat = 'alpha'; flags = @('--multi');
        gt = @('--cs', 'phase5\cases\rayquery_acc.hlsl', '--multi');
        desc = 'the 11 accessors added after surveying Unreal' },
@@ -73,7 +75,49 @@ $cases = @(
     # right here as through the proxy.
     @{ name = 'group'; src = 'phase5\cases\rayquery_group.ll'; pat = 'alpha'; flags = @();
        gt = @('--cs', 'phase5\cases\rayquery_group.hlsl');
-       desc = 'SV_GroupID, SV_GroupThreadID and SV_GroupIndex, numthreads(16,8,1)' }
+       desc = 'SV_GroupID, SV_GroupThreadID and SV_GroupIndex, numthreads(16,8,1)' },
+    # A switch in the Proceed loop and after it (0.65.0): the CFG model
+    # followed only br, so the loop through the switch was not found.
+    @{ name = 'switch'; src = 'phase5\cases\rayquery_switch.ll'; pat = 'alpha'; flags = @('--geom');
+       gt = @('--cs', 'phase5\cases\rayquery_switch.hlsl', '--geom'); norender = $true;
+       desc = 'a switch inside the Proceed loop and after it' },
+    # Resource ARRAYS at Shader Model 6.6 (0.65.0): a constant index bound
+    # element 0 (measured: 0 hits of 14450 on 0.64.0), a dynamic one was
+    # refused.
+    @{ name = 'table66'; src = 'phase5\cases\rayquery_table_sm66.ll'; pat = 'opaque'; flags = @('--table');
+       gt = @('--cs', 'phase5\cases\rayquery_table_sm66.hlsl', '--table');
+       desc = '6.6 resource array, constant index' },
+    @{ name = 'dyn66'; src = 'phase5\cases\rayquery_dyn_sm66.ll'; pat = 'opaque'; flags = @('--table');
+       gt = @('--cs', 'phase5\cases\rayquery_dyn_sm66.hlsl', '--table');
+       desc = '6.6 resource array, dynamic index' },
+    @{ name = 'dynnu66'; src = 'phase5\cases\rayquery_dynnu_sm66.ll'; pat = 'opaque'; flags = @('--table');
+       gt = @('--cs', 'phase5\cases\rayquery_dynnu_sm66.hlsl', '--table');
+       desc = '6.6 resource array, NonUniformResourceIndex' },
+    # Loop state across Proceed iterations and out of the loop (0.65.0), in
+    # the payload; its payload is past what raytest's own pipeline declares,
+    # so it renders through the proxy (the dispatch suite).
+    @{ name = 'carryout'; src = 'phase5\cases\rayquery_carryout.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = 'state carried across candidates and out of the loop' },
+    # Committed state read inside the loop (0.66.0): record constants, so it
+    # renders through the proxy (the dispatch suite).
+    @{ name = 'committed'; src = 'phase5\cases\rayquery_committed.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = 'committed state read inside the Proceed loop' },
+    @{ name = 'committedq2'; src = 'phase5\cases\rayquery_committed_twoq.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = 'the same, two queries' },
+    # Procedural: CommittedRayT inside the loop is RayTCurrent.
+    @{ name = 'proccmt'; src = 'phase5\cases\rayquery_proc_committed.ll'; pat = 'alpha'; flags = @('--proc');
+       gt = @('--cs', 'phase5\cases\rayquery_proc_committed.hlsl', '--proc');
+       desc = 'procedural: CommittedRayT inside the loop' },
+    # Writes in the loop body and exact Abort() (0.67.0): record words, so
+    # they render through the proxy (the dispatch suite).
+    @{ name = 'writes'; src = 'phase5\cases\rayquery_writes.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = 'a store and an atomic in the loop body' },
+    @{ name = 'abortflag'; src = 'phase5\cases\rayquery_abortflag.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = 'Abort(), committed state never read' },
+    @{ name = 'abortcmt'; src = 'phase5\cases\rayquery_abortcommit.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = 'commit then Abort(), and a bare Abort()' },
+    @{ name = 'abortstack'; src = 'phase5\cases\rayquery_abortstack.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = 'committed state saved at Abort()' }
 )
 
 if (-not (Test-Path 'phase5\dxil\rayquery_opaque.ll')) {
@@ -137,6 +181,16 @@ foreach ($c in $cases) {
         Write-Host '  C++ port: phase5out\dxrw.exe missing, run build_rewriter.bat'
     }
 
+    # A case whose hit shaders read record constants renders only through the
+    # proxy, which binds them (the dispatch suite); here, identity and
+    # container path only.
+    if ($c.ContainsKey('norender')) {
+        $srcDxil = [IO.Path]::ChangeExtension($c.src, '.dxil')
+        & .\phase5out\dxrw.exe rewrite $srcDxil "phase5\outcpp\$n.dxil" | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Host '  container path: REFUSED'; $failed++ }
+        else { Write-Host '  container path: rewritten, validated and signed (renders in the dispatch suite)' }
+        continue
+    }
     # WARP RayQuery is the oracle; the 1070 runs what the rewriter produced.
     $gt = if ($c.ContainsKey('gt')) { $c.gt } else { @() }
     & .\raytest.exe warp rayquery $c.pat "rw_${n}_a.bin" @($gt) | Out-Null

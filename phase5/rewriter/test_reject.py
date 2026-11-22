@@ -270,14 +270,15 @@ def main():
     ok.append(expect_reject('unverified rayQuery opcode', unknown,
                             'refusing rather than guessing'))
 
-    # Committed state read inside the loop: the any-hit shader is a separate
-    # invocation and cannot see it.
+    # Committed state read inside the loop. Refused until 0.66.0 ("the any-hit
+    # shader is a separate invocation"); now the any-hit keeps it in the
+    # payload, so this is an ACCEPTANCE, and the C++ must lower it too.
     inloop = alpha.replace(
         '  %v37 = call i32 @dx.op.rayQuery_StateScalar.i32(i32 185, i32 %v33)',
         '  %vct = call float @dx.op.rayQuery_StateScalar.f32(i32 200, i32 %v33)\n'
         '  %v37 = call i32 @dx.op.rayQuery_StateScalar.i32(i32 185, i32 %v33)')
-    ok.append(expect_reject('committed state read in loop', inloop,
-                            'separate invocation'))
+    ok.append(expect_pattern('committed state read in loop', inloop, 3))
+    ok.append(cpp_agrees('committed state read in loop', inloop))
 
     # No loop and not FORCE_OPAQUE: traversal would yield candidates the
     # shader never inspects, so there is nothing to lower to.
@@ -427,8 +428,9 @@ def main():
         for name, text, why in (
                 ('counter updated inside the loop', mutate(''), None),
                 ('append at the counter\'s index', mutate(store('%sidefx')), None),
-                ('store at a FIXED index in the loop', mutate(store('0')),
-                 'has a side effect')):
+                # 0.67.0: any write lowers into an any-hit, which runs once per
+                # candidate RayQuery would yield (NO_DUPLICATE_ANYHIT_INVOCATION).
+                ('store at a FIXED index in the loop', mutate(store('0')), None)):
             if why is None:
                 ok.append(expect_lower_ok(name, text))
             else:
@@ -466,12 +468,13 @@ def main():
             ok.append(False)
         ok.append(cpp_agrees(name, t, None, r'rayQuery_\w+[.\w]*\(i32 \d+'))
 
-    # Around an append, Abort() and an intersection shader stay refused: after
-    # an abort the lowering lets traversal continue, and an intersection
-    # shader may run more than once per primitive whatever the flags say.
+    # Around an append, an intersection shader stays refused: it may run more
+    # than once per primitive whatever the flags say.
+    # 0.67.0: with Abort() the any-hit ends the search (or rejects every later
+    # candidate), so an append after an abort no longer happens: it lowers.
     for path, anchor, why in (
             (os.path.join('phase5', 'cases', 'rayquery_abort.ll'),
-             r'^.*rayQuery_Abort\(i32 181.*$', 'calls Abort()'),
+             r'^.*rayQuery_Abort\(i32 181.*$', None),
             (os.path.join('phase5', 'cases', 'rayquery_proc.ll'),
              r'^.*rayQuery_CommitProceduralPrimitiveHit\(i32 183.*$',
              'intersection shader')):
@@ -491,7 +494,7 @@ def main():
                           'declare i32 @dx.op.bufferUpdateCounter(i32, %%dx.types.Handle, i8) #%s'
                           '\n\n%s' % (g.group(1), g.group(0)))
         name = 'append with ' + ('Abort()' if 'abort' in path else 'an intersection')
-        ok.append(expect_lower_reject(name, t, why))
+        ok.append(expect_lower_ok(name, t) if why is None else expect_lower_reject(name, t, why))
         ok.append(cpp_agrees(name, t, why))
 
     # NVAPI shader extension calls (0.41.1). What 0.41.0 took for an append is
@@ -564,6 +567,17 @@ def main():
             m.group(0) + '\n  call void '
             '@dx.op.rayQuery_CommitNonOpaqueTriangleHit(i32 182, i32 %s)' % handle)
         ok.append(expect_pattern('triangle AND procedural commits', mixed, 5))
+
+        # Committed state other than CommittedRayT() in a loop body that
+        # becomes an intersection shader: no payload to read it from, so still
+        # refused, by name (0.66.0; CommittedRayT alone is RayTCurrent()).
+        pst = load(PROC)
+        m = re.search(r'^.*rayQuery_CommitProceduralPrimitiveHit.*$', pst, re.M)
+        handle = re.search(r'i32 183, i32 (%v\d+)', m.group(0)).group(1)
+        pst = pst.replace(m.group(0), '  %vcs = call i32 @dx.op.rayQuery_StateScalar.i32(i32 184, i32 '
+                          + handle + ')\n' + m.group(0))
+        ok.append(expect_reject('committed status in an intersection', pst, 'no payload'))
+        ok.append(cpp_agrees('committed status in an intersection', pst, 'no payload'))
 
     # A resource handle indexed DYNAMICALLY and used inside the Proceed loop.
     # The handle exemption in the isolation check is only sound when the module

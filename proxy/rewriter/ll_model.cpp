@@ -12,6 +12,7 @@ const std::regex kResult(R"(^\s*(%[\w.$-]+)\s*=\s*(.*)$)");
 const std::regex kCall(R"(\bcall\s+.*?@([\w.$"<>-]+|"[^"]+")\s*\((.*)\)\s*(?:#\d+)?(?:\s*,\s*![\w.$-]+\s+!\d+)*\s*$)");
 const std::regex kBrCond(R"(^\s*br\s+i1\s+(\S+),\s*label\s+(%[\w.$-]+),\s*label\s+(%[\w.$-]+))");
 const std::regex kBrUncond(R"(^\s*br\s+label\s+(%[\w.$-]+))");
+const std::regex kLabelUse(R"(label\s+(%[\w.$-]+))");
 const std::regex kPhiIn(R"(\[\s*([^,\]]+),\s*(%[\w.$-]+)\s*\])");
 const std::regex kOperandTail(R"((%[\w.$-]+|%"[^"]+")\s*$)");
 const std::regex kOpcodeImm(R"(^i32\s+(\d+)$)");
@@ -234,6 +235,19 @@ std::vector<std::string> Block::Successors() const {
     std::smatch m;
     if (std::regex_search(t->line, m, kBrCond)) return { m[2].str(), m[3].str() };
     if (std::regex_search(t->line, m, kBrUncond)) return { m[1].str() };
+    // A switch spans lines: `switch i32 %x, label %default [`, one
+    // `i32 k, label %case` per case, then `]`. Until 0.65.0 its block had no
+    // successors, so what it reaches looked unreachable and a Proceed loop
+    // through one was not found.
+    for (size_t k = instrs.size(); k-- > 0;) {
+        if (instrs[k].body.rfind("switch ", 0) != 0) continue;
+        std::vector<std::string> out;
+        for (size_t j = k; j < instrs.size(); ++j)
+            for (auto it = std::sregex_iterator(instrs[j].line.begin(), instrs[j].line.end(), kLabelUse);
+                 it != std::sregex_iterator(); ++it)
+                if (std::find(out.begin(), out.end(), (*it)[1].str()) == out.end()) out.push_back((*it)[1].str());
+        return out;
+    }
     return {};
 }
 

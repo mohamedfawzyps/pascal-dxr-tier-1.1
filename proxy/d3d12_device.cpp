@@ -27,6 +27,7 @@
 #include "geom_index_so.h"
 #include "scene_bind.h"
 #include "heap_reserve.h"
+#include "pipe_flags.h"
 
 #include <windows.h>
 #include <d3d12sdklayers.h>
@@ -919,11 +920,49 @@ HRESULT STDMETHODCALLTYPE Dxr11Device::CreateStateObject(const D3D12_STATE_OBJEC
     }
     return hr;
 }
-// Every Tier 1.0 CreateStateObject goes through here. A library reading
+// Every Tier 1.0 CreateStateObject goes through here. First the pipeline
+// flags of a PIPELINE_CONFIG1, which the GTX 1070 rejects, are applied to
+// the shaders themselves (proxy/pipe_flags.h, 0.64.0). Then a library reading
 // GeometryIndex() is rewritten and its hit groups' local root signatures
 // extended; see proxy/geom_index_so.h. Anything else is created as asked.
-HRESULT Dxr11Device::CreateStateObjectReal(const D3D12_STATE_OBJECT_DESC* d, REFIID riid,
-                                           void** pp) {
+HRESULT Dxr11Device::CreateStateObjectReal(const D3D12_STATE_OBJECT_DESC* d0, REFIID riid,
+                                           void** pp, const pflags::Mode* forced) {
+    pflags::Rewritten pf;
+    std::string pwhy;
+    const auto po = pflags::Apply(*d0, forced,
+        [this](const D3D12_STATE_OBJECT_DESC& cd, const pflags::Mode& m,
+               Microsoft::WRL::ComPtr<ID3D12StateObject>* out) {
+            void* p = nullptr;
+            const HRESULT hr = CreateStateObjectReal(&cd, __uuidof(ID3D12StateObject), &p, &m);
+            if (SUCCEEDED(hr) && p) out->Attach(static_cast<ID3D12StateObject*>(p));
+            return hr;
+        }, &pf, &pwhy);
+    if (po == pflags::Outcome::kRefused) {
+        static LONG pn = 0;
+        if (InterlockedIncrement(&pn) <= 16)
+            ProxyLog("[dxr-tier-11-proxy-log] pipeline flags (PIPELINE_CONFIG1) REFUSED: %s. The state "
+                     "object is forwarded unchanged and the driver will reject it.\n", pwhy.c_str());
+    } else if (po == pflags::Outcome::kTransformed) {
+        static LONG pn = 0;
+        if (InterlockedIncrement(&pn) <= 16)
+            ProxyLog("[dxr-tier-11-proxy-log] %s: %s\n",
+                     d0->Type == D3D12_STATE_OBJECT_TYPE_COLLECTION ? "collection" : "pipeline",
+                     pf.summary.c_str());
+    }
+    const D3D12_STATE_OBJECT_DESC* d = po == pflags::Outcome::kTransformed ? &pf.desc : d0;
+    // Every object the shim creates keeps what it was built with; a
+    // collection also a copy of the application's description.
+    auto note = [&](HRESULT hr) {
+        if (FAILED(hr) || !pp || !*pp) return hr;
+        ID3D12StateObject* so = nullptr;
+        if (SUCCEEDED(static_cast<IUnknown*>(*pp)->QueryInterface(IID_PPV_ARGS(&so))) && so) {
+            pflags::KeepWith(so, pf);
+            if (d0->Type == D3D12_STATE_OBJECT_TYPE_COLLECTION)
+                pflags::NoteCollection(so, *d0, po == pflags::Outcome::kTransformed ? pf.mode : pflags::Mode{});
+            so->Release();
+        }
+        return hr;
+    };
     gidx::Transformed t;
     std::string why;
     const auto o = gidx::Transform(m_real, *d, &t, &why);
@@ -933,8 +972,8 @@ HRESULT Dxr11Device::CreateStateObjectReal(const D3D12_STATE_OBJECT_DESC* d, REF
             ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex() REFUSED: %s. The state object is "
                      "forwarded unchanged and the driver will reject it.\n", why.c_str());
     }
-    if (o != gidx::Outcome::kTransformed) return m_real->CreateStateObject(d, riid, pp);
-    const HRESULT hr = m_real->CreateStateObject(&t.desc, riid, pp);
+    if (o != gidx::Outcome::kTransformed) return note(m_real->CreateStateObject(d, riid, pp));
+    const HRESULT hr = note(m_real->CreateStateObject(&t.desc, riid, pp));
     // A collection that only records its TraceRay arguments has no summary,
     // and Unreal creates one per raygen, so it stays quiet unless it fails.
     if (!t.summary.empty() || FAILED(hr))

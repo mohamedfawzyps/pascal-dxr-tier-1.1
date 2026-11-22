@@ -363,6 +363,14 @@ bool EnsureVariant(ID3D12Device* dev, Info& info, ID3D12StateObject* app,
 // layout, into `cl`, and fills `mine` with them. The caller binds the
 // variant, dispatches, and binds the application's pipeline again. `sel`:
 // which scene each of the variant's scene slots traces (0.59.0).
+// A library assembled again from `text`, keeping the subobjects `orig`
+// declares; with `config1ToConfig` a RaytracingPipelineConfig1 among them
+// becomes a RaytracingPipelineConfig of the same depth (0.64.0).
+bool ReassembleLibrary(const std::string& text, const void* orig, size_t origSize, bool config1ToConfig,
+                       std::vector<uint8_t>* out, std::string* err);
+// The RaytracingPipelineConfig1 a library declares itself, if any.
+bool LibraryConfig1(const void* container, size_t size, UINT* depth, UINT* flags);
+
 // `heaps`: the descriptor heaps bound at the dispatch; with a variant in a
 // table form and no CBV/SRV/UAV heap among them, `bind` receives the heaps to
 // bind for the dispatch (empty otherwise).

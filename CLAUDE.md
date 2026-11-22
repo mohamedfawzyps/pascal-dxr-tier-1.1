@@ -23,7 +23,10 @@ then cluster operations, then Tier 1.2.
 
 1. The 24 MegaLights loop-isolation shaders. DONE, 0.42.0.
 2. The 33 two-query shaders. DONE, 0.43.0.
-3. **Finish Tier 1.1**, easiest first. Reporting 1.1 promises all of it.
+3. **Finish Tier 1.1: FOLLOW docs/tier11-plan.md (2026-09-26).** It works
+   from the spec's seven-item definition and supersedes the a to f list
+   below, which missed the spec's extra vertex formats and drifted into item
+   a's edge cases for 20 versions. Easiest first. Reporting 1.1 promises all of it.
    Escher hits none of these today, every one of its shaders lowers, so they
    are for correctness, not for anything visible there.
    a. **`GeometryIndex()` in the APPLICATION's own DXR shaders.** Tier 1.1:
@@ -153,6 +156,43 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.67.0: PLAN STEP 3 h, FOR ANY-HIT BODIES, AND AN EXACT `Abort()`.** Any
+write in the loop body lowers (once per candidate, by
+`NO_DUPLICATE_ANYHIT_INVOCATION`); `Abort()` ends the search, or, where
+committed state is read, the query is traced forced non-opaque and every
+later candidate is rejected. Still refused: a write in a body that becomes an
+intersection shader. **DRIVER FACTS: a payload of exactly 124 bytes whose
+last dword an any-hit reads crashes the 1070 inside `CreateStateObject`; one
+of 128 bytes builds and removes the device when dispatched.** (80 to 260
+swept for the first, 120 to 156 run for the second;
+`phase5/cases/driver-crash/pay124`, `rayquery_carry128`.) The lowering pads
+both to 132. Dispatch suite 86 of 86, rewriter 49 of 49. NEXT: step 3 h's intersection case, then e, f, g, i, j, k, l.
+
+**0.66.0: PLAN STEP 3 c.** Committed state read inside the Proceed loop: the
+any-hit keeps the committed hit in the payload. Opaque candidates never reach
+an any-hit, so a tracked query is traced forced non-opaque and the any-hit
+applies opacity itself (geometry `OPAQUE` from a third record word, instance
+and ray flags, the two culls), accepting an opaque one without the body.
+Dispatch suite 78 of 78; opacity poison diverges. **With two candidates per
+ray, what the body sees first is implementation-defined, on WARP too: compare
+only order-free results.** NEXT: step 3 h (general writes) and exact
+`Abort()`, then e, f, g, i, j, k, l.
+
+**0.65.0: PLAN STEP 3 a, b, d.** `switch` edges in both CFG models; 6.6
+resource arrays (a CONSTANT index had bound element 0, silently: 0 hits of
+14450 on 0.64.0); loop state (header phis and values leaving the loop) in
+the payload, per iteration, with a flag for the guard's edge. Dispatch suite
+66 of 66. NEXT: step 3 c (committed state read inside the loop: needs each
+record's opacity, since opaque candidates never reach an any-hit).
+
+**0.64.0: SPEC ITEMS 7 AND 6 DONE; ONLY ITEM 3 (RAYQUERY BEYOND COMPUTE) IS
+LEFT OF TIER 1.1.** Following docs/tier11-plan.md. The seven vertex formats
+Tier 1.1 adds are native on the 1070 (`raytest --vformat`, all bit-exact). A
+`PIPELINE_CONFIG1` is REJECTED by the 1070, so `proxy/pipe_flags` ORs its
+flags into every `TraceRay`, turns it into a `CONFIG`, rebuilds collections
+built otherwise, and masks `RayFlags()` where exact (the spec says they do
+not show there; WARP shows them). `tier11/pflagtest.exe` 12 of 12.
+
 **0.63.0: PAST THE LOCAL ROOT SIGNATURE LIMIT, A DESCRIPTOR TABLE; AND THE
 LIMIT WAS WRONG.** The shim's own layouts carry their scene copies in one
 descriptor table (1 dword) where root SRVs (2 each) would pass the GTX 1070's
@@ -165,7 +205,7 @@ a signature it passed at 191 removed the device. Measured again
 descriptor 2, table 1; a constants parameter ending past dword 64 caps the
 total at its start + 128, otherwise 192. `gitest --biglrs` (191 of 192) all
 match; matrix 511 of 511 in root form and in both forced table forms, plus 2 gates. Still refused by name: an application
-signature at 192, a table needed in a 1,000,000 heap. NEXT: item b.
+signature at 192, a table needed in a 1,000,000 heap. 
 
 **0.62.0: A DESERIALIZED STRUCTURE IS DECODED AND DRAWN.** What a
 DESERIALIZE made is asked of the driver: `VISUALIZATION_DECODE_FOR_TOOLS`

@@ -341,6 +341,56 @@ $cases = @(
        desc = 'the dispatch traces a deserialized top-level structure' },
     @{ name = 'tlasdesergpu'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--tlasdeser', '--gpuinst');
        desc = 'the same, GPU-written instances' },
+    # Plan step 3 (0.65.0): a switch through the Proceed loop, which the CFG
+    # model did not follow, and resource arrays at Shader Model 6.6, where a
+    # constant index bound element 0 (0 hits of 14450) and a dynamic one was
+    # refused.
+    @{ name = 'switch'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_switch.hlsl', '--geom');
+       desc = 'a switch inside the Proceed loop and after it' },
+    @{ name = 'switchc'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_switch.hlsl', '--geom', '--contrib');
+       desc = 'the same, contribution 2' },
+    @{ name = 'table66'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_table_sm66.hlsl', '--table');
+       desc = '6.6 resource array, constant index' },
+    @{ name = 'dyn66'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_dyn_sm66.hlsl', '--table');
+       desc = '6.6 resource array, dynamic index' },
+    @{ name = 'dynnu66'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_dynnu_sm66.hlsl', '--table');
+       desc = '6.6 resource array, NonUniformResourceIndex' },
+    # Loop state (0.65.0): a count, the nearest t and a value chosen with it,
+    # carried across Proceed iterations and out of the loop in the payload.
+    @{ name = 'carryout'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_carryout.hlsl', '--geom');
+       desc = 'state carried across candidates and out of the loop' },
+    @{ name = 'carryoutm'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_carryout.hlsl', '--multi');
+       desc = 'the same, two instances' },
+    # Committed state read inside the Proceed loop (0.66.0): the any-hit keeps
+    # it in the payload, the ray traced forced non-opaque and the original
+    # opacity applied by the any-hit from each record's third word. Single
+    # candidates per ray (--geom), so what the body sees is comparable; the
+    # stacked scene compares only the final hit, the order-free result.
+    @{ name = 'cmt'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_committed.hlsl', '--geom'); desc = 'committed state read in the loop' },
+    @{ name = 'cmtop'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_committed.hlsl', '--geom', '--opaquemix'); desc = 'the same, two quadrants opaque' },
+    @{ name = 'cmtopc'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_committed.hlsl', '--geom', '--opaquemix', '--contrib'); desc = 'the same, contribution 2' },
+    @{ name = 'cmtif8'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_committed.hlsl', '--geom', '--opaquemix', '--instflags', '8'); desc = 'the instance forced non-opaque' },
+    @{ name = 'cmtif4'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_committed.hlsl', '--geom', '--opaquemix', '--instflags', '4'); desc = 'the instance forced opaque' },
+    @{ name = 'cmtstack'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_committed_stack.hlsl', '--geom', '--opaquemix', '--stack'); desc = 'two candidates per ray, the final hit' },
+    @{ name = 'cmtcullop'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_committed_cullop.hlsl', '--geom', '--opaquemix'); desc = 'RAY_FLAG_CULL_OPAQUE' },
+    @{ name = 'cmtcullnop'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_committed_cullnop.hlsl', '--geom', '--opaquemix'); desc = 'RAY_FLAG_CULL_NON_OPAQUE' },
+    @{ name = 'cmtfnop'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_committed_forcenop.hlsl', '--geom', '--opaquemix'); desc = 'RAY_FLAG_FORCE_NON_OPAQUE' },
+    @{ name = 'cmttwoq'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_committed_twoq.hlsl', '--geom', '--opaquemix'); desc = 'two queries, both reading committed state' },
+    @{ name = 'proccmt'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_committed.hlsl', '--proc'); desc = 'procedural: CommittedRayT is RayTCurrent' },
+    @{ name = 'proccmtmix'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_committed.hlsl', '--mixed', '--contrib'); desc = 'the same, a mixed scene' },
+    # Writes in the loop body and Abort() made exact (0.67.0). One candidate
+    # per ray (--geom) for the writes, so each store is comparable; the stacked
+    # scenes compare only order-free results.
+    @{ name = 'writes'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_writes.hlsl', '--geom'); desc = 'a store and an atomic in the loop body' },
+    @{ name = 'writesop'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_writes.hlsl', '--geom', '--opaquemix'); desc = 'the same, two quadrants opaque' },
+    @{ name = 'abortflag'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_abortflag.hlsl', '--geom', '--stack'); desc = 'Abort(), committed state never read: the search ends' },
+    @{ name = 'abortcmt'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_abortcommit.hlsl', '--geom', '--opaquemix'); desc = 'commit then Abort(), and a bare Abort()' },
+    @{ name = 'abortcmtc'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_abortcommit.hlsl', '--geom', '--opaquemix', '--contrib'); desc = 'the same, contribution 2' },
+    @{ name = 'abortstack'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_abortstack.hlsl', '--geom', '--opaquemix', '--stack'); desc = 'nothing commits after Abort(), order-free' },
+    @{ name = 'abortmix'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_abortstack.hlsl', '--geom', '--stackmix'); desc = 'the same, an opaque candidate behind a non-opaque one' },
+    # A 128 byte payload removes the 1070's device when dispatched; the
+    # lowering pads it to 132 (0.67.0).
+    @{ name = 'carry128'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_carry128.hlsl', '--geom', '--opaquemix'); desc = 'a payload that would be 128 bytes' },
     @{ name = 'deserboth'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--tlasdeser', '--deserialize');
        desc = 'a deserialized top-level structure over a deserialized bottom-level one' }
 )
@@ -595,6 +645,111 @@ foreach ($l in @('--localscene', '--localscenetable')) {
     else { Write-Host "  gitest $l --biglrs: NOT ALL MATCH"; $failed++ }
 }
 $env:DXR_TIER11 = ''
+
+# Spec Tier 1.1 item 7: the vertex formats Tier 1.1 adds for bottom-level
+# builds (and the Tier 1.0 ones as controls), with the packed strides the
+# spec allows. MEASURED native on the GTX 1070 (0.64.0): no emulation, every
+# format bit-exact against WARP. Sensitivity: 8-bit positions against float
+# ones must DIVERGE, so the case sees the format.
+Write-Host ''
+Write-Host '=== vertex formats (Tier 1.1 adds seven) ==='
+$env:DXR_TIER11 = '1'
+$vf = @(@(6,0),@(10,0),@(13,0),@(11,0),@(35,0),@(24,0),@(28,0),@(49,0),@(31,0),@(51,0),@(28,3),@(31,3),@(11,6))
+$bad = @()
+foreach ($c in $vf) {
+    $x = @('--vformat', "$($c[0])"); if ($c[1]) { $x += @('--vstride', "$($c[1])") }
+    & .\raytest.exe warp rayquery opaque dp_vf_a.bin @x | Out-Null
+    & .\raytest.exe hw rayquery opaque dp_vf_b.bin @x | Out-Null
+    if (-not ((& .\raytest.exe diff dp_vf_a.bin dp_vf_b.bin 2>&1) -match 'RESULT: MATCH')) { $bad += "$($c[0])/$($c[1])" }
+}
+& .\raytest.exe hw rayquery opaque dp_vf_b.bin --vformat 6 | Out-Null
+& .\raytest.exe warp rayquery opaque dp_vf_a.bin --vformat 28 | Out-Null
+$sens = (& .\raytest.exe diff dp_vf_a.bin dp_vf_b.bin 2>&1) -match 'RESULT: DIVERGE'
+Remove-Item dp_vf_a.bin, dp_vf_b.bin -ErrorAction SilentlyContinue
+if (-not $bad.Count -and $sens) { Write-Host "  $($vf.Count) format/stride cases match WARP; 8-bit against float diverges" }
+else { Write-Host "  VERTEX FORMATS FAILED: $($bad -join ', ') sensitive=$sens"; $failed++ }
+$env:DXR_TIER11 = ''
+
+# Loop state (0.65.0): with DXR_TIER11_STATE_POISON=1 no iteration stores
+# its state, so carryout must DIVERGE.
+Write-Host ''
+Write-Host '=== loop state carried in the payload ==='
+$env:DXR_TIER11 = '1'
+$x = @('--cs', 'phase5\cases\rayquery_carryout.hlsl', '--geom')
+& .\raytest.exe warp rayquery alpha dp_st_a.bin @x | Out-Null
+$env:DXR_TIER11_STATE_POISON = '1'
+& .\raytest.exe hw rayquery alpha dp_st_b.bin @x | Out-Null
+$env:DXR_TIER11_STATE_POISON = $null
+if ((& .\raytest.exe diff dp_st_a.bin dp_st_b.bin 2>&1) -match 'RESULT: DIVERGE') { Write-Host '  carryout: diverges with the state poisoned' }
+else { Write-Host '  NOT SENSITIVE: carryout matched with the state poisoned'; $failed++ }
+foreach ($f in 'dp_st_a.bin', 'dp_st_b.bin') { if (Test-Path $f) { [IO.File]::Delete((Join-Path $PWD $f)) } }
+$env:DXR_TIER11 = ''
+
+# Committed state (0.66.0): with DXR_TIER11_OPACITY_POISON=1 every record
+# says not opaque, so the opaque quadrants run the body: cmtop must DIVERGE.
+Write-Host ''
+Write-Host '=== committed state read inside the loop ==='
+$env:DXR_TIER11 = '1'
+$x = @('--cs', 'phase5\cases\rayquery_committed.hlsl', '--geom', '--opaquemix')
+& .\raytest.exe warp rayquery alpha dp_op_a.bin @x | Out-Null
+$env:DXR_TIER11_OPACITY_POISON = '1'
+& .\raytest.exe hw rayquery alpha dp_op_b.bin @x | Out-Null
+$env:DXR_TIER11_OPACITY_POISON = $null
+if ((& .\raytest.exe diff dp_op_a.bin dp_op_b.bin 2>&1) -match 'RESULT: DIVERGE') { Write-Host '  cmtop: diverges with every record said not opaque' }
+else { Write-Host '  NOT SENSITIVE: cmtop matched with the opacity poisoned'; $failed++ }
+foreach ($f in 'dp_op_a.bin', 'dp_op_b.bin') { if (Test-Path $f) { [IO.File]::Delete((Join-Path $PWD $f)) } }
+$env:DXR_TIER11 = ''
+
+# Abort() (0.67.0): with DXR_TIER11_ABORT_POISON=1 an aborting query keeps
+# its own flags, so traversal commits an opaque candidate met after the abort,
+# as before 0.67.0. abortstack must DIVERGE, on --stackmix: with --stack
+# --opaquemix no ray meets both kinds, and the poison matched (measured).
+Write-Host ''
+Write-Host '=== Abort() exactness ==='
+$env:DXR_TIER11 = '1'
+$x = @('--cs', 'phase5\cases\rayquery_abortstack.hlsl', '--geom', '--stackmix')
+& .\raytest.exe warp rayquery alpha dp_ab_a.bin @x | Out-Null
+$env:DXR_TIER11_ABORT_POISON = '1'
+& .\raytest.exe hw rayquery alpha dp_ab_b.bin @x | Out-Null
+$env:DXR_TIER11_ABORT_POISON = $null
+if ((& .\raytest.exe diff dp_ab_a.bin dp_ab_b.bin 2>&1) -match 'RESULT: DIVERGE') { Write-Host '  abortstack: diverges with traversal committing after the abort' }
+else { Write-Host '  NOT SENSITIVE: abortstack matched with the abort poisoned'; $failed++ }
+foreach ($f in 'dp_ab_a.bin', 'dp_ab_b.bin') { if (Test-Path $f) { [IO.File]::Delete((Join-Path $PWD $f)) } }
+$env:DXR_TIER11 = ''
+
+# Spec Tier 1.1 item 6: PIPELINE_CONFIG1 flags (0.64.0). The GTX 1070
+# rejects the subobject (CreateStateObject E_INVALIDARG); the shim ORs the
+# flags into every TraceRay (proxy/pipe_flags). tier11/pflagtest.exe against
+# WARP: the hit kinds always, RayFlags() too except where the shim masks it
+# as the spec says and WARP does not (--spec). The poison must DIVERGE.
+Write-Host ''
+Write-Host '=== pipeline flags (PIPELINE_CONFIG1) ==='
+$pf = @(
+    @{ a = @('--flags','0x100'); s = '' }, @{ a = @('--flags','0x200'); s = '' },
+    @{ a = @('--flags','0x100','--dxil'); s = '' }, @{ a = @('--flags','0x200','--dxil'); s = '' },
+    @{ a = @('--flags','0x100','--literal'); s = '0x100' }, @{ a = @('--flags','0x200','--literal','--dxil'); s = '0x200' },
+    @{ a = @('--flags','0x100','--collection'); s = '' }, @{ a = @('--flags','0x200','--collection','--dxil'); s = '' },
+    @{ a = @('--flags','0x100','--collection','--literal'); s = '0x100' },
+    @{ a = @('--flags','0x100','--collection','--literal','--mixmask'); s = '' },
+    @{ a = @('--flags','0x100','--grow'); s = '' }, @{ a = @('--flags','0x200','--grow','--literal'); s = '0x200' }
+)
+$bad = @()
+foreach ($c in $pf) {
+    $x = $c.a
+    foreach ($f in 'dp_pf_a.bin', 'dp_pf_b.bin') { if (Test-Path $f) { [IO.File]::Delete((Join-Path $PWD $f)) } }
+    & .\pflagtest.exe warp dp_pf_a.bin @x | Out-Null
+    & .\pflagtest.exe hw dp_pf_b.bin @x | Out-Null
+    $d = if ($c.s) { & .\pflagtest.exe diff dp_pf_a.bin dp_pf_b.bin --spec $c.s } else { & .\pflagtest.exe diff dp_pf_a.bin dp_pf_b.bin }
+    if (-not ($d -match 'RESULT: MATCH')) { $bad += ($x -join ' ') }
+}
+$env:DXR_TIER11_PFLAGS_POISON = '1'
+& .\pflagtest.exe hw dp_pf_b.bin --flags 0x100 | Out-Null
+& .\pflagtest.exe warp dp_pf_a.bin --flags 0x100 | Out-Null
+$env:DXR_TIER11_PFLAGS_POISON = $null
+$sens = (& .\pflagtest.exe diff dp_pf_a.bin dp_pf_b.bin) -match 'RESULT: DIVERGE'
+foreach ($f in 'dp_pf_a.bin', 'dp_pf_b.bin') { if (Test-Path $f) { [IO.File]::Delete((Join-Path $PWD $f)) } }
+if (-not $bad.Count -and $sens) { Write-Host "  $($pf.Count) cases match; poisoned, the flags are seen missing" }
+else { Write-Host "  PIPELINE FLAGS FAILED: $($bad -join '; ') sensitive=$sens"; $failed++ }
 
 Write-Host '=== the driver''s decode of a DESERIALIZED structure carries the result ==='
 # DXR_TIER11_DECODE_POISON=1 makes every decoded bottom-level structure one
