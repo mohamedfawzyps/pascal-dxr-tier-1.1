@@ -753,7 +753,34 @@ def _edit_query(module, q, edits, exports, fields, base, multi=False):
         if q.state:
             _edit_exit_phis(fn, q, exit_label, latch, edits)
 
-    edits[q.trace.index] = _trace_block(q, ra, exit_label, multi)
+    text = _trace_block(q, ra, exit_label, multi)
+    # Where traversal starts (0.72.0): at the first Proceed, not at
+    # TraceRayInline, so what the shader does between them (a store the loop
+    # body's atomics add to, say) happens before any candidate is met, as it
+    # did. The call and the routing after it replace the branch that first
+    # Proceed fed, or a top-tested loop's way in; the payload set-up stays.
+    route = None
+    if q.loop and q.top:
+        # Top-tested: the trace's block branches into the loop's header,
+        # which goes with the loop; the trace block now routes.
+        term = q.trace_block.terminator
+        if term is None or term.body.strip() != 'br label %s' % q.loop[1]:
+            raise rq.Unsupported('the trace does not branch straight into the '
+                                 'Proceed loop tested at its top')
+        route = term
+    elif q.loop:
+        for block, instr in q.proceeds:
+            term = block.terminator
+            if block.label != q.loop[1] and block is q.trace_block and term is not instr:
+                m = re.match(r'\s*br\s+i1\s+(\S+),', term.line)
+                if m and m.group(1) == instr.result:
+                    route = term
+    if route is not None:
+        cut = text.index('  call void @dx.op.traceRay.')
+        edits[q.trace.index] = text[:cut].rstrip('\n')
+        edits[route.index] = text[cut:]
+    else:
+        edits[q.trace.index] = text
 
     # Proceed calls vanish. The guard's branch is rewired past the loop; the
     # latch goes with the rest of the loop blocks.
@@ -839,9 +866,12 @@ def _trace_block(q, ra, exit_label, multi=False):
             else:
                 lines.append('  store %s %s, %s* %%%s.plc%d, align 4'
                              % (ty, init, ty, q.pfx, field))
-        lines.append('  %%%s.plc%d = getelementptr inbounds %s, %s* %%%s.pl, i32 0, i32 %d'
-                     % (q.pfx, st['iter'], PAYLOAD, PAYLOAD, q.pfx, st['iter']))
-        lines.append('  store i32 0, i32* %%%s.plc%d, align 4' % (q.pfx, st['iter']))
+        for f in (st['iter'], st['exit']):
+            if f is None:
+                continue
+            lines.append('  %%%s.plc%d = getelementptr inbounds %s, %s* %%%s.pl, i32 0, i32 %d'
+                         % (q.pfx, f, PAYLOAD, PAYLOAD, q.pfx, f))
+            lines.append('  store i32 0, i32* %%%s.plc%d, align 4' % (q.pfx, f))
     lines += flag_setup
     if q.track:
         # The original flags go to the any-hit, which applies the opacity
@@ -871,7 +901,7 @@ def _trace_block(q, ra, exit_label, multi=False):
         # What left the loop, as the last iteration stored it; then the
         # guard's two ways on, by whether any iteration ran. With none, the
         # original took the guard's other edge, so this does too.
-        for name, ty, field in st['outs']:
+        for name, ty, field in st['outs'] + st['souts']:
             lines.append('  %%%s.plc%d = getelementptr inbounds %s, %s* %%%s.pl, i32 0, i32 %d'
                          % (q.pfx, field, PAYLOAD, PAYLOAD, q.pfx, field))
             if ty == 'i1':
@@ -881,11 +911,26 @@ def _trace_block(q, ra, exit_label, multi=False):
             else:
                 lines.append('  %s = load %s, %s* %%%s.plc%d, align 4'
                              % (name, ty, ty, q.pfx, field))
-        lines.append('  %%%s.it = load i32, i32* %%%s.plc%d, align 4'
-                     % (q.pfx, q.pfx, st['iter']))
-        lines.append('  %%%s.itc = icmp ne i32 %%%s.it, 0' % (q.pfx, q.pfx))
-        lines.append('  br i1 %%%s.itc, label %s, label %s'
-                     % (q.pfx, exit_label, st['guard_false']))
+        if st['exits']:
+            # Which way the loop was left (0.72.0): through exit k, the
+            # raygen goes on where that edge went.
+            p = q.pfx
+            lines.append('  %%%s.ex = load i32, i32* %%%s.plc%d, align 4' % (p, p, st['exit']))
+            for b, t, k in st['exits']:
+                lines.append('  %%%s.xc%d = icmp eq i32 %%%s.ex, %d' % (p, k, p, k))
+                lines.append('  br i1 %%%s.xc%d, label %%%s.x%d, label %%%s.xk%d'
+                             % (p, k, p, k, p, k))
+                lines += ['', '%s.x%d:' % (p, k), '  br label %s' % t, '', '%s.xk%d:' % (p, k)]
+            lines.append('  br label %%%s.xn' % p)
+            lines += ['', '%s.xn:' % p]
+        if st['iter'] is not None:
+            lines.append('  %%%s.it = load i32, i32* %%%s.plc%d, align 4'
+                         % (q.pfx, q.pfx, st['iter']))
+            lines.append('  %%%s.itc = icmp ne i32 %%%s.it, 0' % (q.pfx, q.pfx))
+            lines.append('  br i1 %%%s.itc, label %s, label %s'
+                         % (q.pfx, exit_label, st['guard_false']))
+        else:
+            lines.append('  br label %s' % exit_label)
     elif exit_label:
         lines.append('  br label %s' % exit_label)
     return '\n'.join(lines)
@@ -1236,6 +1281,13 @@ def _check_loop_isolated(fn, q, header, latch, body, types):
             # is not read by the any-hit.
             if label == header and i.is_phi:
                 continue
+            if q.top and label == latch and i.is_phi:
+                # Top-tested (0.72.0): its header is the latch and its phis
+                # the state; only what an iteration hands back is read here.
+                for v, b in i.phi_incoming:
+                    if b in body:
+                        used.update(_NAME.findall(v))
+                continue
             used.update(_operands(i, types))
 
     # A resource handle read inside the loop is NOT caller state. It names a
@@ -1284,11 +1336,11 @@ def _plan_state(fn, q, header, latch, body, escapes, fields, base):
     picks the guard's edge the original would have taken.
 
     None when the loop carries nothing."""
-    hdr = fn.block(header)
+    hdr = fn.block(latch if q.top else header)
     phis = [i for i in hdr.instrs if i.is_phi]
-    if not phis and not escapes:
+    if not phis and not escapes and not q.exits:
         return None
-    if q.needs_both:
+    if q.needs_both and (phis or escapes):
         raise rq.Unsupported(
             'Proceed loop carries state across candidates or out of the loop (%s) '
             'and becomes an intersection shader, which has no payload to carry it in'
@@ -1314,24 +1366,47 @@ def _plan_state(fn, q, header, latch, body, escapes, fields, base):
             fields[key] = (ty, base + len(fields))
         return fields[key][1]
 
-    st = {'phis': [], 'outs': [], 'iter': None, 'guard_false': None}
+    st = {'phis': [], 'outs': [], 'souts': [], 'iter': None, 'guard_false': None,
+          'exits': [], 'exit': None}
     for p in phis:
         ty = typed(p.result)
-        inits = [v for v, b in p.phi_incoming if b != latch]
-        nexts = [v for v, b in p.phi_incoming if b == latch]
+        if q.top:
+            # Top-tested (0.72.0): the phi is the state itself, its start from
+            # outside, its next per edge back, resolved as latch phis are.
+            inits = [v for v, b in p.phi_incoming if b not in body]
+            nexts = [p.result]
+        else:
+            inits = [v for v, b in p.phi_incoming if b != latch]
+            nexts = [v for v, b in p.phi_incoming if b == latch]
         if len(inits) != 1 or len(nexts) != 1:
             raise rq.Unsupported('Proceed loop header phi %s has an unexpected shape'
                                  % p.result)
         st['phis'].append((p.result, ty, field(p.result, ty), inits[0].strip(),
                            nexts[0].strip()))
+    state = dict((n, f) for n, _ty, f, _i, _x in st['phis'])
     for e in escapes:
         ty = typed(e)
-        st['outs'].append((e, ty, field(e + '.out', ty)))
-    st['iter'] = field('%rq.iter', 'i32')
+        if q.top and e in state:
+            # Its field holds it as it leaves, by either way out.
+            st['souts'].append((e, ty, state[e]))
+        else:
+            st['outs'].append((e, ty, field(e + '.out', ty)))
+    if q.exits:
+        # Which way out, 0.72.0: 0 through the latch, k through exit k.
+        st['exit'] = field('%%rq.ex%d.out' % q.qid, 'i32')
+        st['exits'] = [(b, t, k) for k, (b, t) in enumerate(q.exits, 1)]
+    if not q.top:
+        st['iter'] = field('%rq.iter', 'i32')
     if len(fields) > MAX_CARRY:
         raise rq.Unsupported(
             'the Proceed loops carry %d values between them; more than the %d the '
             'payload carries' % (len(fields), MAX_CARRY))
+    st['def'] = dict((i.result, b.label) for b, i in fn.instrs() if i.result)
+    st['dom'] = fn.dominators()
+    st['latch_phis'] = {i.result: dict((b, v.strip()) for v, b in i.phi_incoming)
+                        for i in lat.instrs if i.is_phi}
+    if q.top:
+        return st
     # The guard: the Proceed before the loop, whose other edge skips it.
     pre = _preheader(fn, q, header, body)
     guard = [b for b, _ in q.proceeds if b.label != latch]
@@ -1341,25 +1416,38 @@ def _plan_state(fn, q, header, latch, body, escapes, fields, base):
     if len(others) != 1:
         raise rq.Unsupported('the guard Proceed has an unexpected shape')
     st['guard_false'] = others[0]
-    # Per edge into the latch, the value each field takes: a latch phi's
-    # incoming for that edge, anything else itself.
-    latch_phis = {i.result: dict((b, v.strip()) for v, b in i.phi_incoming)
-                  for i in lat.instrs if i.is_phi}
-    st['latch_phis'] = latch_phis
+    st['guard'] = guard[0].label
     return st
 
 
 def _edit_exit_phis(fn, q, exit_label, latch, edits):
-    """The loop's exit block now follows the trace block, not the latch."""
-    blk = fn.block(exit_label)
+    """The loop's exit block now follows the trace block, not the latch.
+
+    With exits (0.72.0) the trace block routes through blocks of its own: the
+    normal way on through %<pfx>.xn, exit k through %<pfx>.x<k>, so each
+    phi on the way out names the block it is now reached from."""
+    st = q.state
     tb = q.trace_block.label
-    for i in blk.instrs:
-        if not i.is_phi or not re.search(re.escape(latch) + r'\s*\]', i.line):
-            continue
-        if not tb:
-            raise rq.Unsupported('the Proceed loop exit has a phi and the trace is in '
-                                 'the entry block, which has no label to name')
-        edits[i.index] = re.sub(re.escape(latch) + r'(\s*\])', tb + r'\1', i.line)
+    ren = []      # (block whose phis, old predecessor, new one)
+    if st['exits']:
+        norm = '%%%s.xn' % q.pfx
+        ren.append((exit_label, latch, norm))
+        if st['guard_false']:
+            ren.append((st['guard_false'], st['guard'], norm))
+        for b, t, k in st['exits']:
+            ren.append((t, b, '%%%s.x%d' % (q.pfx, k)))
+    else:
+        ren.append((exit_label, latch, tb))
+    for target, old, new in ren:
+        for i in fn.block(target).instrs:
+            line = edits.get(i.index, i.line)
+            if not i.is_phi or line is None or \
+                    not re.search(re.escape(old) + r'\s*\]', line):
+                continue
+            if not new:
+                raise rq.Unsupported('the Proceed loop exit has a phi and the trace is in '
+                                     'the entry block, which has no label to name')
+            edits[i.index] = re.sub(re.escape(old) + r'(\s*\])', new + r'\1', line)
 
 
 # Values the loop body reads from before it and the hit shader cannot rebuild,
@@ -1692,7 +1780,7 @@ def _swap_declarations(text, q, globals_, binding=False):
             new += ['', '; Function Attrs: nounwind readonly',
                     'declare %s @dx.op.rawBufferLoad.i32'
                     '(i32, %%dx.types.Handle, i32, i32, i8, i32) #RQRO' % RESRET]
-    if q.needs_intersection or (q.track_proc and q.aborts):
+    if q.needs_intersection or (q.track_proc and (q.aborts or q.exits)):
         new += ['', '; Function Attrs: nounwind',
                 'declare i1 @dx.op.reportHit.%s(i32, float, i32, %s*) #RQNW'
                 % (ATTRS[1:], ATTRS)]
@@ -1700,7 +1788,7 @@ def _swap_declarations(text, q, globals_, binding=False):
     # AnyHitNull always does and it is nothing but an IgnoreHit.
     new += ['', '; Function Attrs: noreturn nounwind',
             'declare void @dx.op.ignoreHit(i32) #RQNR']
-    if (any(x.aborts for x in _loops(q)) and (not q.needs_intersection or q.needs_both)
+    if (any(x.aborts or x.exits for x in _loops(q)) and (not q.needs_intersection or q.needs_both)
             or q.track_proc):
         new += ['', '; Function Attrs: noreturn nounwind',
                 'declare void @dx.op.acceptHitAndEndSearch(i32) #RQNR']
@@ -1903,7 +1991,7 @@ def _intersection(module, q, exports, table, globals_, binds=None):
     order = [header] + sorted(l for l in body if l not in (header, latch))
     out = ['define void @%s() #RQNW {' % exports['intersection'],
            '  %%rq.at = alloca %s, align 8' % ATTRS]
-    if q.track_proc and q.aborts:
+    if q.track_proc and (q.aborts or q.exits):
         out += ['  %rq.iab = alloca i32, align 4',
                 '  store i32 0, i32* %rq.iab, align 4']
     if q.track_proc and q.ray_flags & 0xC0:
@@ -2016,25 +2104,41 @@ def _intersection(module, q, exports, table, globals_, binds=None):
                 line = re.sub(re.escape(old) + r'\b', new, line)
             # Every way out of the loop body is just a return here.
             line = re.sub(r'label\s+' + re.escape(latch) + r'\b', 'label %rq.done', line)
+            for k, (b, t) in enumerate(q.exits, 1):
+                if b == label:
+                    # A break or return (0.72.0): noted, and reported at the
+                    # one exit as a hit of kind 127 - k.
+                    line = re.sub(r'label\s+' + re.escape(t) + r'\b', 'label %%rq.ix%d' % k, line)
             for s2 in Block_successors(line):
-                if s2 not in body and s2 != '%rq.done':
+                if s2 not in body and s2 != '%rq.done' and not s2.startswith('%rq.ix'):
                     raise rq.Unsupported(
                         'Proceed loop body branches to %s, outside the loop; '
                         'no lowering is defined for that' % s2)
             out.append(line)
 
-    if q.track_proc and q.aborts:
+    for k, _bt in enumerate(q.exits, 1):
+        # Which way out (0.72.0): 1 is an Abort(), k + 1 exit k.
+        out += ['', 'rq.ix%d:' % k,
+                '  store i32 %d, i32* %%rq.iab, align 4' % (k + 1),
+                '  br label %rq.done']
+    if q.track_proc and (q.aborts or q.exits):
         # The one exit: an Abort() in this invocation is reported as a hit of
         # kind 127, which the procedural any-hit turns into the end of the
-        # search (0.71.0). At RayTCurrent(), always inside the interval.
+        # search (0.71.0); exit k as one of kind 127 - k (0.72.0). At
+        # RayTCurrent(), always inside the interval.
+        kind = 'i32 127'
+        pre = []
+        if q.exits:
+            pre = ['  %rq.idk = sub i32 128, %rq.ida']
+            kind = 'i32 %rq.idk'
         out += ['', 'rq.done:',
                 '  %rq.ida = load i32, i32* %rq.iab, align 4',
                 '  %rq.idc = icmp ne i32 %rq.ida, 0',
                 '  br i1 %rq.idc, label %rq.iabt, label %rq.iret',
-                '', 'rq.iabt:',
+                '', 'rq.iabt:'] + pre + [
                 '  %rq.idt = call float @dx.op.rayTCurrent.f32(i32 154)  ; RayTCurrent()',
-                '  %%rq.idr = call i1 @dx.op.reportHit.%s(i32 158, float %%rq.idt, i32 127, '
-                '%s* nonnull %%rq.at)  ; ReportHit(THit,HitKind,Attributes)' % (ATTRS[1:], ATTRS),
+                '  %%rq.idr = call i1 @dx.op.reportHit.%s(i32 158, float %%rq.idt, %s, '
+                '%s* nonnull %%rq.at)  ; ReportHit(THit,HitKind,Attributes)' % (ATTRS[1:], kind, ATTRS),
                 '  br label %rq.iret',
                 '', 'rq.iret:', '  ret void', '}']
     else:
@@ -2091,7 +2195,8 @@ def _anyhit(module, q, exports, table, globals_, binds=None):
     # AcceptHitAndEndSearch would be exact for the commit-then-abort case, but
     # only after proving the commit dominates the abort in the same iteration,
     # and correctness comes first here.
-    aborts = any(x.aborts for x in loops)
+    # A break or return ends the search as Abort() does (0.72.0).
+    aborts = any(x.aborts or x.exits for x in loops)
     track = any(x.track for x in loops)
 
     out = ['define void @%s(%s* noalias nocapture %%p, %s* nocapture readonly %%attr) #RQNW {'
@@ -2167,6 +2272,7 @@ def _anyhit(module, q, exports, table, globals_, binds=None):
     for x in loops:
         header, latch, body = x.loop
         commit_blocks = {b.label for b, _ in x.commits}
+        x.commit_blocks = commit_blocks
         order = [header] + sorted(l for l in body if l not in (header, latch))
         _anyhit_body(fn, x, order, header, latch, body, commit_blocks, subst,
                      multi, out)
@@ -2184,7 +2290,7 @@ def _anyhit(module, q, exports, table, globals_, binds=None):
                 '  br i1 %rq.ac, label %rq.end, label %rq.ret',
                 '', 'rq.ret:']
     out += ['  ret void', '', 'rq.reject:']
-    if aborts and (q.track_proc or not any(x.aborts and x.track for x in loops)):
+    if aborts and (q.track_proc or not any((x.aborts or x.exits) and x.track for x in loops)):
         # A bare Abort() in a query that never reads committed state: ending
         # the search on this candidate commits it, which nothing reads, and
         # stops traversal at once (0.67.0; until then it ran to the end).
@@ -2262,11 +2368,21 @@ def _anyhit_proc(q, exports):
            '  %%rq.ap = getelementptr inbounds %s, %s* %%attr, i32 0, i32 0' % (ATTRS, ATTRS),
            '  %rq.ab = load <2 x float>, <2 x float>* %rq.ap, align 4',
            '  %%rq.pab = getelementptr inbounds %s, %s* %%p, i32 0, i32 9' % (PAYLOAD, PAYLOAD),
-           '  %rq.phk = call i32 @dx.op.hitKind.i32(i32 143)  ; HitKind()',
-           '  %rq.pak = icmp eq i32 %rq.phk, 127',
-           '  br i1 %rq.pak, label %rq.pend, label %rq.prec',
+           '  %rq.phk = call i32 @dx.op.hitKind.i32(i32 143)  ; HitKind()']
+    if q.exits:
+        # Kinds 127 - n to 127 end the search, and say which way out (0.72.0).
+        out += ['  %%rq.pak = icmp ugt i32 %%rq.phk, %d' % (126 - len(q.exits))]
+    else:
+        out += ['  %rq.pak = icmp eq i32 %rq.phk, 127']
+    out += ['  br i1 %rq.pak, label %rq.pend, label %rq.prec',
            '', 'rq.pend:',
-           '  store i32 1, i32* %rq.pab, align 4',
+           '  store i32 1, i32* %rq.pab, align 4']
+    if q.exits:
+        out += ['  %rq.pxi = sub i32 127, %rq.phk',
+                '  %%rq.pxp = getelementptr inbounds %s, %s* %%p, i32 0, i32 %d'
+                % (PAYLOAD, PAYLOAD, q.state['exit']),
+                '  store i32 %rq.pxi, i32* %rq.pxp, align 4']
+    out += [
            '  call void @dx.op.acceptHitAndEndSearch(i32 156)  ; AcceptHitAndEndSearch()',
            '  unreachable',
            '', 'rq.prec:']
@@ -2339,6 +2455,7 @@ def _committed_read(i):
 def _anyhit_body(fn, q, order, header, latch, body, commit_blocks, subst, multi, out):
     """One query's loop body, as blocks of the any-hit."""
     q.tails = []
+    q.xtails = []
     # A phi in the body naming the header as a predecessor needs the header to
     # be a block of its own, not the entry (0.65.0; loop state makes these).
     named = any(i.is_phi and any(b == header for _v, b in i.phi_incoming)
@@ -2350,7 +2467,7 @@ def _anyhit_body(fn, q, order, header, latch, body, commit_blocks, subst, multi,
         if multi or label != header or named:
             out.append('')
             out.append('%s:' % label[1:])
-        if label == header and q.state:
+        if label == header and q.state and q.state['iter'] is not None:
             # An iteration ran: the body, not an opaque candidate committed
             # before it (0.66.0), and not an aborted one.
             f = q.state['iter']
@@ -2419,9 +2536,18 @@ def _anyhit_body(fn, q, order, header, latch, body, commit_blocks, subst, multi,
                 line = re.sub(r'label\s+' + re.escape(latch) + r'\b', 'label ' + tail, line)
                 target = tail
             line = re.sub(r'label\s+' + re.escape(latch) + r'\b', 'label ' + target, line)
+            for b, t, k in (q.state['exits'] if q.state else ()):
+                if b == label:
+                    # A break or return (0.72.0): through a tail that says
+                    # which, ends the search and keeps what was committed.
+                    tail = '%%rq.x%d.%d' % (q.qid, k)
+                    line = re.sub(r'label\s+' + re.escape(t) + r'\b', 'label ' + tail, line)
+                    if (label, tail, k) not in q.xtails:
+                        q.xtails.append((label, tail, k))
             for s in Block_successors(line):
                 if s not in body and s not in ('%rq.accept', '%rq.reject') and \
-                        not s.startswith('%%rq.t%d.' % q.qid):
+                        not s.startswith('%%rq.t%d.' % q.qid) and \
+                        not s.startswith('%%rq.x%d.' % q.qid):
                     raise rq.Unsupported(
                         'Proceed loop body branches to %s, outside the loop; '
                         'no lowering is defined for that' % s)
@@ -2434,6 +2560,13 @@ def _anyhit_tails(q, out):
     st = q.state
     if not st:
         return
+
+    def dominates(v, label):
+        # A value leaves only where it exists (0.72.0): an exit can be
+        # taken before a value it does not use is computed.
+        d = st['def'].get(v)
+        return d is None or d in st['dom'].get(label, ())
+
     for label, target in q.tails:
         tail = 'rq.t%d.%s' % (q.qid, label[1:])
         out.append('')
@@ -2442,6 +2575,8 @@ def _anyhit_tails(q, out):
                  [(f, ty, n) for n, ty, f in st['outs']]
         for f, ty, v in stores:
             v = st['latch_phis'].get(v, {}).get(label, v)
+            if not dominates(v, label):
+                continue
             ptr = '%%rq.s%d.%d.%s' % (f, q.qid, label[1:])
             out.append('  %s = getelementptr inbounds %s, %s* %%p, i32 0, i32 %d'
                        % (ptr, PAYLOAD, PAYLOAD, f))
@@ -2452,6 +2587,26 @@ def _anyhit_tails(q, out):
             else:
                 out.append('  store %s %s, %s* %s, align 4' % (ty, v, ty, ptr))
         out.append('  br label %s' % target)
+    for label, tail, k in q.xtails:
+        out.append('')
+        out.append('%s:' % tail[1:])
+        for f, ty, v in [(f, ty, n) for n, ty, f in st['outs']]:
+            if not dominates(v, label):
+                continue
+            ptr = '%%rq.s%d.%d.x%d' % (f, q.qid, k)
+            out.append('  %s = getelementptr inbounds %s, %s* %%p, i32 0, i32 %d'
+                       % (ptr, PAYLOAD, PAYLOAD, f))
+            if ty == 'i1':
+                z = '%%rq.z%d.%d.x%d' % (f, q.qid, k)
+                out.append('  %s = zext i1 %s to i32' % (z, v))
+                out.append('  store i32 %s, i32* %s, align 4' % (z, ptr))
+            else:
+                out.append('  store %s %s, %s* %s, align 4' % (ty, v, ty, ptr))
+        out.append('  %%rq.xe%d.%d = getelementptr inbounds %s, %s* %%p, i32 0, i32 %d'
+                   % (q.qid, k, PAYLOAD, PAYLOAD, st['exit']))
+        out.append('  store i32 %d, i32* %%rq.xe%d.%d, align 4' % (k, q.qid, k))
+        out.append('  store i32 1, i32* %rq.pab, align 4')
+        out.append('  br label %s' % ('%rq.accept' if label in q.commit_blocks else '%rq.reject'))
 
 
 def Block_successors(line):

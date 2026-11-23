@@ -92,7 +92,14 @@ code (`rq_analyze.cpp`, `rq_lower.cpp`) on 2026-09-26, not from memory:
   the payload, as values already travel in. DONE 0.65.0, with loop-carried
   state (header phis) too (`rayquery_carryout.hlsl`).
 - e. A `break` or `return` out of the loop body, and a loop with several
-  exits.
+  exits. DONE 0.72.0: an exit ends the search as `Abort()` does and stores
+  its id; the raygen branches on it after `TraceRay`. Top-tested loops (the
+  `Proceed()` in the header) are recognised; a procedural body reports an
+  exit as a hit of kind 127 - k. Found doing it, fixed: traversal began at
+  `TraceRayInline`, before code between it and the first `Proceed()`. Left of
+  it on the limits list: a candidate read after the loop where both ways out
+  meet (refused by name), and loop state or carried values in a body that is
+  also an intersection shader (refused, as before).
 - f. One query traced twice (`TraceRayInline` again on the same object).
 - g. `Proceed()` called without a loop, more than once.
 - h. General writes in the loop body (only counter appends lower today),
@@ -165,7 +172,13 @@ Three-form matrix, dispatch suite, an Escher run. Then the limits list:
   signature route);
 - a descriptor table needed while a 1,000,000-descriptor heap is bound;
 - a scene not resolved through the root signature;
-- a build older than the last 8 kept.
+- a build older than the last 8 kept;
+- a procedural query with `Abort()` and ray flags computed at run time
+  (0.71.0);
+- a candidate read after the Proceed loop where both ways out meet (0.72.0);
+- loop state, or values carried out, in a body that is also an
+  intersection shader, which has no payload (0.69.0; a per-ray scratch UAV
+  would be the route).
 
 ## Size
 

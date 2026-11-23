@@ -916,10 +916,18 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
     struct LoopState {
         std::vector<StatePhi> phis;
         std::vector<StateOut> outs;
+        // Top-tested (0.72.0): escaping header phis, loaded from their state.
+        std::vector<StateOut> souts;
         int iter = -1;
-        std::string guardFalse;
+        std::string guardFalse, guard;
         std::map<std::string, std::map<std::string, std::string>> latchPhis;   // phi -> pred -> value
         std::vector<std::pair<std::string, std::string>> tails;                // (block, accept/reject)
+        // A break or return (0.72.0): which way out, the exits as (block,
+        // target, k), and the any-hit's tails for them as (block, tail, k).
+        int exitField = -1;
+        std::vector<std::tuple<std::string, std::string, int>> exits, xtails;
+        std::map<std::string, std::string> defBlock;
+        std::map<std::string, std::set<std::string>> dom;
     };
     std::map<const Query*, LoopState> states;
     // Every value carried by any query, in field order, once all are planned.
@@ -1224,6 +1232,19 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 // the raygen and its next value by each iteration, so what it
                 // reads is not read by the any-hit.
                 if (lbl == x.loop.header && i.isPhi) continue;
+                if (x.top && lbl == x.loop.latch && i.isPhi) {
+                    // Top-tested (0.72.0): its header is the latch and its
+                    // phis the state; only what an iteration hands back is
+                    // read here.
+                    static const std::regex kName(R"RX(%"[^"]*"|%[\w.$-]+)RX");
+                    for (const auto& in : i.phiIncoming) {
+                        if (!x.loop.body.count(in.second)) continue;
+                        for (std::sregex_iterator it(in.first.begin(), in.first.end(), kName), end;
+                             it != end; ++it)
+                            used.insert(it->str());
+                    }
+                    continue;
+                }
                 for (const auto& u : Operands(i, types)) used.insert(u);
             }
         }
@@ -1339,13 +1360,13 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
 
         // The loop's state and what leaves it (0.65.0): see _plan_state.
         {
-            const llm::Block* hdr = fn.FindBlock(x.loop.header);
+            const llm::Block* hdr = fn.FindBlock(x.top ? x.loop.latch : x.loop.header);
             std::vector<const llm::Instr*> phis;
             if (hdr)
                 for (const auto& i : hdr->instrs)
                     if (i.isPhi) phis.push_back(&i);
-            if (!phis.empty() || !escapes.empty()) {
-                if (x.NeedsBoth()) {
+            if (!phis.empty() || !escapes.empty() || !x.exits.empty()) {
+                if (x.NeedsBoth() && (!phis.empty() || !escapes.empty())) {
                     std::string names;
                     for (const auto* p : phis) names += (names.empty() ? "" : ", ") + p->result;
                     for (const auto& s : escapes) names += (names.empty() ? "" : ", ") + s;
@@ -1387,30 +1408,58 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     const std::string ty = typed(p->result);
                     if (!terr.empty()) { r.error = terr; return false; }
                     std::vector<std::string> inits, nexts;
-                    for (const auto& in : p->phiIncoming)
-                        (in.second == x.loop.latch ? nexts : inits).push_back(Trim(in.first));
+                    if (x.top) {
+                        // Top-tested (0.72.0): the phi is the state itself.
+                        for (const auto& in : p->phiIncoming)
+                            if (!x.loop.body.count(in.second)) inits.push_back(Trim(in.first));
+                        nexts.push_back(p->result);
+                    } else {
+                        for (const auto& in : p->phiIncoming)
+                            (in.second == x.loop.latch ? nexts : inits).push_back(Trim(in.first));
+                    }
                     if (inits.size() != 1 || nexts.size() != 1) {
                         r.error = "Proceed loop header phi " + p->result + " has an unexpected shape";
                         return false;
                     }
                     st.phis.push_back({p->result, ty, field(p->result, ty), inits[0], nexts[0]});
                 }
+                std::map<std::string, int> stateField;
+                for (const auto& p : st.phis) stateField[p.name] = p.field;
                 for (const auto& s : escapes) {
                     const std::string ty = typed(s);
                     if (!terr.empty()) { r.error = terr; return false; }
-                    st.outs.push_back({s, ty, field(s + ".out", ty)});
+                    if (x.top && stateField.count(s))
+                        st.souts.push_back({s, ty, stateField[s]});
+                    else
+                        st.outs.push_back({s, ty, field(s + ".out", ty)});
                 }
-                st.iter = field("%rq.iter", "i32");
+                if (!x.exits.empty()) {
+                    // Which way out (0.72.0): 0 through the latch, k through exit k.
+                    st.exitField = field("%rq.ex" + std::to_string(x.qid) + ".out", "i32");
+                    for (size_t k = 0; k < x.exits.size(); ++k)
+                        st.exits.emplace_back(x.exits[k].first, x.exits[k].second, (int)k + 1);
+                }
+                if (!x.top) st.iter = field("%rq.iter", "i32");
                 if ((int)carryFields.size() > kMaxCarry) {
                     r.error = "the Proceed loops carry " + std::to_string(carryFields.size()) +
                               " values between them; more than the " + std::to_string(kMaxCarry) +
                               " the payload carries";
                     return false;
                 }
+                for (const auto& b : fn.blocks)
+                    for (const auto& i : b.instrs)
+                        if (!i.result.empty()) st.defBlock[i.result] = b.label;
+                st.dom = fn.Dominators();
+                for (const auto& i : lat->instrs) {
+                    if (!i.isPhi) continue;
+                    auto& mp = st.latchPhis[i.result];
+                    for (const auto& in : i.phiIncoming) mp[in.second] = Trim(in.first);
+                }
                 // The guard: the Proceed before the loop, whose other edge
-                // skips it.
+                // skips it. A top-tested loop has none.
                 std::string pre;
                 const llm::Block* guard = nullptr;
+                if (!x.top) {
                 for (const auto& p : x.proceeds)
                     if (p.first->label != x.loop.latch) { guard = p.first; break; }
                 if (guard)
@@ -1434,23 +1483,41 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     return false;
                 }
                 st.guardFalse = others[0];
-                for (const auto& i : lat->instrs) {
-                    if (!i.isPhi) continue;
-                    auto& mp = st.latchPhis[i.result];
-                    for (const auto& in : i.phiIncoming) mp[in.second] = Trim(in.first);
+                st.guard = guard->label;
                 }
-                // The loop's exit block now follows the trace block.
-                const llm::Block* ex = fn.FindBlock(exitLabel);
+                // The loop's exit block now follows the trace block; with
+                // exits (0.72.0), the blocks the trace block routes through.
+                // See _edit_exit_phis in lower.py.
                 const std::string tb = x.traceBlock->label;
-                const std::regex kLatchIn("\\" + x.loop.latch + "(\\s*\\])");
-                for (const auto& i : ex->instrs) {
-                    if (!i.isPhi || !std::regex_search(i.line, kLatchIn)) continue;
-                    if (tb.empty()) {
-                        r.error = "the Proceed loop exit has a phi and the trace is in the entry "
-                                  "block, which has no label to name";
-                        return false;
+                std::vector<std::tuple<std::string, std::string, std::string>> ren;
+                if (!st.exits.empty()) {
+                    const std::string norm = "%" + x.pfx + ".xn";
+                    ren.emplace_back(exitLabel, x.loop.latch, norm);
+                    if (!st.guardFalse.empty()) ren.emplace_back(st.guardFalse, st.guard, norm);
+                    for (const auto& ex : st.exits)
+                        ren.emplace_back(std::get<1>(ex), std::get<0>(ex),
+                                         "%" + x.pfx + ".x" + std::to_string(std::get<2>(ex)));
+                } else {
+                    ren.emplace_back(exitLabel, x.loop.latch, tb);
+                }
+                for (const auto& rn : ren) {
+                    const llm::Block* ex = fn.FindBlock(std::get<0>(rn));
+                    const std::regex kIn("\\" + std::get<1>(rn) + "(\\s*\\])");
+                    for (const auto& i : ex->instrs) {
+                        std::string line = i.line;
+                        auto ed = edits.find(i.index);
+                        if (ed != edits.end()) {
+                            if (!ed->second.has_value()) continue;
+                            line = *ed->second;
+                        }
+                        if (!i.isPhi || !std::regex_search(line, kIn)) continue;
+                        if (std::get<2>(rn).empty()) {
+                            r.error = "the Proceed loop exit has a phi and the trace is in the entry "
+                                      "block, which has no label to name";
+                            return false;
+                        }
+                        edits[i.index] = std::regex_replace(line, kIn, std::get<2>(rn) + "$1");
                     }
-                    edits[i.index] = std::regex_replace(i.line, kLatchIn, tb + "$1");
                 }
             }
         }
@@ -1627,10 +1694,13 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                                     ", align 4");
                 }
             }
-            const std::string f = std::to_string(st->iter);
-            lines.push_back("  %" + x.pfx + ".plc" + f + " = getelementptr inbounds " + kPayload + ", " +
-                            kPayload + "* %" + x.pfx + ".pl, i32 0, i32 " + f);
-            lines.push_back("  store i32 0, i32* %" + x.pfx + ".plc" + f + ", align 4");
+            for (int fi : { st->iter, st->exitField }) {
+                if (fi < 0) continue;
+                const std::string f = std::to_string(fi);
+                lines.push_back("  %" + x.pfx + ".plc" + f + " = getelementptr inbounds " + kPayload + ", " +
+                                kPayload + "* %" + x.pfx + ".pl, i32 0, i32 " + f);
+                lines.push_back("  store i32 0, i32* %" + x.pfx + ".plc" + f + ", align 4");
+            }
         }
         const auto ra = x.RayArgs();
         // The RayFlags operand, which may be a runtime value. The OR that
@@ -1672,7 +1742,9 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         if (st) {
             // What left the loop, as the last iteration stored it; then the
             // guard's two ways on, by whether any iteration ran.
-            for (const auto& o : st->outs) {
+            std::vector<StateOut> loads = st->outs;
+            loads.insert(loads.end(), st->souts.begin(), st->souts.end());
+            for (const auto& o : loads) {
                 const std::string f = std::to_string(o.field);
                 lines.push_back("  %" + x.pfx + ".plc" + f + " = getelementptr inbounds " + kPayload + ", " +
                                 kPayload + "* %" + x.pfx + ".pl, i32 0, i32 " + f);
@@ -1685,10 +1757,36 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                                     f + ", align 4");
                 }
             }
-            lines.push_back("  %" + x.pfx + ".it = load i32, i32* %" + x.pfx + ".plc" + std::to_string(st->iter) +
-                            ", align 4");
-            lines.push_back("  %" + x.pfx + ".itc = icmp ne i32 %" + x.pfx + ".it, 0");
-            lines.push_back("  br i1 %" + x.pfx + ".itc, label " + exitLabel + ", label " + st->guardFalse);
+            if (!st->exits.empty()) {
+                // Which way the loop was left (0.72.0): through exit k, the
+                // raygen goes on where that edge went.
+                const std::string& p = x.pfx;
+                lines.push_back("  %" + p + ".ex = load i32, i32* %" + p + ".plc" +
+                                std::to_string(st->exitField) + ", align 4");
+                for (const auto& ex : st->exits) {
+                    const std::string k = std::to_string(std::get<2>(ex));
+                    lines.push_back("  %" + p + ".xc" + k + " = icmp eq i32 %" + p + ".ex, " + k);
+                    lines.push_back("  br i1 %" + p + ".xc" + k + ", label %" + p + ".x" + k +
+                                    ", label %" + p + ".xk" + k);
+                    lines.push_back("");
+                    lines.push_back(p + ".x" + k + ":");
+                    lines.push_back("  br label " + std::get<1>(ex));
+                    lines.push_back("");
+                    lines.push_back(p + ".xk" + k + ":");
+                }
+                lines.push_back("  br label %" + p + ".xn");
+                lines.push_back("");
+                lines.push_back(p + ".xn:");
+            }
+            if (st->iter >= 0) {
+                lines.push_back("  %" + x.pfx + ".it = load i32, i32* %" + x.pfx + ".plc" +
+                                std::to_string(st->iter) + ", align 4");
+                lines.push_back("  %" + x.pfx + ".itc = icmp ne i32 %" + x.pfx + ".it, 0");
+                lines.push_back("  br i1 %" + x.pfx + ".itc, label " + exitLabel + ", label " +
+                                st->guardFalse);
+            } else {
+                lines.push_back("  br label " + exitLabel);
+            }
         } else if (!exitLabel.empty()) {
             lines.push_back("  br label " + exitLabel);
         }
@@ -1697,7 +1795,41 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             if (i) joined += "\n";
             joined += lines[i];
         }
-        edits[x.trace->index] = joined;
+        // Where traversal starts (0.72.0): at the first Proceed, so what the
+        // shader does between it and TraceRayInline happens before any
+        // candidate is met. See _edit_query in lower.py.
+        const llm::Instr* route = nullptr;
+        if (x.hasLoop && x.top) {
+            // Top-tested: the trace's block branches into the loop's header,
+            // which goes with the loop; the trace block now routes.
+            const llm::Instr* term = x.traceBlock->Terminator();
+            if (!term || Trim(term->body) != "br label " + x.loop.latch) {
+                r.error = "the trace does not branch straight into the Proceed loop "
+                          "tested at its top";
+                return false;
+            }
+            route = term;
+        } else if (x.hasLoop) {
+            static const std::regex kBr(R"(^\s*br\s+i1\s+(\S+),)");
+            for (const auto& p : x.proceeds) {
+                const llm::Instr* term = p.first->Terminator();
+                if (p.first->label == x.loop.latch || p.first != x.traceBlock || !term ||
+                    term == p.second)
+                    continue;
+                std::smatch bm;
+                if (std::regex_search(term->line, bm, kBr) && bm[1].str() == p.second->result)
+                    route = term;
+            }
+        }
+        if (route) {
+            const size_t cut = joined.find("  call void @dx.op.traceRay.");
+            std::string head = joined.substr(0, cut);
+            while (!head.empty() && head.back() == '\n') head.pop_back();
+            edits[x.trace->index] = head;
+            edits[route->index] = joined.substr(cut);
+        } else {
+            edits[x.trace->index] = joined;
+        }
     }
 
     // --- Proceed calls vanish ----------------------------------------------
@@ -1980,7 +2112,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                               "(i32, %dx.types.Handle, i32, i32, i8, i32) #RQRO");
             }
         }
-        if (q.NeedsIntersection() || (q.trackProc && !q.aborts.empty())) {
+        if (q.NeedsIntersection() || (q.trackProc && (!q.aborts.empty() || !q.exits.empty()))) {
             add.push_back("");
             add.push_back("; Function Attrs: nounwind");
             add.push_back("declare i1 @dx.op.reportHit." +
@@ -1994,7 +2126,8 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         add.push_back("declare void @dx.op.ignoreHit(i32) #RQNR");
         {
             bool anyAbort = false;
-            for (const Query* qp : queries) anyAbort = anyAbort || (qp->hasLoop && !qp->aborts.empty());
+            for (const Query* qp : queries)
+                anyAbort = anyAbort || (qp->hasLoop && (!qp->aborts.empty() || !qp->exits.empty()));
             if ((anyAbort && (!q.NeedsIntersection() || q.NeedsBoth())) || q.trackProc) {
                 add.push_back("");
                 add.push_back("; Function Attrs: noreturn nounwind");
@@ -2082,7 +2215,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             std::vector<std::string> is;
             is.push_back("define void @" + e.intersection + "() #RQNW {");
             is.push_back(std::string("  %rq.at = alloca ") + kAttrs + ", align 8");
-            if (q.trackProc && !q.aborts.empty()) {
+            if (q.trackProc && (!q.aborts.empty() || !q.exits.empty())) {
                 is.push_back("  %rq.iab = alloca i32, align 4");
                 is.push_back("  store i32 0, i32* %rq.iab, align 4");
             }
@@ -2218,8 +2351,16 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     line = std::regex_replace(
                         line, std::regex("label\\s+\\" + q.loop.latch + "\\b"),
                         "label %rq.done");
+                    for (size_t k = 0; k < q.exits.size(); ++k)
+                        if (q.exits[k].first == lbl)
+                            // A break or return (0.72.0): noted, and reported
+                            // at the one exit as a hit of kind 127 - k.
+                            line = std::regex_replace(
+                                line, std::regex("label\\s+\\" + q.exits[k].second + "\\b"),
+                                "label %rq.ix" + std::to_string(k + 1));
                     for (const auto& s2 : Block_successors(line))
-                        if (!q.loop.body.count(s2) && s2 != "%rq.done") {
+                        if (!q.loop.body.count(s2) && s2 != "%rq.done" &&
+                            s2.rfind("%rq.ix", 0) != 0) {
                             r.error = "Proceed loop body branches to " + s2 +
                                       ", outside the loop; no lowering is defined "
                                       "for that";
@@ -2228,9 +2369,16 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     is.push_back(line);
                 }
             }
+            for (size_t k = 0; k < q.exits.size(); ++k) {
+                // Which way out (0.72.0): 1 is an Abort(), k + 1 exit k.
+                is.push_back("");
+                is.push_back("rq.ix" + std::to_string(k + 1) + ":");
+                is.push_back("  store i32 " + std::to_string(k + 2) + ", i32* %rq.iab, align 4");
+                is.push_back("  br label %rq.done");
+            }
             is.push_back("");
             is.push_back("rq.done:");
-            if (q.trackProc && !q.aborts.empty()) {
+            if (q.trackProc && (!q.aborts.empty() || !q.exits.empty())) {
                 // The one exit (0.71.0): see _intersection in lower.py.
                 // DXR_TIER11_PROCABORT_POISON=1 leaves the abort unreported,
                 // so traversal runs on: the abort cases must diverge.
@@ -2241,10 +2389,16 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 is.push_back("  br i1 %rq.idc, label %rq.iabt, label %rq.iret");
                 is.push_back("");
                 is.push_back("rq.iabt:");
+                std::string kind = "i32 127";
+                if (!q.exits.empty()) {
+                    // Exit k as a hit of kind 127 - k (0.72.0).
+                    is.push_back("  %rq.idk = sub i32 128, %rq.ida");
+                    kind = "i32 %rq.idk";
+                }
                 is.push_back("  %rq.idt = call float @dx.op.rayTCurrent.f32(i32 154)  ; RayTCurrent()");
                 if (!procAbortPoison)
                     is.push_back("  %rq.idr = call i1 @dx.op.reportHit." +
-                                 std::string(kAttrs).substr(1) + "(i32 158, float %rq.idt, i32 127, " +
+                                 std::string(kAttrs).substr(1) + "(i32 158, float %rq.idt, " + kind + ", " +
                                  kAttrs + "* nonnull %rq.at)  ; ReportHit(THit,HitKind,Attributes)");
                 is.push_back("  br label %rq.iret");
                 is.push_back("");
@@ -2300,7 +2454,8 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             // only after proving the commit dominates the abort in the same
             // iteration, and correctness comes first.
             bool aborts = false;
-            for (const Query* xp : loops) aborts = aborts || !xp->aborts.empty();
+            // A break or return ends the search as Abort() does (0.72.0).
+            for (const Query* xp : loops) aborts = aborts || !xp->aborts.empty() || !xp->exits.empty();
             bool track = false;
             for (const Query* xp : loops) track = track || xp->track;
             auto entryOf = [](const Query* xp) {
@@ -2441,7 +2596,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                         ah.push_back("");
                         ah.push_back(lbl.substr(1) + ":");
                     }
-                    if (lbl == x.loop.header && st) {
+                    if (lbl == x.loop.header && st && st->iter >= 0) {
                         // An iteration ran: the body, not an opaque candidate
                         // committed before it (0.66.0), and not an aborted one.
                         const std::string f = std::to_string(st->iter);
@@ -2530,10 +2685,27 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                             target = tail;
                         }
                         line = std::regex_replace(line, kToLatch, "label " + target);
+                        if (st)
+                            for (const auto& ex : st->exits) {
+                                if (std::get<0>(ex) != lbl) continue;
+                                // A break or return (0.72.0): through a tail that
+                                // says which, ends the search and keeps what was
+                                // committed.
+                                const std::string tail = "%rq.x" + std::to_string(x.qid) + "." +
+                                                         std::to_string(std::get<2>(ex));
+                                line = std::regex_replace(
+                                    line, std::regex("label\\s+\\" + std::get<1>(ex) + "\\b"),
+                                    "label " + tail);
+                                const auto xt = std::make_tuple(lbl, tail, std::get<2>(ex));
+                                if (std::find(st->xtails.begin(), st->xtails.end(), xt) == st->xtails.end())
+                                    st->xtails.push_back(xt);
+                            }
                         const std::string tailPfx = "%rq.t" + std::to_string(x.qid) + ".";
+                        const std::string xtailPfx = "%rq.x" + std::to_string(x.qid) + ".";
                         for (const auto& s2 : Block_successors(line))
                             if (!x.loop.body.count(s2) && s2 != "%rq.accept" &&
-                                s2 != "%rq.reject" && s2.rfind(tailPfx, 0) != 0) {
+                                s2 != "%rq.reject" && s2.rfind(tailPfx, 0) != 0 &&
+                                s2.rfind(xtailPfx, 0) != 0) {
                                 r.error = "Proceed loop body branches to " + s2 +
                                           ", outside the loop; no lowering is defined "
                                           "for that";
@@ -2550,6 +2722,14 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 if (sit == states.end()) continue;
                 const LoopState& st = sit->second;
                 const std::string qs = std::to_string(xp->qid);
+                // A value leaves only where it exists (0.72.0): an exit can be
+                // taken before a value it does not use is computed.
+                auto dominates = [&](const std::string& v, const std::string& label) {
+                    auto d = st.defBlock.find(v);
+                    if (d == st.defBlock.end()) return true;
+                    auto dm = st.dom.find(label);
+                    return dm != st.dom.end() && dm->second.count(d->second) != 0;
+                };
                 for (const auto& tl : st.tails) {
                     const std::string bl = tl.first.substr(1);
                     ah.push_back("");
@@ -2570,6 +2750,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                             auto e2 = lp->second.find(tl.first);
                             if (e2 != lp->second.end()) v = e2->second;
                         }
+                        if (!dominates(v, tl.first)) continue;
                         const std::string ptr = "%rq.s" + f + "." + qs + "." + bl;
                         ah.push_back("  " + ptr + " = getelementptr inbounds " + std::string(kPayload) + ", " +
                                      kPayload + "* %p, i32 0, i32 " + f);
@@ -2582,6 +2763,41 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                         }
                     }
                     ah.push_back("  br label " + tl.second);
+                }
+                std::set<std::string> commitBlocks;
+                for (const auto& c : xp->commits) commitBlocks.insert(c.first->label);
+                for (const auto& xt : st.xtails) {
+                    const std::string& label = std::get<0>(xt);
+                    const std::string k = std::to_string(std::get<2>(xt));
+                    ah.push_back("");
+                    ah.push_back(std::get<1>(xt).substr(1) + ":");
+                    for (const auto& o : st.outs) {
+                        if (!dominates(o.name, label)) continue;
+                        const std::string f = std::to_string(o.field);
+                        const std::string ptr = "%rq.s" + f + "." + qs + ".x" + k;
+                        ah.push_back("  " + ptr + " = getelementptr inbounds " + std::string(kPayload) + ", " +
+                                     kPayload + "* %p, i32 0, i32 " + f);
+                        if (o.ty == "i1") {
+                            const std::string z = "%rq.z" + f + "." + qs + ".x" + k;
+                            ah.push_back("  " + z + " = zext i1 " + o.name + " to i32");
+                            ah.push_back("  store i32 " + z + ", i32* " + ptr + ", align 4");
+                        } else {
+                            ah.push_back("  store " + o.ty + " " + o.name + ", " + o.ty + "* " + ptr + ", align 4");
+                        }
+                    }
+                    // DXR_TIER11_EXIT_POISON=1 (0.72.0): an exit neither says
+                    // which nor ends the search, as before 0.72.0 had it lowered.
+                    // The exit cases must diverge (C++ only).
+                    static const bool exitPoison = std::getenv("DXR_TIER11_EXIT_POISON") != nullptr;
+                    if (!exitPoison) {
+                        ah.push_back("  %rq.xe" + qs + "." + k + " = getelementptr inbounds " +
+                                     std::string(kPayload) + ", " + kPayload + "* %p, i32 0, i32 " +
+                                     std::to_string(st.exitField));
+                        ah.push_back("  store i32 " + k + ", i32* %rq.xe" + qs + "." + k + ", align 4");
+                        ah.push_back("  store i32 1, i32* %rq.pab, align 4");
+                    }
+                    ah.push_back(std::string("  br label ") +
+                                 (commitBlocks.count(label) ? "%rq.accept" : "%rq.reject"));
                 }
             }
             ah.push_back("");
@@ -2599,7 +2815,8 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             ah.push_back("");
             ah.push_back("rq.reject:");
             bool abortTracked = false;
-            for (const Query* xp : loops) abortTracked = abortTracked || (!xp->aborts.empty() && xp->track);
+            for (const Query* xp : loops)
+                abortTracked = abortTracked || ((!xp->aborts.empty() || !xp->exits.empty()) && xp->track);
             if (aborts && (q.trackProc || !abortTracked)) {
                 // A bare Abort() in a query that never reads committed state:
                 // ending the search commits a hit nothing reads (0.67.0).
@@ -2734,14 +2951,26 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     "  %rq.ab = load <2 x float>, <2 x float>* %rq.ap, align 4",
                     "  %rq.pab = getelementptr inbounds " + pl + ", " + pl + "* %p, i32 0, i32 9",
                     "  %rq.phk = call i32 @dx.op.hitKind.i32(i32 143)  ; HitKind()",
-                    "  %rq.pak = icmp eq i32 %rq.phk, 127",
-                    "  br i1 %rq.pak, label %rq.pend, label %rq.prec",
-                    "", "rq.pend:",
-                    "  store i32 1, i32* %rq.pab, align 4",
-                    "  call void @dx.op.acceptHitAndEndSearch(i32 156)  ; AcceptHitAndEndSearch()",
-                    "  unreachable",
-                    "", "rq.prec:",
                 };
+                // Kinds 127 - n to 127 end the search, and say which way out
+                // (0.72.0).
+                if (!q.exits.empty())
+                    ap.push_back("  %rq.pak = icmp ugt i32 %rq.phk, " +
+                                 std::to_string(126 - (int)q.exits.size()));
+                else
+                    ap.push_back("  %rq.pak = icmp eq i32 %rq.phk, 127");
+                for (const char* l : { "  br i1 %rq.pak, label %rq.pend, label %rq.prec", "",
+                                       "rq.pend:", "  store i32 1, i32* %rq.pab, align 4" })
+                    ap.push_back(l);
+                if (!q.exits.empty()) {
+                    ap.push_back("  %rq.pxi = sub i32 127, %rq.phk");
+                    ap.push_back("  %rq.pxp = getelementptr inbounds " + pl + ", " + pl +
+                                 "* %p, i32 0, i32 " + std::to_string(states.at(&q).exitField));
+                    ap.push_back("  store i32 %rq.pxi, i32* %rq.pxp, align 4");
+                }
+                for (const char* l : { "  call void @dx.op.acceptHitAndEndSearch(i32 156)  ; AcceptHitAndEndSearch()",
+                                       "  unreachable", "", "rq.prec:" })
+                    ap.push_back(l);
                 for (const auto& l : RecordCommit(q, sm66, 2)) ap.push_back(l);
                 ap.push_back("  ret void");
                 ap.push_back("}");

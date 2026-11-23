@@ -127,6 +127,12 @@ struct Query {
     std::vector<std::pair<const llm::Block*, const llm::Instr*>> committedOps;
     bool hasLoop = false;
     llm::Loop loop;
+    // A loop left top-tested (0.72.0): the Proceed is in the block that
+    // loops, so loop.latch is that block and loop.header its body's first.
+    bool top = false;
+    // Edges leaving the loop body other than through the latch, a break or
+    // return (0.72.0): (block, target), numbered from 1 in order.
+    std::vector<std::pair<std::string, std::string>> exits;
     // Set by the lowering: is RayFlags read INSIDE the Proceed loop? Only
     // then does a generated hit shader call dx.op.rayFlags, and only then
     // may it be declared, since an unused declare is a validation error.

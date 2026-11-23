@@ -418,7 +418,18 @@ $cases = @(
     # lowering pads it to 132 (0.67.0).
     @{ name = 'carry128'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_carry128.hlsl', '--geom', '--opaquemix'); desc = 'a payload that would be 128 bytes' },
     @{ name = 'deserboth'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_geom.hlsl', '--geom', '--contrib', '--tlasdeser', '--deserialize');
-       desc = 'a deserialized top-level structure over a deserialized bottom-level one' }
+       desc = 'a deserialized top-level structure over a deserialized bottom-level one' },
+    # A break or return out of the loop body, and loops with several exits
+    # (0.72.0, plan step 3 e). Order-free: on --stack both layers have the
+    # same barycentrics, and a box test commits only the box it computes.
+    @{ name = 'break'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_break.hlsl', '--geom'); desc = 'a break, with and without a commit' },
+    @{ name = 'breakstack'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_break.hlsl', '--geom', '--stack'); desc = 'the same, two candidates: a break ends the search' },
+    @{ name = 'return'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_return.hlsl', '--geom'); desc = 'a return out of the loop body' },
+    @{ name = 'returnstack'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_return.hlsl', '--geom', '--stack'); desc = 'the same, two candidates' },
+    @{ name = 'twoexits'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_twoexits.hlsl', '--geom'); desc = 'a loop left top-tested, two exits with code of their own' },
+    @{ name = 'procbreak'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_break.hlsl', '--proc'); desc = 'a break and a return out of a procedural body' },
+    @{ name = 'procbreakstack'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_break.hlsl', '--proc', '--stack'); desc = 'the same, two boxes' },
+    @{ name = 'procbreakmix'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_break.hlsl', '--mixed', '--contrib'); desc = 'the same, a triangle beside the box' }
 )
 
 $failed = 0
@@ -774,6 +785,32 @@ $env:DXR_TIER11_PROCABORT_POISON = $null
 if ((& .\raytest.exe diff dp_pa_a.bin dp_pa_b.bin 2>&1) -match 'RESULT: DIVERGE') { Write-Host '  procwriteabort: diverges with the abort unreported' }
 else { Write-Host '  NOT SENSITIVE: procwriteabort matched with the abort unreported'; $failed++ }
 foreach ($f in 'dp_pa_a.bin', 'dp_pa_b.bin') { if (Test-Path $f) { [IO.File]::Delete((Join-Path $PWD $f)) } }
+$env:DXR_TIER11 = ''
+
+# A break or return out of the loop body (0.72.0): with
+# DXR_TIER11_EXIT_POISON=1 an exit neither ends the search nor says which
+# way it left, so breakstack (a second candidate runs the body), return and
+# twoexits (the code after the loop that the original skipped) must DIVERGE;
+# with the procedural abort poison, procbreakstack must too.
+Write-Host ''
+Write-Host '=== a break or return out of the loop body ==='
+$env:DXR_TIER11 = '1'
+$xg = @(
+    @{ n = 'breakstack'; v = 'DXR_TIER11_EXIT_POISON'; x = @('--cs', 'phase5\cases\rayquery_break.hlsl', '--geom', '--stack') },
+    @{ n = 'return'; v = 'DXR_TIER11_EXIT_POISON'; x = @('--cs', 'phase5\cases\rayquery_return.hlsl', '--geom') },
+    @{ n = 'twoexits'; v = 'DXR_TIER11_EXIT_POISON'; x = @('--cs', 'phase5\cases\rayquery_twoexits.hlsl', '--geom') },
+    @{ n = 'procbreakstack'; v = 'DXR_TIER11_PROCABORT_POISON'; x = @('--cs', 'phase5\cases\rayquery_proc_break.hlsl', '--proc', '--stack') }
+)
+foreach ($g in $xg) {
+    $x = $g.x
+    & .\raytest.exe warp rayquery alpha dp_xg_a.bin @x | Out-Null
+    Set-Item "env:$($g.v)" '1'
+    & .\raytest.exe hw rayquery alpha dp_xg_b.bin @x | Out-Null
+    Remove-Item "env:$($g.v)"
+    if ((& .\raytest.exe diff dp_xg_a.bin dp_xg_b.bin 2>&1) -match 'RESULT: DIVERGE') { Write-Host "  $($g.n): diverges with the exit poisoned" }
+    else { Write-Host "  NOT SENSITIVE: $($g.n) matched with the exit poisoned"; $failed++ }
+}
+foreach ($f in 'dp_xg_a.bin', 'dp_xg_b.bin') { if (Test-Path $f) { [IO.File]::Delete((Join-Path $PWD $f)) } }
 $env:DXR_TIER11 = ''
 
 # Spec Tier 1.1 item 6: PIPELINE_CONFIG1 flags (0.64.0). The GTX 1070

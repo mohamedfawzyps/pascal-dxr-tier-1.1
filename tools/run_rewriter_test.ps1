@@ -129,7 +129,17 @@ $cases = @(
     @{ name = 'procabortmix'; src = 'phase5\cases\rayquery_proc_abortmix.ll'; pat = 'alpha'; flags = @('--proc');
        norender = $true; desc = 'Abort() on either kind in a procedural query' },
     @{ name = 'procabortcmt'; src = 'phase5\cases\rayquery_proc_abortcmt.ll'; pat = 'alpha'; flags = @('--proc');
-       norender = $true; desc = 'commit then Abort(), committed state read' }
+       norender = $true; desc = 'commit then Abort(), committed state read' },
+    # A break or return out of the loop body, and a loop with two exits
+    # (0.72.0): record words, so these render through the proxy.
+    @{ name = 'break'; src = 'phase5\cases\rayquery_break.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = 'a break, with and without a commit' },
+    @{ name = 'return'; src = 'phase5\cases\rayquery_return.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = 'a return out of the loop body' },
+    @{ name = 'twoexits'; src = 'phase5\cases\rayquery_twoexits.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = 'a loop left top-tested, two exits with code of their own' },
+    @{ name = 'procbreak'; src = 'phase5\cases\rayquery_proc_break.ll'; pat = 'alpha'; flags = @('--proc');
+       norender = $true; desc = 'a break and a return out of a procedural body' }
 )
 
 if (-not (Test-Path 'phase5\dxil\rayquery_opaque.ll')) {

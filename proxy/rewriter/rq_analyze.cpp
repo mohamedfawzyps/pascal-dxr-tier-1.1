@@ -226,6 +226,79 @@ std::string Collect(const llm::Function& fn, Query& q,
     return "";
 }
 
+// The loop's exits other than the latch's (0.72.0): see _absorb_exits in
+// rayquery.py, which this mirrors.
+static std::string AbsorbExits(const llm::Function& fn, Query& q) {
+    std::set<std::string>& body = q.loop.body;
+    std::map<std::string, int> order;
+    for (size_t k = 0; k < fn.blocks.size(); ++k) order[fn.blocks[k].label] = (int)k;
+    auto byOrder = [&](const std::set<std::string>& in) {
+        std::vector<std::string> v(in.begin(), in.end());
+        std::sort(v.begin(), v.end(), [&](const std::string& a, const std::string& b) {
+            return order[a] < order[b];
+        });
+        return v;
+    };
+    std::map<std::string, std::vector<std::string>> succ;
+    for (const auto& b : fn.blocks) succ[b.label] = b.Successors();
+    const auto preds = fn.Preds();
+    std::set<std::string> need;
+    for (const auto* list : { &q.commits, &q.procCommits, &q.aborts })
+        for (const auto& c : *list) need.insert(c.first->label);
+    for (const auto& c : q.candidateOps)
+        if (c.second->DxOp() != kRayFlags) need.insert(c.first->label);
+    std::set<std::string> reach;
+    std::vector<std::string> todo;
+    for (const auto& l : body)
+        if (l != q.loop.latch)
+            for (const auto& s : succ[l])
+                if (!body.count(s)) todo.push_back(s);
+    while (!todo.empty()) {
+        const std::string l = todo.back();
+        todo.pop_back();
+        if (reach.count(l) || body.count(l)) continue;
+        reach.insert(l);
+        for (const auto& s : succ[l]) todo.push_back(s);
+    }
+    std::set<std::string> want;
+    for (const auto& l : need)
+        if (!body.count(l) && reach.count(l)) want.insert(l);
+    if (!want.empty()) {
+        std::set<std::string> back;
+        todo.assign(want.begin(), want.end());
+        while (!todo.empty()) {
+            const std::string l = todo.back();
+            todo.pop_back();
+            if (back.count(l) || body.count(l) || !reach.count(l)) continue;
+            back.insert(l);
+            auto it = preds.find(l);
+            if (it != preds.end())
+                for (const auto& p : it->second) todo.push_back(p);
+        }
+        for (const auto& l : byOrder(back)) {
+            auto it = preds.find(l);
+            if (it != preds.end())
+                for (const auto& p : it->second)
+                    if (p == q.loop.latch || (!body.count(p) && !back.count(p)))
+                        return "the candidate is read or committed in " + l +
+                               ", after the Proceed loop, which code that did not leave "
+                               "the loop also reaches";
+            for (const auto& c : q.committedOps)
+                if (c.first->label == l)
+                    return "committed state is read in " + l + ", on the way out of the "
+                           "Proceed loop after the candidate is used there";
+        }
+        body.insert(back.begin(), back.end());
+    }
+    q.exits.clear();
+    for (const auto& l : byOrder(body)) {
+        if (l == q.loop.latch) continue;
+        for (const auto& s : succ[l])
+            if (!body.count(s)) q.exits.emplace_back(l, s);
+    }
+    return "";
+}
+
 std::string FindLoop(const llm::Function& fn, Query& q) {
     std::set<std::string> proceedBlocks;
     for (const auto& p : q.proceeds) proceedBlocks.insert(p.first->label);
@@ -235,7 +308,51 @@ std::string FindLoop(const llm::Function& fn, Query& q) {
         if (proceedBlocks.count(lp.latch)) found.push_back(lp);
 
     if (found.size() > 1) return "more than one Proceed loop on one query";
-    if (found.size() == 1) { q.hasLoop = true; q.loop = found[0]; return ""; }
+    if (found.empty()) {
+        // Top-tested (0.72.0): see _find_loop in rayquery.py.
+        static const std::regex kBr(R"(^br i1 (\S+), label (\S+), label (\S+)$)");
+        const auto preds = fn.Preds();
+        for (const auto& lp : fn.NaturalLoops()) {
+            if (!proceedBlocks.count(lp.header)) continue;
+            const llm::Block* hdr = fn.FindBlock(lp.header);
+            const llm::Instr* pr = nullptr;
+            for (const auto& p : q.proceeds)
+                if (p.first->label == lp.header) { pr = p.second; break; }
+            const llm::Instr* term = hdr->Terminator();
+            std::smatch m;
+            if (!term || !std::regex_match(term->body, m, kBr) || m[1].str() != pr->result ||
+                !lp.body.count(m[2].str()) || lp.body.count(m[3].str()))
+                return "a Proceed loop tested at its top has an unexpected header shape";
+            for (const auto& i : hdr->instrs)
+                if (!(i.isPhi || &i == pr || &i == term))
+                    return "the Proceed loop header computes " +
+                           (i.result.empty() ? i.body.substr(0, 40) : i.result) +
+                           " itself; the any-hit shader has no header to compute it in";
+            const std::string first = m[2].str();
+            auto pit = preds.find(first);
+            if (pit == preds.end() || pit->second != std::vector<std::string>{ lp.header })
+                return "a Proceed loop tested at its top has an unexpected body entry";
+            bool merged = false;
+            for (auto& f : found)
+                if (f.latch == lp.header) {
+                    f.body.insert(lp.body.begin(), lp.body.end());
+                    merged = true;
+                }
+            if (merged) continue;
+            llm::Loop t;
+            t.header = first;
+            t.latch = lp.header;
+            t.body = lp.body;
+            found.push_back(t);
+            q.top = true;
+        }
+        if (found.size() > 1) return "more than one Proceed loop on one query";
+    }
+    if (found.size() == 1) {
+        q.hasLoop = true;
+        q.loop = found[0];
+        return AbsorbExits(fn, q);
+    }
     if (q.proceeds.size() > 1)
         return std::to_string(q.proceeds.size()) +
                " Proceed calls but no loop; unrecognised shape";
@@ -370,7 +487,9 @@ std::string RejectFunction(const llm::Function& fn, Query& q) {
             q.needsRecordConstants = true;
         }
         // Abort(), exactly (0.67.0): see _reject_function in rayquery.py.
-        if (!q.aborts.empty() && !q.committedOps.empty() && q.procCommits.empty() &&
+        // A break or return ends the search the same way (0.72.0).
+        if ((!q.aborts.empty() || !q.exits.empty()) && !q.committedOps.empty() &&
+            q.procCommits.empty() &&
             !(q.RayFlags() & 1)) {
             q.track = true;
             q.needsRecordConstants = true;
@@ -384,12 +503,19 @@ std::string RejectFunction(const llm::Function& fn, Query& q) {
                 for (const auto& i : blk->instrs)
                     if (IsCommittedOp(i.DxOp())) triCmt = true;
             }
-            if (!q.aborts.empty() || triCmt) {
+            // A break or return ends the search the same way (0.72.0).
+            if (!q.aborts.empty() || !q.exits.empty() || triCmt) {
                 if (!q.StaticFlags())
-                    return "Abort() or committed state read for a triangle candidate in a "
+                    return std::string(!q.exits.empty() && q.aborts.empty()
+                                           ? "A break or return" : "Abort()") +
+                           " or committed state read for a triangle candidate in a "
                            "Proceed loop that commits procedural hits, with ray flags "
                            "computed at run time; the exact lowering needs the query's own "
                            "opacity and cull flags as constants in its intersection shader";
+                if (q.exits.size() > 100)
+                    return std::to_string(q.exits.size()) + " ways out of a Proceed loop that "
+                           "becomes an intersection shader; it says which in a hit kind, and "
+                           "100 are free";
                 q.trackProc = true;
                 q.track = true;
                 q.needsRecordConstants = true;

@@ -522,7 +522,8 @@ def main():
     for case, why in (('rayquery_refuse_tricmt.ll', None),
                       ('rayquery_refuse_triabort.ll', None),
                       ('rayquery_refuse_procfx.ll', 'also writes for procedural candidates'),
-                      ('rayquery_refuse_procdynabort.ll', 'with ray flags computed at run time')):
+                      ('rayquery_refuse_procdynabort.ll', 'with ray flags computed at run time'),
+                      ('rayquery_refuse_candafter.ll', 'which code that did not leave the loop also reaches')):
         path = os.path.join('phase5', 'cases', case)
         if not os.path.isfile(path):
             continue

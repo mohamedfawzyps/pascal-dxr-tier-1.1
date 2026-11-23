@@ -200,6 +200,12 @@ class Query(object):
         self.candidate_ops = []
         self.committed_ops = []
         self.loop = None            # (header, latch, body) or None
+        # A loop left top-tested (0.72.0): the Proceed is in the block that
+        # loops, so `latch` is that block and `header` its body's first.
+        self.top = False
+        # Edges leaving the loop body other than through the latch, a `break`
+        # or `return` (0.72.0): [(block, target)], numbered from 1 in order.
+        self.exits = []
         # Does any accessor need the answer that only the shader TABLE has?
         # Set by the collect pass; drives the local root signature and the
         # wider hit records, both of which cost something and are therefore
@@ -567,8 +573,44 @@ def _find_loop(fn, q):
             found.append((header, latch, body))
     if len(found) > 1:
         raise Unsupported('more than one Proceed loop on one query')
+    if not found:
+        # Top-tested (0.72.0): DXC leaves a loop unrotated when its latch
+        # already exits, `while (q.Proceed()) { ...; if (c) break; }`, so the
+        # one Proceed sits in the header and the body's last block loops back.
+        # The header is then the latch: an edge into it ends an iteration.
+        for header, latch, body in fn.natural_loops():
+            if header not in proceed_blocks:
+                continue
+            hdr = fn.block(header)
+            pr = [i for b, i in q.proceeds if b.label == header][0]
+            m = re.match(r'^br i1 (\S+), label (\S+), label (\S+)$',
+                         hdr.terminator.body) if hdr.terminator else None
+            if (not m or m.group(1) != pr.result or m.group(2) not in body
+                    or m.group(3) in body):
+                raise Unsupported('a Proceed loop tested at its top has an '
+                                  'unexpected header shape')
+            for i in hdr.instrs:
+                if not (i.is_phi or i is pr or i is hdr.terminator):
+                    raise Unsupported(
+                        'the Proceed loop header computes %s itself; the any-hit '
+                        'shader has no header to compute it in' % (i.result or i.body[:40]))
+            first = m.group(2)
+            if fn.preds()[first] != [header]:
+                raise Unsupported('a Proceed loop tested at its top has an '
+                                  'unexpected body entry')
+            # A `continue` is a second edge back, so a second natural loop on
+            # the same header: one loop, both bodies.
+            same = [x for x in found if x[1] == header]
+            if same:
+                same[0][2].update(body)
+                continue
+            found.append((first, header, set(body)))
+            q.top = True
+        if len(found) > 1:
+            raise Unsupported('more than one Proceed loop on one query')
     if found:
         q.loop = found[0]
+        _absorb_exits(fn, q)
         return
 
     # No loop. One bare Proceed is the FORCE_OPAQUE shape, where traversal is
@@ -576,6 +618,59 @@ def _find_loop(fn, q):
     if len(q.proceeds) > 1:
         raise Unsupported('%d Proceed calls but no loop; unrecognised shape'
                           % len(q.proceeds))
+
+
+def _absorb_exits(fn, q):
+    """The loop's exits other than the latch's, 0.72.0.
+
+    A `break` or `return` leaves the body without reaching the latch, and DXC
+    sinks what the source did just before it (a commit, a candidate read)
+    into the block that leaves, OUTSIDE the natural loop. Those blocks are
+    the candidate's, so they join the body; every other edge out of the body
+    is an exit. An exit ends the search with the committed state as it
+    stands, as Abort() does, and the raygen goes on where the edge went."""
+    header, latch, body = q.loop
+    body = set(body)
+    labels = [b.label for b in fn.blocks]
+    succ = {b.label: b.successors() for b in fn.blocks}
+    preds = fn.preds()
+    need = set(b.label for b, i in q.commits + q.proc_commits + q.aborts)
+    need |= set(b.label for b, i in q.candidate_ops if i.dxop != RAY_FLAGS)
+    need -= body
+    # Outside blocks the body reaches without coming back to it, other than
+    # through the latch: running out of candidates leaves with none current.
+    reach, todo = set(), [s for l in body if l != latch for s in succ[l] if s not in body]
+    while todo:
+        l = todo.pop()
+        if l in reach or l in body:
+            continue
+        reach.add(l)
+        todo.extend(succ[l])
+    need &= reach
+    if need:
+        # And every block on the way to one.
+        back, todo = set(), list(need)
+        while todo:
+            l = todo.pop()
+            if l in back or l in body or l not in reach:
+                continue
+            back.add(l)
+            todo.extend(preds[l])
+        for l in sorted(back, key=labels.index):
+            for p in preds[l]:
+                if p == latch or (p not in body and p not in back):
+                    raise Unsupported(
+                        'the candidate is read or committed in %s, after the Proceed '
+                        'loop, which code that did not leave the loop also reaches' % l)
+            for b, i in q.committed_ops:
+                if b.label == l:
+                    raise Unsupported(
+                        'committed state is read in %s, on the way out of the Proceed '
+                        'loop after the candidate is used there' % l)
+        body |= back
+    q.loop = (header, latch, body)
+    q.exits = [(l, s) for l in sorted(body, key=labels.index) if l != latch
+               for s in succ[l] if s not in body]
 
 
 def _reject_module(module):
@@ -647,7 +742,8 @@ def _reject_function(fn, q):
         # is read; there the query is tracked, so every candidate reaches the
         # any-hit, which rejects them all once aborted. Where it is not read,
         # the any-hit ends the search instead (lower.py).
-        if (q.aborts and q.committed_ops and not q.needs_intersection
+        # A break or return ends the search the same way (0.72.0).
+        if ((q.aborts or q.exits) and q.committed_ops and not q.needs_intersection
                 and not (q.ray_flags & 1)):
             q.track = True
             q.needs_record_constants = True
@@ -666,13 +762,19 @@ def _reject_function(fn, q):
             tri_cmt = any(instr.dxop in COMMITTED_OPS
                           for label in reach_as(fn, q, 0)
                           for instr in fn.block(label).instrs)
-            if q.aborts or tri_cmt:
+            # A break or return ends the search the same way (0.72.0).
+            if q.aborts or q.exits or tri_cmt:
                 if q.dyn_flags is None:
                     raise Unsupported(
-                        'Abort() or committed state read for a triangle candidate in a '
+                        '%s or committed state read for a triangle candidate in a '
                         'Proceed loop that commits procedural hits, with ray flags '
                         'computed at run time; the exact lowering needs the query\'s own '
-                        'opacity and cull flags as constants in its intersection shader')
+                        'opacity and cull flags as constants in its intersection shader'
+                        % ('A break or return' if q.exits and not q.aborts else 'Abort()'))
+                if len(q.exits) > 100:
+                    raise Unsupported('%d ways out of a Proceed loop that becomes an '
+                                      'intersection shader; it says which in a hit kind, '
+                                      'and 100 are free' % len(q.exits))
                 q.track_proc = True
                 q.track = True
                 q.needs_record_constants = True

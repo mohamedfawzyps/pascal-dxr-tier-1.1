@@ -24,6 +24,65 @@ not.
 
 ---
 
+## 0.72.0
+
+**Plan step 3 e: a `break` or `return` out of the Proceed loop body, and
+loops with several exits.** All three were refused: an edge out of the body
+that did not go through the latch ("branches outside the loop"), and a loop
+DXC leaves top-tested ("no Proceed loop", because the one `Proceed()` sits in
+the header and the latch does not call it).
+
+- **An exit ends the search and says which way it left.** A `break` or
+  `return` leaves RayQuery with the committed state as it stands, as
+  `Abort()` does, so the exit's tail in the any-hit stores its exit id (a
+  payload field) and the values the code after the loop reads, sets the
+  abort flag, and accepts (an exit through a commit) or rejects; the 0.67.0
+  abort machinery then ends the search, tracked where committed state is
+  read. After `TraceRay` the raygen branches on the exit id to where each
+  edge went, through blocks of its own, so the phis there name a predecessor
+  each.
+- **What DXC sinks into the way out joins the body.** A commit or a candidate
+  read just before a `break` lands in the block that leaves, outside the
+  natural loop. Blocks the body reaches through a non-latch exit that hold
+  the candidate's ops become part of the any-hit. Refused by name: such a
+  block that code which did not leave through an exit also reaches (a
+  candidate read after the loop, `rayquery_refuse_candafter.hlsl`), and a
+  committed read there.
+- **Top-tested loops.** `while (q.Proceed()) { ...; if (c) break; }` keeps
+  its `Proceed()` in the header, which DXC does not rotate because the latch
+  already exits. The header is then the latch: an edge into it ends an
+  iteration, its phis are the loop state, and a `continue` (a second edge
+  back) merges into the same loop.
+- **Procedural bodies too.** The intersection shader notes an exit and
+  reports it at its one exit as a hit of kind 127 - k (an `Abort()` stays
+  127), which `AnyHitProc` turns into the exit id and the end of the search;
+  so a procedural query with an exit is tracked procedural (0.71.0). Still
+  refused there, as before: loop state or values carried out of a body that
+  is also an intersection shader (no payload).
+- **Traversal starts at the first `Proceed()`, not at `TraceRayInline`.**
+  The `TraceRay` call and its routing now replace the branch the first
+  `Proceed()` fed, so what the shader does between the two (a store the
+  body's atomics add to, found by `rayquery_break.hlsl`) happens before any
+  candidate, as it did. Every earlier case had nothing there, so nothing
+  else moved.
+- **Tests.** `rayquery_break.hlsl` (a break with a commit and one without,
+  a per-candidate atomic, loop state leaving through the break),
+  `rayquery_return.hlsl`, `rayquery_twoexits.hlsl` (top-tested, two exits
+  into one block, a candidate value used after), `rayquery_proc_break.hlsl`
+  (a commit-and-break and a return in a procedural body): all refused on
+  0.71.0, all match WARP on one candidate per ray and on two (`--stack`), the
+  procedural one on the mixed scene too. Order-free: both stacked layers have
+  the same barycentrics, and the box test commits only the box it computes.
+  `DXR_TIER11_EXIT_POISON=1` (an exit neither ends the search nor says which)
+  diverges: breakstack 3025 rays, return 3025, twoexits 4624;
+  `DXR_TIER11_PROCABORT_POISON=1` on the procedural case 5547. A break that
+  commits cannot show a continuing search on the 1070, which meets the near
+  layer first; the break without a commit can, whatever the order.
+  Byte-identical in both rewriters on 61 cases; rewriter refusal checks 61 of
+  61; dispatch suite 110 of 110.
+- **Escher unchanged:** all 781 dumped Unreal shader inputs lower
+  byte-identically to 0.71.0.
+
 ## 0.71.0
 
 **Plan step 3 h, finished: `Abort()` in a procedural query, exact.** An

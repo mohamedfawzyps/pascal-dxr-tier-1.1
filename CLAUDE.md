@@ -165,6 +165,20 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.72.0: PLAN STEP 3 e DONE, A `break` OR `return` OUT OF THE PROCEED
+LOOP.** An exit ends the search with the committed state kept, as `Abort()`
+does, storing its exit id in the payload; the raygen branches on it after
+`TraceRay` to where the edge went. What DXC sinks into the leaving block (a
+commit, a candidate read) joins the body; top-tested loops (`Proceed()` in
+the header, left unrotated when the latch already exits) are recognised; a
+procedural body reports exit k as a hit of kind 127 - k. Found doing it:
+traversal began at `TraceRayInline`, before the code between it and the
+first `Proceed()` (a store the body's atomics add to); now at the first
+`Proceed()`. **A break that commits cannot show a search that wrongly goes
+on, on the 1070 (near layer first); only a break without a commit can.**
+Escher unchanged, 781 of 781 byte-identical. NEXT: plan step 3 f (one query
+traced twice).
+
 **0.71.0: PLAN STEP 3 h DONE, `Abort()` IN A PROCEDURAL QUERY EXACT.**
 "Tracked procedural": forced non-opaque trace, a procedural any-hit
 (`AnyHitProc`) recording commits and ending the search on a reported hit of
