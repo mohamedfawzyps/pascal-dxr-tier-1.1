@@ -263,7 +263,11 @@ def lower(module, q, exports=None):
                           # functions is a cheap price for not having to
                           # re-lower later.
                           'anyhitnull': 'AnyHitNull',
-                          'isectnull': 'IsectNull'}
+                          'isectnull': 'IsectNull',
+                          # A tracked procedural query's (0.71.0): records
+                          # each procedural commit in the payload, and ends
+                          # the search for an Abort() reported as kind 127.
+                          'anyhitproc': 'AnyHitProc'}
     text = module.text
     md = _metadata(text)
     table = _resource_table(text, md)
@@ -1209,7 +1213,7 @@ def _check_loop_side_effects(module, fn, q, body):
     # types". The proxy sets it on AABB geometry as on triangles. What stays
     # refused is a write beside an Abort(): an intersection shader cannot
     # stop traversal, so it would write for AABBs RayQuery never yields.
-    if writes and q.needs_both and q.aborts:
+    if writes and q.needs_both and q.aborts and not q.track_proc:
         raise rq.Unsupported(
             'Proceed loop body writes (%s) and calls Abort() and becomes an '
             'intersection shader, which cannot stop traversal, so the write '
@@ -1688,7 +1692,7 @@ def _swap_declarations(text, q, globals_, binding=False):
             new += ['', '; Function Attrs: nounwind readonly',
                     'declare %s @dx.op.rawBufferLoad.i32'
                     '(i32, %%dx.types.Handle, i32, i32, i8, i32) #RQRO' % RESRET]
-    if q.needs_intersection:
+    if q.needs_intersection or (q.track_proc and q.aborts):
         new += ['', '; Function Attrs: nounwind',
                 'declare i1 @dx.op.reportHit.%s(i32, float, i32, %s*) #RQNW'
                 % (ATTRS[1:], ATTRS)]
@@ -1696,7 +1700,8 @@ def _swap_declarations(text, q, globals_, binding=False):
     # AnyHitNull always does and it is nothing but an IgnoreHit.
     new += ['', '; Function Attrs: noreturn nounwind',
             'declare void @dx.op.ignoreHit(i32) #RQNR']
-    if any(x.aborts for x in _loops(q)) and (not q.needs_intersection or q.needs_both):
+    if (any(x.aborts for x in _loops(q)) and (not q.needs_intersection or q.needs_both)
+            or q.track_proc):
         new += ['', '; Function Attrs: noreturn nounwind',
                 'declare void @dx.op.acceptHitAndEndSearch(i32) #RQNR']
     if binding:
@@ -1730,8 +1735,16 @@ def _closesthit(name, status, q):
     because it does not know which hit group resolved to it.
     """
     ch = ['define void @{ch}({pl}* noalias nocapture %p, {at}* nocapture readonly %attr) #RQNW {{'
-          .format(ch=name, pl=PAYLOAD, at=ATTRS),
-          '  %t = call float @dx.op.rayTCurrent.f32(i32 154)  ; RayTCurrent()',
+          .format(ch=name, pl=PAYLOAD, at=ATTRS)]
+    if q.track_proc:
+        # An abort ended the search (0.71.0): the hit it ended on is a
+        # stand-in, and the payload already holds what was committed.
+        ch += ['  %%rq.cga = getelementptr inbounds %s, %s* %%p, i32 0, i32 9' % (PAYLOAD, PAYLOAD),
+               '  %rq.cgv = load i32, i32* %rq.cga, align 4',
+               '  %rq.cgc = icmp ne i32 %rq.cgv, 0',
+               '  br i1 %rq.cgc, label %rq.cgr, label %rq.cgw',
+               '', 'rq.cgr:', '  ret void', '', 'rq.cgw:']
+    ch += ['  %t = call float @dx.op.rayTCurrent.f32(i32 154)  ; RayTCurrent()',
           '  %ap = getelementptr inbounds {at}, {at}* %attr, i32 0, i32 0'.format(at=ATTRS),
           '  %b = load <2 x float>, <2 x float>* %ap, align 4',
           '  %pt = getelementptr inbounds {pl}, {pl}* %p, i32 0, i32 0'.format(pl=PAYLOAD),
@@ -1805,6 +1818,8 @@ def _append_shaders(text, module, q, exports, table, globals_, binds=None):
         # closest-hit cannot tell which hit group resolved to it.
         fns.append(_closesthit(exports['closesthit'], 1, q))
         fns.append(_closesthit(exports['closesthitproc'], 2, q))
+        if q.track_proc:
+            fns.append(_anyhit_proc(q, exports))
     else:
         fns.append(_closesthit(exports['closesthit'],
                                2 if q.needs_intersection else 1, q))
@@ -1888,6 +1903,19 @@ def _intersection(module, q, exports, table, globals_, binds=None):
     order = [header] + sorted(l for l in body if l not in (header, latch))
     out = ['define void @%s() #RQNW {' % exports['intersection'],
            '  %%rq.at = alloca %s, align 8' % ATTRS]
+    if q.track_proc and q.aborts:
+        out += ['  %rq.iab = alloca i32, align 4',
+                '  store i32 0, i32* %rq.iab, align 4']
+    if q.track_proc and q.ray_flags & 0xC0:
+        # Traced forced non-opaque, so traversal no longer culls by the
+        # query's CULL_OPAQUE / CULL_NON_OPAQUE: this does (0.71.0).
+        out += _isect_opacity(q, 'icw')
+        out += ['  %rq.icw.co = and i32 %rq.icw.f, 64',
+                '  %rq.icw.cn = and i32 %rq.icw.f, 128',
+                '  %rq.icw.cu = select i1 %rq.icw.op, i32 %rq.icw.co, i32 %rq.icw.cn',
+                '  %rq.icw.cl = icmp ne i32 %rq.icw.cu, 0',
+                '  br i1 %rq.icw.cl, label %rq.done, label %rq.ic',
+                '', 'rq.ic:']
 
     used, inBody = set(), set()
     for label in body:
@@ -1924,18 +1952,8 @@ def _intersection(module, q, exports, table, globals_, binds=None):
                 # geometry's OPAQUE), as traversal decides it. The query is
                 # traced with its own flags, so RayFlags() is the query's.
                 t = 'pn' + i.result[1:]
-                out += _record_read(t, 2, '%%rq.%s.w' % t, q.record_sm66)
-                out += [
-                    '  %%rq.%s.f = call i32 @dx.op.rayFlags.i32(i32 144)  ; RayFlags()' % t,
-                    '  %%rq.%s.fo = and i32 %%rq.%s.f, 1' % (t, t),
-                    '  %%rq.%s.fn = and i32 %%rq.%s.f, 2' % (t, t),
-                    '  %%rq.%s.a = icmp ne i32 %%rq.%s.fo, 0' % (t, t),
-                    '  %%rq.%s.b = icmp ne i32 %%rq.%s.fn, 0' % (t, t),
-                    '  %%rq.%s.c = icmp ne i32 %%rq.%s.w, 0' % (t, t),
-                    '  %%rq.%s.d = select i1 %%rq.%s.b, i1 false, i1 %%rq.%s.c' % (t, t, t),
-                    '  %%rq.%s.op = select i1 %%rq.%s.a, i1 true, i1 %%rq.%s.d' % (t, t, t),
-                    '  %s = xor i1 %%rq.%s.op, true' % (i.result, t),
-                ]
+                out += _isect_opacity(q, t)
+                out.append('  %s = xor i1 %%rq.%s.op, true' % (i.result, t))
                 continue
             if i.dxop in (rq.CANDIDATE_TYPE,
                           rq.CANDIDATE_BARY, rq.CANDIDATE_FRONT_FACE):
@@ -1962,6 +1980,10 @@ def _intersection(module, q, exports, table, globals_, binds=None):
                 # rayquery_proc_abort.hlsl is that case; the 1070 meets the
                 # near box first, so it is not observed there. A write beside
                 # the abort is refused (_check_loop_side_effects).
+                # EXACT once tracked procedural (0.71.0): noted here, reported
+                # at the shader's one exit as a hit of kind 127.
+                if q.track_proc:
+                    out.append('  store i32 1, i32* %rq.iab, align 4')
                 continue
             if i.dxop == rq.COMMITTED_RAY_T:
                 # In an intersection shader RayTCurrent() IS the committed t:
@@ -1974,6 +1996,14 @@ def _intersection(module, q, exports, table, globals_, binds=None):
                 # local root signature bound this record's own constants.
                 out += _record_read(i.result[1:], RECORD_WORD[i.dxop], i.result,
                                     q.record_sm66)
+                continue
+            if i.dxop in rq.COMMITTED_OPS and i.dxop != rq.COMMITTED_RAY_T:
+                # Only where no procedural candidate reaches it (refused
+                # otherwise, 0.71.0), so dead here; a constant keeps the IR.
+                kind = i.callee.rsplit('.', 1)[-1]
+                out.append({'i32': '  %s = add i32 0, 0',
+                            'f32': '  %s = fadd float 0.000000e+00, 0.000000e+00',
+                            'i1': '  %s = icmp eq i32 0, 0'}[kind] % i.result)
                 continue
             if i.dxop in CANDIDATE_MAP:
                 ty, callee, op, extra = CANDIDATE_MAP[i.dxop]
@@ -1993,7 +2023,22 @@ def _intersection(module, q, exports, table, globals_, binds=None):
                         'no lowering is defined for that' % s2)
             out.append(line)
 
-    out += ['', 'rq.done:', '  ret void', '}']
+    if q.track_proc and q.aborts:
+        # The one exit: an Abort() in this invocation is reported as a hit of
+        # kind 127, which the procedural any-hit turns into the end of the
+        # search (0.71.0). At RayTCurrent(), always inside the interval.
+        out += ['', 'rq.done:',
+                '  %rq.ida = load i32, i32* %rq.iab, align 4',
+                '  %rq.idc = icmp ne i32 %rq.ida, 0',
+                '  br i1 %rq.idc, label %rq.iabt, label %rq.iret',
+                '', 'rq.iabt:',
+                '  %rq.idt = call float @dx.op.rayTCurrent.f32(i32 154)  ; RayTCurrent()',
+                '  %%rq.idr = call i1 @dx.op.reportHit.%s(i32 158, float %%rq.idt, i32 127, '
+                '%s* nonnull %%rq.at)  ; ReportHit(THit,HitKind,Attributes)' % (ATTRS[1:], ATTRS),
+                '  br label %rq.iret',
+                '', 'rq.iret:', '  ret void', '}']
+    else:
+        out += ['', 'rq.done:', '  ret void', '}']
     return '\n'.join(out)
 
 
@@ -2139,7 +2184,7 @@ def _anyhit(module, q, exports, table, globals_, binds=None):
                 '  br i1 %rq.ac, label %rq.end, label %rq.ret',
                 '', 'rq.ret:']
     out += ['  ret void', '', 'rq.reject:']
-    if aborts and not any(x.aborts and x.track for x in loops):
+    if aborts and (q.track_proc or not any(x.aborts and x.track for x in loops)):
         # A bare Abort() in a query that never reads committed state: ending
         # the search on this candidate commits it, which nothing reads, and
         # stops traversal at once (0.67.0; until then it ran to the end).
@@ -2185,7 +2230,52 @@ def _opacity(q, header):
     return out
 
 
-def _record_commit(q, loops):
+def _isect_opacity(q, t):
+    """%rq.<t>.op: whether this procedural candidate is opaque, as traversal
+    decides it (0.70.0): the ray's FORCE_OPAQUE / FORCE_NON_OPAQUE first,
+    else the record's word 2. Traced forced non-opaque (tracked procedural,
+    0.71.0) the ray's are the query's own, constant; otherwise RayFlags()."""
+    out = _record_read(t, 2, '%%rq.%s.w' % t, q.record_sm66)
+    if q.track_proc:
+        out.append('  %%rq.%s.f = add i32 %d, 0' % (t, q.ray_flags))
+    else:
+        out.append('  %%rq.%s.f = call i32 @dx.op.rayFlags.i32(i32 144)  ; RayFlags()' % t)
+    out += [
+        '  %%rq.%s.fo = and i32 %%rq.%s.f, 1' % (t, t),
+        '  %%rq.%s.fn = and i32 %%rq.%s.f, 2' % (t, t),
+        '  %%rq.%s.a = icmp ne i32 %%rq.%s.fo, 0' % (t, t),
+        '  %%rq.%s.b = icmp ne i32 %%rq.%s.fn, 0' % (t, t),
+        '  %%rq.%s.c = icmp ne i32 %%rq.%s.w, 0' % (t, t),
+        '  %%rq.%s.d = select i1 %%rq.%s.b, i1 false, i1 %%rq.%s.c' % (t, t, t),
+        '  %%rq.%s.op = select i1 %%rq.%s.a, i1 true, i1 %%rq.%s.d' % (t, t, t),
+    ]
+    return out
+
+
+def _anyhit_proc(q, exports):
+    """The procedural hit group's any-hit, tracked procedural (0.71.0). Every
+    procedural hit reaches it, the trace being forced non-opaque: a hit of
+    kind 127 is an Abort() the intersection shader reported, and ends the
+    search; any other is a commit, recorded in the payload and accepted."""
+    out = ['define void @%s(%s* noalias nocapture %%p, %s* nocapture readonly %%attr) #RQNW {'
+           % (exports['anyhitproc'], PAYLOAD, ATTRS),
+           '  %%rq.ap = getelementptr inbounds %s, %s* %%attr, i32 0, i32 0' % (ATTRS, ATTRS),
+           '  %rq.ab = load <2 x float>, <2 x float>* %rq.ap, align 4',
+           '  %%rq.pab = getelementptr inbounds %s, %s* %%p, i32 0, i32 9' % (PAYLOAD, PAYLOAD),
+           '  %rq.phk = call i32 @dx.op.hitKind.i32(i32 143)  ; HitKind()',
+           '  %rq.pak = icmp eq i32 %rq.phk, 127',
+           '  br i1 %rq.pak, label %rq.pend, label %rq.prec',
+           '', 'rq.pend:',
+           '  store i32 1, i32* %rq.pab, align 4',
+           '  call void @dx.op.acceptHitAndEndSearch(i32 156)  ; AcceptHitAndEndSearch()',
+           '  unreachable',
+           '', 'rq.prec:']
+    out += _record_commit(q, _loops(q), 2)
+    out += ['  ret void', '}']
+    return '\n'.join(out)
+
+
+def _record_commit(q, loops, status=1):
     """What the closest-hit would record, recorded on every accept, so the
     committed accessors read inside the loop see the state as it stands."""
     out = ['  %rq.ct = call float @dx.op.rayTCurrent.f32(i32 154)  ; RayTCurrent()',
@@ -2194,7 +2284,7 @@ def _record_commit(q, loops):
            '  %%rq.cp1 = getelementptr inbounds %s, %s* %%p, i32 0, i32 1' % (PAYLOAD, PAYLOAD),
            '  store <2 x float> %rq.ab, <2 x float>* %rq.cp1, align 4',
            '  %%rq.cp2 = getelementptr inbounds %s, %s* %%p, i32 0, i32 2' % (PAYLOAD, PAYLOAD),
-           '  store i32 1, i32* %rq.cp2, align 4']
+           '  store i32 %d, i32* %%rq.cp2, align 4' % status]
     for idx, (ty, call) in sorted(CH_SOURCE.items()):
         out.append('  %%rq.ci%d = %s' % (idx, call))
         out.append('  %%rq.cp%d = getelementptr inbounds %s, %s* %%p, i32 0, i32 %d'
@@ -2460,6 +2550,8 @@ def _rewrite_metadata(text, md, table, globals_, q, exports, binding=False):
                 '!%d' % ann_hit]
     ann += ['void %s* @%s' % (sig_p, exports['miss']), '!%d' % ann_miss]
     ann += ['void %s* @%s' % (sig_h, exports['anyhitnull']), '!%d' % ann_hit]
+    if q.track_proc:
+        ann += ['void %s* @%s' % (sig_h, exports['anyhitproc']), '!%d' % ann_hit]
     # An intersection shader is void(), so it annotates like the raygen.
     ann += ['void ()* @%s' % exports['isectnull'], '!%d' % ann_raygen]
     ann_id = node(', '.join(ann))
@@ -2500,6 +2592,8 @@ def _rewrite_metadata(text, md, table, globals_, q, exports, binding=False):
         eps.append(entry(exports['closesthitproc'], sig_h, 10, True, True))
     eps.append(entry(exports['miss'], sig_p, 11, True, False))
     eps.append(entry(exports['anyhitnull'], sig_h, 9, True, True))
+    if q.track_proc:
+        eps.append(entry(exports['anyhitproc'], sig_h, 9, True, True))
     eps.append(entry(exports['isectnull'], '()', 8, False, False))
     eps.append(entry(exports['raygen'], '()', 7, False, False))
 

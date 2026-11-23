@@ -347,15 +347,21 @@ std::string RejectFunction(const llm::Function& fn, Query& q) {
             const llm::Block* blk = fn.FindBlock(label);
             if (!blk) continue;
             for (const auto& i : blk->instrs)
-                if (IsCommittedOp(i.DxOp())) {
-                    q.committedInLoop = true;
-                    // An intersection shader has RayTCurrent(), which IS the
-                    // committed t, and no payload for the rest.
-                    if (!q.procCommits.empty() && i.DxOp() != kCommittedRayT)
+                if (IsCommittedOp(i.DxOp())) q.committedInLoop = true;
+        }
+        // An intersection shader has RayTCurrent(), which IS the committed t,
+        // and no payload for the rest; only what a procedural candidate
+        // reaches matters (0.71.0, the whole body before).
+        if (!q.procCommits.empty()) {
+            for (const auto& label : ReachAs(fn, q, 1)) {
+                const llm::Block* blk = fn.FindBlock(label);
+                if (!blk) continue;
+                for (const auto& i : blk->instrs)
+                    if (IsCommittedOp(i.DxOp()) && i.DxOp() != kCommittedRayT)
                         return "committed state other than CommittedRayT() is read inside a "
                                "Proceed loop that becomes an intersection shader, which has no "
                                "payload to read it from";
-                }
+            }
         }
         // Committed state as it stands during traversal, 0.66.0: see
         // _reject_function in rayquery.py.
@@ -369,6 +375,26 @@ std::string RejectFunction(const llm::Function& fn, Query& q) {
             q.track = true;
             q.needsRecordConstants = true;
         }
+        // Tracked procedural (0.71.0): see _reject_function in rayquery.py.
+        if (q.NeedsBoth()) {
+            bool triCmt = false;
+            for (const auto& label : ReachAs(fn, q, 0)) {
+                const llm::Block* blk = fn.FindBlock(label);
+                if (!blk) continue;
+                for (const auto& i : blk->instrs)
+                    if (IsCommittedOp(i.DxOp())) triCmt = true;
+            }
+            if (!q.aborts.empty() || triCmt) {
+                if (!q.StaticFlags())
+                    return "Abort() or committed state read for a triangle candidate in a "
+                           "Proceed loop that commits procedural hits, with ray flags "
+                           "computed at run time; the exact lowering needs the query's own "
+                           "opacity and cull flags as constants in its intersection shader";
+                q.trackProc = true;
+                q.track = true;
+                q.needsRecordConstants = true;
+            }
+        }
         // CandidateProceduralPrimitiveNonOpaque() in the intersection shader
         // (0.70.0): see _reject_function in rayquery.py.
         if (!q.procCommits.empty()) {
@@ -376,7 +402,7 @@ std::string RejectFunction(const llm::Function& fn, Query& q) {
                 if (c.second->DxOp() == kCandidateProcNonOpaque &&
                     q.loop.body.count(c.first->label)) {
                     q.needsRecordConstants = true;
-                    q.rayFlagsInLoop = true;
+                    if (!q.trackProc) q.rayFlagsInLoop = true;
                     break;
                 }
         }
@@ -386,26 +412,6 @@ std::string RejectFunction(const llm::Function& fn, Query& q) {
             return "committed state is read inside a Proceed loop whose body also writes "
                    "for procedural candidates; the intersection shader that serves them "
                    "has no payload to read it from";
-        // A procedural query's triangle any-hit sees only what a TRIANGLE
-        // candidate reaches (0.69.0): see _reject_function in rayquery.py.
-        if (q.NeedsBoth()) {
-            const std::set<std::string> tri = ReachAs(fn, q, 0);
-            for (const auto& label : tri) {
-                const llm::Block* blk = fn.FindBlock(label);
-                if (!blk) continue;
-                for (const auto& i : blk->instrs) {
-                    if (IsCommittedOp(i.DxOp()))
-                        return "committed state is read for a triangle candidate in a "
-                               "Proceed loop that commits procedural hits; those are made "
-                               "in an intersection shader, which cannot record them in "
-                               "the payload";
-                    if (i.DxOp() == kAbort)
-                        return "Abort() is reached by a triangle candidate in a Proceed "
-                               "loop that commits procedural hits, which this lowering "
-                               "cannot stop exactly yet";
-                }
-            }
-        }
     }
     return "";
 }

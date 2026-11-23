@@ -217,6 +217,9 @@ class Query(object):
         # A triangle query whose body WRITES where a procedural candidate
         # reaches it (0.69.0): see _mark_procedural_effects.
         self.proc_effects = False
+        # A procedural query with Abort() or committed state read for a
+        # triangle candidate (0.71.0): see _reject_function.
+        self.track_proc = False
         # Several queries in one entry point, 0.43.0: the first is returned and
         # carries the rest here. Each names its raygen values with its own
         # prefix, so two traces never define the same %name; the first keeps
@@ -618,9 +621,13 @@ def _reject_function(fn, q):
             for instr in blk.instrs:
                 if instr.dxop in COMMITTED_OPS:
                     q.committed_in_loop = True
-                    # An intersection shader has RayTCurrent(), which IS the
-                    # committed t, and no payload for the rest.
-                    if q.needs_intersection and instr.dxop != COMMITTED_RAY_T:
+        # An intersection shader has RayTCurrent(), which IS the committed t,
+        # and no payload for the rest; only what a procedural candidate
+        # reaches matters (0.71.0, the whole body before).
+        if q.proc_commits:
+            for label in sorted(reach_as(fn, q, 1)):
+                for instr in fn.block(label).instrs:
+                    if instr.dxop in COMMITTED_OPS and instr.dxop != COMMITTED_RAY_T:
                         raise Unsupported(
                             'committed state other than CommittedRayT() is read '
                             'inside a Proceed loop that becomes an intersection '
@@ -644,13 +651,40 @@ def _reject_function(fn, q):
                 and not (q.ray_flags & 1)):
             q.track = True
             q.needs_record_constants = True
+        # Tracked procedural, 0.71.0: Abort() anywhere in a procedural query's
+        # loop, or committed state read where a triangle candidate reaches.
+        # An intersection shader cannot stop traversal or write the payload,
+        # so: the ray is traced forced non-opaque (the 0.66.0 tracking, the
+        # any-hit applying opacity), every procedural commit goes through a
+        # procedural any-hit that records it in the payload, an Abort() in the
+        # intersection shader is reported as a hit of kind 127 that the
+        # procedural any-hit turns into AcceptHitAndEndSearch, every abort
+        # ends the search, and the closest-hits leave the payload alone once
+        # one has. The intersection shader then sees the forced flags, so it
+        # takes the query's own as constants: computed at run time, refused.
+        if q.needs_both:
+            tri_cmt = any(instr.dxop in COMMITTED_OPS
+                          for label in reach_as(fn, q, 0)
+                          for instr in fn.block(label).instrs)
+            if q.aborts or tri_cmt:
+                if q.dyn_flags is None:
+                    raise Unsupported(
+                        'Abort() or committed state read for a triangle candidate in a '
+                        'Proceed loop that commits procedural hits, with ray flags '
+                        'computed at run time; the exact lowering needs the query\'s own '
+                        'opacity and cull flags as constants in its intersection shader')
+                q.track_proc = True
+                q.track = True
+                q.needs_record_constants = True
         # CandidateProceduralPrimitiveNonOpaque() in the intersection shader
         # (0.70.0): computed from the ray's flags and the record's word 2,
         # the geometry's and instance's opacity, as traversal decides it.
+        # Tracked, the flags are the query's constant ones (0.71.0).
         if q.proc_commits and any(i.dxop == CANDIDATE_PROC_NON_OPAQUE
                                   for b, i in q.candidate_ops if b.label in body):
             q.needs_record_constants = True
-            q.rayflags_in_loop = True
+            if not q.track_proc:
+                q.rayflags_in_loop = True
         # Its intersection shader has no payload to read committed state from
         # (0.69.0).
         if q.proc_effects and q.committed_in_loop:
@@ -658,22 +692,4 @@ def _reject_function(fn, q):
                 'committed state is read inside a Proceed loop whose body also writes '
                 'for procedural candidates; the intersection shader that serves them '
                 'has no payload to read it from')
-        # A procedural query's triangle any-hit (0.69.0) sees only what a
-        # TRIANGLE candidate reaches: committed state read there would need
-        # the payload to hold procedural commits too, which an intersection
-        # shader cannot write; and an Abort() there is not exact yet.
-        if q.needs_both:
-            tri = reach_as_triangle(fn, q)
-            for label in sorted(tri):
-                for instr in fn.block(label).instrs:
-                    if instr.dxop in COMMITTED_OPS:
-                        raise Unsupported(
-                            'committed state is read for a triangle candidate in a '
-                            'Proceed loop that commits procedural hits; those are made '
-                            'in an intersection shader, which cannot record them in '
-                            'the payload')
-                    if instr.dxop == ABORT:
-                        raise Unsupported(
-                            'Abort() is reached by a triangle candidate in a Proceed '
-                            'loop that commits procedural hits, which this lowering '
-                            'cannot stop exactly yet')
+

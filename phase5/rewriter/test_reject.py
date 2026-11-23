@@ -480,7 +480,8 @@ def main():
             (os.path.join('phase5', 'cases', 'rayquery_abort.ll'),
              r'^.*rayQuery_Abort\(i32 181.*$', None),
             (PROC, COMMIT_PROC, None),
-            (PROC + '+abort', COMMIT_PROC, 'calls Abort() and becomes an intersection')):
+            # 0.71.0: exact once tracked procedural, so it lowers.
+            (PROC + '+abort', COMMIT_PROC, None)):
         abort = path.endswith('+abort')
         path = path[:-len('+abort')] if abort else path
         if not os.path.isfile(path):
@@ -516,15 +517,18 @@ def main():
     # TRIANGLE candidate reaches in its body must be lowerable in the any-hit:
     # no committed state (the payload cannot hold procedural commits) and no
     # Abort() (not exact there yet). The reachability folds CandidateType().
-    for case, why in (('rayquery_refuse_tricmt.ll', 'committed state is read for a triangle'),
-                      ('rayquery_refuse_triabort.ll', 'reached by a triangle candidate'),
-                      ('rayquery_refuse_procfx.ll', 'also writes for procedural candidates')):
+    # 0.71.0: tracked procedural lowers the first two; what stays refused is
+    # the same with ray flags computed at run time.
+    for case, why in (('rayquery_refuse_tricmt.ll', None),
+                      ('rayquery_refuse_triabort.ll', None),
+                      ('rayquery_refuse_procfx.ll', 'also writes for procedural candidates'),
+                      ('rayquery_refuse_procdynabort.ll', 'with ray flags computed at run time')):
         path = os.path.join('phase5', 'cases', case)
         if not os.path.isfile(path):
             continue
         t = load(path)
         name = case[len('rayquery_refuse_'):-3]
-        ok.append(expect_lower_reject(name, t, why))
+        ok.append(expect_lower_ok(name, t) if why is None else expect_lower_reject(name, t, why))
         ok.append(cpp_agrees(name, t, why))
 
     # NVAPI shader extension calls (0.41.1). What 0.41.0 took for an append is

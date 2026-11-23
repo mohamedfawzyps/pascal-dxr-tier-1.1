@@ -114,8 +114,11 @@ code (`rq_analyze.cpp`, `rq_lower.cpp`) on 2026-09-26, not from memory:
   candidates). LEFT also: `Abort()` reached by a candidate of the kind a
   query does not commit (refused by name in a procedural query). Found next,
   fixed in 0.70.0: `CandidateProceduralPrimitiveNonOpaque()` was folded to
-  true. Exact `Abort()` here needs procedural commits recorded in the payload
-  (design in the 0.70.0 CHANGELOG entry).
+  true. Exact `Abort()` here: DONE 0.71.0 (tracked procedural: forced
+  non-opaque trace, a procedural any-hit recording commits, the abort
+  reported as a hit of kind 127 that ends the search). STEP 3 h DONE; left
+  of it on the limits list: a procedural query with `Abort()` and ray flags
+  computed at run time (refused by name).
 - i. `Abort()` outside the loop.
 - j. More than 16 carried values, and carried values of other types.
 - k. Several queries where one needs an intersection shader: give each

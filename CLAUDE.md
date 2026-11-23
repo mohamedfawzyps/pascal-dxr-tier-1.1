@@ -165,6 +165,18 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.71.0: PLAN STEP 3 h DONE, `Abort()` IN A PROCEDURAL QUERY EXACT.**
+"Tracked procedural": forced non-opaque trace, a procedural any-hit
+(`AnyHitProc`) recording commits and ending the search on a reported hit of
+kind 127, every abort ending the search, closest-hits leaving the payload
+alone after one, the query's opacity and cull flags as constants in the
+intersection shader (run-time flags refused by name). Lifts the refusals of
+writes beside `Abort()` in a procedural body and of an `Abort()` or committed
+read a triangle candidate reaches in a procedural query. **An abort's effect
+on committed state depends on traversal order; the order-free test is how
+many times the body runs.** Escher unchanged. NEXT: plan step 3 e (a `break`
+or `return` out of the loop body, several exits).
+
 **0.70.0: `CandidateProceduralPrimitiveNonOpaque()` WAS FOLDED TO TRUE.** A
 third silent wrong result in procedural queries (7396 rays on an opaque box):
 every box reaches the body, opaque or not. Now computed in the intersection

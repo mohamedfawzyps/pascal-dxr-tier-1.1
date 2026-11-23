@@ -121,7 +121,15 @@ $cases = @(
     # Writes in a body that becomes an intersection shader (0.68.0).
     @{ name = 'procwrites'; src = 'phase5\cases\rayquery_proc_writes.ll'; pat = 'alpha'; flags = @('--proc', '--procch');
        gt = @('--cs', 'phase5\cases\rayquery_proc_writes.hlsl', '--proc');
-       desc = 'a store and an atomic in a procedural body' }
+       desc = 'a store and an atomic in a procedural body' },
+    # Exact Abort() in a procedural query (0.71.0): record words and the
+    # procedural any-hit, so these render through the proxy.
+    @{ name = 'procwriteabort'; src = 'phase5\cases\rayquery_proc_writeabort.ll'; pat = 'alpha'; flags = @('--proc');
+       norender = $true; desc = 'a write beside Abort() in a procedural body' },
+    @{ name = 'procabortmix'; src = 'phase5\cases\rayquery_proc_abortmix.ll'; pat = 'alpha'; flags = @('--proc');
+       norender = $true; desc = 'Abort() on either kind in a procedural query' },
+    @{ name = 'procabortcmt'; src = 'phase5\cases\rayquery_proc_abortcmt.ll'; pat = 'alpha'; flags = @('--proc');
+       norender = $true; desc = 'commit then Abort(), committed state read' }
 )
 
 if (-not (Test-Path 'phase5\dxil\rayquery_opaque.ll')) {

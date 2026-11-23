@@ -800,7 +800,27 @@ std::vector<std::string> Opacity(const Query& q, bool sm66) {
 }
 
 // What the closest-hit would record, on every accept; see _record_commit.
-std::vector<std::string> RecordCommit(const Query& q, bool sm66) {
+// %rq.<t>.op, whether this procedural candidate is opaque (0.70.0), with
+// the query's own flags as constants once traced forced non-opaque (0.71.0).
+// See _isect_opacity in lower.py.
+std::vector<std::string> IsectOpacity(const Query& q, const std::string& t, bool sm66) {
+    const std::string n = "%rq." + t;
+    std::vector<std::string> out = RecordRead(t, 2, n + ".w", sm66);
+    if (q.trackProc)
+        out.push_back("  " + n + ".f = add i32 " + std::to_string(q.RayFlags()) + ", 0");
+    else
+        out.push_back("  " + n + ".f = call i32 @dx.op.rayFlags.i32(i32 144)  ; RayFlags()");
+    out.push_back("  " + n + ".fo = and i32 " + n + ".f, 1");
+    out.push_back("  " + n + ".fn = and i32 " + n + ".f, 2");
+    out.push_back("  " + n + ".a = icmp ne i32 " + n + ".fo, 0");
+    out.push_back("  " + n + ".b = icmp ne i32 " + n + ".fn, 0");
+    out.push_back("  " + n + ".c = icmp ne i32 " + n + ".w, 0");
+    out.push_back("  " + n + ".d = select i1 " + n + ".b, i1 false, i1 " + n + ".c");
+    out.push_back("  " + n + ".op = select i1 " + n + ".a, i1 true, i1 " + n + ".d");
+    return out;
+}
+
+std::vector<std::string> RecordCommit(const Query& q, bool sm66, int status = 1) {
     const std::string pl = kPayload;
     auto gep = [&](int idx) {
         return "  %rq.cp" + std::to_string(idx) + " = getelementptr inbounds " + pl + ", " + pl +
@@ -810,7 +830,7 @@ std::vector<std::string> RecordCommit(const Query& q, bool sm66) {
         "  %rq.ct = call float @dx.op.rayTCurrent.f32(i32 154)  ; RayTCurrent()",
         gep(0), "  store float %rq.ct, float* %rq.cp0, align 4",
         gep(1), "  store <2 x float> %rq.ab, <2 x float>* %rq.cp1, align 4",
-        gep(2), "  store i32 1, i32* %rq.cp2, align 4",
+        gep(2), "  store i32 " + std::to_string(status) + ", i32* %rq.cp2, align 4",
     };
     for (const auto& kv : kChSource) {
         const std::string idx = std::to_string(kv.first);
@@ -1519,7 +1539,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             // geometry). See _check_loop_side_effects in lower.py. Refused:
             // a write beside an Abort(), which an intersection shader cannot
             // act on.
-            if (!writes.empty() && x.NeedsBoth() && !x.aborts.empty()) {
+            if (!writes.empty() && x.NeedsBoth() && !x.aborts.empty() && !x.trackProc) {
                 r.error = "Proceed loop body writes (" + writes[0]->callee +
                           ") and calls Abort() and becomes an intersection shader, which "
                           "cannot stop traversal, so the write would happen for procedural "
@@ -1960,7 +1980,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                               "(i32, %dx.types.Handle, i32, i32, i8, i32) #RQRO");
             }
         }
-        if (q.NeedsIntersection()) {
+        if (q.NeedsIntersection() || (q.trackProc && !q.aborts.empty())) {
             add.push_back("");
             add.push_back("; Function Attrs: nounwind");
             add.push_back("declare i1 @dx.op.reportHit." +
@@ -1975,7 +1995,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         {
             bool anyAbort = false;
             for (const Query* qp : queries) anyAbort = anyAbort || (qp->hasLoop && !qp->aborts.empty());
-            if (anyAbort && (!q.NeedsIntersection() || q.NeedsBoth())) {
+            if ((anyAbort && (!q.NeedsIntersection() || q.NeedsBoth())) || q.trackProc) {
                 add.push_back("");
                 add.push_back("; Function Attrs: noreturn nounwind");
                 add.push_back("declare void @dx.op.acceptHitAndEndSearch(i32) #RQNR");
@@ -2062,6 +2082,21 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             std::vector<std::string> is;
             is.push_back("define void @" + e.intersection + "() #RQNW {");
             is.push_back(std::string("  %rq.at = alloca ") + kAttrs + ", align 8");
+            if (q.trackProc && !q.aborts.empty()) {
+                is.push_back("  %rq.iab = alloca i32, align 4");
+                is.push_back("  store i32 0, i32* %rq.iab, align 4");
+            }
+            if (q.trackProc && (q.RayFlags() & 0xC0)) {
+                // Traced forced non-opaque: the query's culls, here (0.71.0).
+                for (const auto& l : IsectOpacity(q, "icw", sm66)) is.push_back(l);
+                is.push_back("  %rq.icw.co = and i32 %rq.icw.f, 64");
+                is.push_back("  %rq.icw.cn = and i32 %rq.icw.f, 128");
+                is.push_back("  %rq.icw.cu = select i1 %rq.icw.op, i32 %rq.icw.co, i32 %rq.icw.cn");
+                is.push_back("  %rq.icw.cl = icmp ne i32 %rq.icw.cu, 0");
+                is.push_back("  br i1 %rq.icw.cl, label %rq.done, label %rq.ic");
+                is.push_back("");
+                is.push_back("rq.ic:");
+            }
 
             const std::set<std::string> types = TypeNames(m.text);
             std::set<std::string> usedNames, inBody;
@@ -2109,17 +2144,8 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     // see _intersection in lower.py.
                     if (op == kCandidateProcNonOpaque) {
                         const std::string t = "pn" + i.result.substr(1);
-                        const std::string n = "%rq." + t;
-                        for (const auto& l : RecordRead(t, 2, n + ".w", sm66)) is.push_back(l);
-                        is.push_back("  " + n + ".f = call i32 @dx.op.rayFlags.i32(i32 144)  ; RayFlags()");
-                        is.push_back("  " + n + ".fo = and i32 " + n + ".f, 1");
-                        is.push_back("  " + n + ".fn = and i32 " + n + ".f, 2");
-                        is.push_back("  " + n + ".a = icmp ne i32 " + n + ".fo, 0");
-                        is.push_back("  " + n + ".b = icmp ne i32 " + n + ".fn, 0");
-                        is.push_back("  " + n + ".c = icmp ne i32 " + n + ".w, 0");
-                        is.push_back("  " + n + ".d = select i1 " + n + ".b, i1 false, i1 " + n + ".c");
-                        is.push_back("  " + n + ".op = select i1 " + n + ".a, i1 true, i1 " + n + ".d");
-                        is.push_back("  " + i.result + " = xor i1 " + n + ".op, true");
+                        for (const auto& l : IsectOpacity(q, t, sm66)) is.push_back(l);
+                        is.push_back("  " + i.result + " = xor i1 %rq." + t + ".op, true");
                         continue;
                     }
                     if (op == kCandidateType ||
@@ -2140,7 +2166,12 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     }
                     // Abort: NOT EXACT here, traversal continues (0.68.0). See
                     // _intersection in lower.py for when that is still legal.
-                    if (op == kAbort) continue;
+                    // EXACT once tracked procedural (0.71.0): noted, and
+                    // reported at the one exit as a hit of kind 127.
+                    if (op == kAbort) {
+                        if (q.trackProc) is.push_back("  store i32 1, i32* %rq.iab, align 4");
+                        continue;
+                    }
                     // DXR_TIER11_WRITE_POISON=1 (0.68.0): the stores of a
                     // procedural body are dropped from the intersection
                     // shader. The writes case must diverge.
@@ -2162,6 +2193,14 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                         for (const auto& l :
                              RecordRead(i.result.substr(1), RecordWord(op), i.result, sm66))
                             is.push_back(l);
+                        continue;
+                    }
+                    if (IsCommittedOp(op) && op != kCommittedRayT) {
+                        // Dead here (0.71.0): see _intersection in lower.py.
+                        const std::string kind = i.callee.substr(i.callee.rfind('.') + 1);
+                        if (kind == "i32") is.push_back("  " + i.result + " = add i32 0, 0");
+                        else if (kind == "f32") is.push_back("  " + i.result + " = fadd float 0.000000e+00, 0.000000e+00");
+                        else is.push_back("  " + i.result + " = icmp eq i32 0, 0");
                         continue;
                     }
                     if (const CandMap* cmap = FindCand(op)) {
@@ -2191,6 +2230,26 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             }
             is.push_back("");
             is.push_back("rq.done:");
+            if (q.trackProc && !q.aborts.empty()) {
+                // The one exit (0.71.0): see _intersection in lower.py.
+                // DXR_TIER11_PROCABORT_POISON=1 leaves the abort unreported,
+                // so traversal runs on: the abort cases must diverge.
+                static const bool procAbortPoison =
+                    std::getenv("DXR_TIER11_PROCABORT_POISON") != nullptr;
+                is.push_back("  %rq.ida = load i32, i32* %rq.iab, align 4");
+                is.push_back("  %rq.idc = icmp ne i32 %rq.ida, 0");
+                is.push_back("  br i1 %rq.idc, label %rq.iabt, label %rq.iret");
+                is.push_back("");
+                is.push_back("rq.iabt:");
+                is.push_back("  %rq.idt = call float @dx.op.rayTCurrent.f32(i32 154)  ; RayTCurrent()");
+                if (!procAbortPoison)
+                    is.push_back("  %rq.idr = call i1 @dx.op.reportHit." +
+                                 std::string(kAttrs).substr(1) + "(i32 158, float %rq.idt, i32 127, " +
+                                 kAttrs + "* nonnull %rq.at)  ; ReportHit(THit,HitKind,Attributes)");
+                is.push_back("  br label %rq.iret");
+                is.push_back("");
+                is.push_back("rq.iret:");
+            }
             is.push_back("  ret void");
             is.push_back("}");
             std::string joinedIs;
@@ -2541,7 +2600,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             ah.push_back("rq.reject:");
             bool abortTracked = false;
             for (const Query* xp : loops) abortTracked = abortTracked || (!xp->aborts.empty() && xp->track);
-            if (aborts && !abortTracked) {
+            if (aborts && (q.trackProc || !abortTracked)) {
                 // A bare Abort() in a query that never reads committed state:
                 // ending the search commits a hit nothing reads (0.67.0).
                 ah.push_back("  %rq.ra = load i32, i32* %rq.pab, align 4");
@@ -2576,6 +2635,19 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             ch.push_back("define void @" + name + "(" + kPayload +
                          "* noalias nocapture %p, " + kAttrs +
                          "* nocapture readonly %attr) #RQNW {");
+            if (q.trackProc) {
+                // An abort ended the search (0.71.0): see _closesthit.
+                ch.push_back(std::string("  %rq.cga = getelementptr inbounds ") + kPayload + ", " +
+                             kPayload + "* %p, i32 0, i32 9");
+                ch.push_back("  %rq.cgv = load i32, i32* %rq.cga, align 4");
+                ch.push_back("  %rq.cgc = icmp ne i32 %rq.cgv, 0");
+                ch.push_back("  br i1 %rq.cgc, label %rq.cgr, label %rq.cgw");
+                ch.push_back("");
+                ch.push_back("rq.cgr:");
+                ch.push_back("  ret void");
+                ch.push_back("");
+                ch.push_back("rq.cgw:");
+            }
             ch.push_back("  %t = call float @dx.op.rayTCurrent.f32(i32 154)  ; RayTCurrent()");
             ch.push_back(std::string("  %ap = getelementptr inbounds ") + kAttrs + ", " +
                          kAttrs + "* %attr, i32 0, i32 0");
@@ -2652,6 +2724,34 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         if (q.NeedsBoth()) {
             closestHit(e.closesthit, "1");
             closestHit(e.closesthitproc, "2");
+            if (q.trackProc) {
+                // See _anyhit_proc in lower.py.
+                const std::string pl = kPayload, at = kAttrs;
+                std::vector<std::string> ap = {
+                    "define void @" + e.anyhitproc + "(" + pl + "* noalias nocapture %p, " + at +
+                        "* nocapture readonly %attr) #RQNW {",
+                    "  %rq.ap = getelementptr inbounds " + at + ", " + at + "* %attr, i32 0, i32 0",
+                    "  %rq.ab = load <2 x float>, <2 x float>* %rq.ap, align 4",
+                    "  %rq.pab = getelementptr inbounds " + pl + ", " + pl + "* %p, i32 0, i32 9",
+                    "  %rq.phk = call i32 @dx.op.hitKind.i32(i32 143)  ; HitKind()",
+                    "  %rq.pak = icmp eq i32 %rq.phk, 127",
+                    "  br i1 %rq.pak, label %rq.pend, label %rq.prec",
+                    "", "rq.pend:",
+                    "  store i32 1, i32* %rq.pab, align 4",
+                    "  call void @dx.op.acceptHitAndEndSearch(i32 156)  ; AcceptHitAndEndSearch()",
+                    "  unreachable",
+                    "", "rq.prec:",
+                };
+                for (const auto& l : RecordCommit(q, sm66, 2)) ap.push_back(l);
+                ap.push_back("  ret void");
+                ap.push_back("}");
+                std::string joinedAp;
+                for (size_t i = 0; i < ap.size(); ++i) {
+                    if (i) joinedAp += "\n";
+                    joinedAp += ap[i];
+                }
+                fns.push_back(joinedAp);
+            }
         } else {
             closestHit(e.closesthit, q.NeedsIntersection() ? "2" : "1");
         }
@@ -2834,6 +2934,10 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         ann.push_back("!" + std::to_string(annMiss));
         ann.push_back("void " + sigH + "* @" + e.anyhitnull);
         ann.push_back("!" + std::to_string(annHit));
+        if (q.trackProc) {
+            ann.push_back("void " + sigH + "* @" + e.anyhitproc);
+            ann.push_back("!" + std::to_string(annHit));
+        }
         // An intersection shader is void(), so it annotates like the raygen.
         ann.push_back("void ()* @" + e.isectnull);
         ann.push_back("!" + std::to_string(annRaygen));
@@ -2886,6 +2990,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             eps.push_back(entry(e.closesthitproc, sigH, 10, true, true));
         eps.push_back(entry(e.miss, sigP, 11, true, false));
         eps.push_back(entry(e.anyhitnull, sigH, 9, true, true));
+        if (q.trackProc) eps.push_back(entry(e.anyhitproc, sigH, 9, true, true));
         eps.push_back(entry(e.isectnull, "()", 8, false, false));
         eps.push_back(entry(e.raygen, "()", 7, false, false));
 

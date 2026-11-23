@@ -52,6 +52,8 @@ struct Exports {
     // having to re-lower later.
     std::string anyhitnull = "AnyHitNull";
     std::string isectnull = "IsectNull";
+    // A tracked procedural query's (0.71.0): see lower() in lower.py.
+    std::string anyhitproc = "AnyHitProc";
 };
 
 LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e = Exports());

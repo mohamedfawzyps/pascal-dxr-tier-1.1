@@ -55,6 +55,8 @@ struct Xform {
     bool needsRecordConstants = false;
     // A query reads committed state inside its loop (0.66.0).
     bool track = false;
+    // Tracked procedural (0.71.0): the procedural hit group gets AnyHitProc.
+    bool trackProc = false;
     // The loop body appends to a buffer; see rq::LowerResult::appends.
     bool appends = false;
     UINT payloadBytes = kPayloadBytes;   // grows with values the payload carries
@@ -97,6 +99,7 @@ bool DoLower(const std::string& in, std::string* out, std::string* why, void* ct
     x->needsBoth = a.query.NeedsBoth();
     x->needsRecordConstants = a.query.needsRecordConstants;
     x->track = a.query.track;
+    x->trackProc = a.query.trackProc;
     for (const auto& o : a.query.others) x->track = x->track || o.track;
     x->appends = l.appends;
     x->payloadBytes = (UINT)l.payloadBytes;
@@ -150,6 +153,8 @@ bool BuildStateObject(ID3D12Device5* dev, const std::vector<uint8_t>& lib,
     std::vector<std::wstring> names;
     names.reserve(copies * 6);
     std::vector<D3D12_HIT_GROUP_DESC> hgs(copies), hgProcs(x.needsBoth ? copies : 0);
+    std::vector<std::wstring> procAnyHitNames;
+    for (size_t k = 0; k < copies; ++k) procAnyHitNames.push_back(Name(L"AnyHitProc", k));
     for (size_t k = 0; k < copies; ++k) {
         names.push_back(Name(L"HitGroup", k));
         names.push_back(Name(L"ClosestHit", k));
@@ -171,6 +176,9 @@ bool BuildStateObject(ID3D12Device5* dev, const std::vector<uint8_t>& lib,
             hp.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
             hp.IntersectionShaderImport = n[3].c_str();
             hp.ClosestHitShaderImport = n[5].c_str();
+            // Every procedural hit, traced forced non-opaque, reaches it: it
+            // records commits and ends the search for an abort (0.71.0).
+            if (x.trackProc) hp.AnyHitShaderImport = procAnyHitNames[k].c_str();
         } else if (x.hasIntersection) {
             hg.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
             hg.IntersectionShaderImport = n[3].c_str();

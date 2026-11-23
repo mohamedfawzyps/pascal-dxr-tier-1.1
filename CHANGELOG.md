@@ -24,6 +24,53 @@ not.
 
 ---
 
+## 0.71.0
+
+**Plan step 3 h, finished: `Abort()` in a procedural query, exact.** An
+intersection shader can neither stop traversal nor write the payload, so an
+`Abort()` there was dropped, writes beside it were refused, and an `Abort()`
+or a committed read a triangle candidate reaches in a procedural query was
+refused (0.69.0).
+
+- **Tracked procedural**, for a procedural query with an `Abort()` anywhere in
+  its loop, or committed state read where a triangle candidate reaches:
+  - the ray is traced forced non-opaque, the 0.66.0 tracking, so every hit
+    of either kind reaches an any-hit, the triangle one applying opacity;
+  - a new procedural any-hit, `AnyHitProc`, records each procedural commit in
+    the payload as the triangle any-hit does, and turns a hit of kind 127
+    into `AcceptHitAndEndSearch`;
+  - an `Abort()` in the intersection shader is noted and reported at its one
+    exit as `ReportHit(RayTCurrent(), 127)`, so the body's own code after it
+    still runs, as in RayQuery, and nothing after that invocation does;
+  - every abort ends the search, triangle side too;
+  - both closest-hits leave the payload alone once an abort has ended the
+    search, since the hit it ended on is a stand-in and the payload already
+    holds what was committed;
+  - the intersection shader, now seeing the forced flags, takes the query's
+    own as constants for its opacity accessor and for the culls traversal no
+    longer applies (`CULL_OPAQUE` / `CULL_NON_OPAQUE`). Ray flags computed at
+    run time are refused by name, the only new refusal.
+- **Lifted:** writes beside an `Abort()` in a procedural body; an `Abort()` or
+  a committed read reached by a triangle candidate in a procedural query.
+  Committed state other than `CommittedRayT()` read where a procedural
+  candidate reaches is still refused (no payload in an intersection shader),
+  now checked against what that candidate reaches rather than the whole body.
+- **What can be measured, and what cannot:** an abort's effect on committed
+  state depends on traversal order, which RayQuery leaves to the
+  implementation, so the order-free test is the COUNT of body runs. A body
+  that counts, commits and aborts runs once per ray on any implementation.
+  `rayquery_proc_writeabort.hlsl` (two stacked boxes) and
+  `rayquery_proc_abortmix.hlsl` (either kind first, the mixed scene): both
+  refused on 0.70.0, both match WARP now; `DXR_TIER11_PROCABORT_POISON=1`
+  (the abort unreported) diverges in 7396 rays. `rayquery_proc_abortcmt.hlsl`
+  (commit then abort, committed status, t and instance read; the box in front
+  of the triangle, so order-free) matches opaque and not, on one box and the
+  mixed scene: the committed state survives the stand-in hit.
+  `rayquery_proc_abort.hlsl` (0.68.0) still shows the near box never
+  committed. Dispatch suite 102 of 102, rewriter suite 59 of 59.
+- **Escher unchanged:** all 781 dumped Unreal shader inputs lower as before,
+  pattern 3; none is procedural.
+
 ## 0.70.0
 
 **A third silent wrong result in procedural queries, fixed:

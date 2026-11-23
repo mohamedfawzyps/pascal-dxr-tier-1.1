@@ -142,6 +142,9 @@ struct Query {
     // A triangle query whose body writes where a procedural candidate
     // reaches it (0.69.0): see _mark_procedural_effects in rayquery.py.
     bool procEffects = false;
+    // A procedural query with Abort() or committed state read for a triangle
+    // candidate (0.71.0): see _reject_function in rayquery.py.
+    bool trackProc = false;
 
     int patternNum = 0;
     std::string patternDesc;

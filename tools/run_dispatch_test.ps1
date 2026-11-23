@@ -404,6 +404,14 @@ $cases = @(
     @{ name = 'procopaque'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_proc_opacity.hlsl', '--proc'); desc = 'CandidateProceduralPrimitiveNonOpaque on an opaque box' },
     @{ name = 'procnonopaque'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_opacity.hlsl', '--proc'); desc = 'the same, a non-opaque box' },
     @{ name = 'procopaquemix'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_proc_opacity.hlsl', '--mixed', '--contrib'); desc = 'the same, an opaque box and triangle' },
+    # Exact Abort() in a procedural query (0.71.0): the body runs once per ray
+    # whatever the order, and the committed state survives the abort.
+    @{ name = 'procwriteabort'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_writeabort.hlsl', '--proc', '--stack'); desc = 'a write beside Abort() in a procedural body, two boxes' },
+    @{ name = 'procabortmix'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_abortmix.hlsl', '--mixed', '--contrib'); desc = 'Abort() on either kind in a procedural query' },
+    @{ name = 'procabortcmt'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_abortcmt.hlsl', '--mixed', '--contrib'); desc = 'commit then Abort(), committed state read' },
+    @{ name = 'procabortcmtop'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_proc_abortcmt.hlsl', '--mixed', '--contrib'); desc = 'the same, opaque geometry' },
+    @{ name = 'procabortcmt1'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_abortcmt.hlsl', '--proc'); desc = 'the same, one box' },
+    @{ name = 'procabortorder'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_abort.hlsl', '--proc', '--stack'); desc = 'Abort() on the first candidate: never the near box' },
     # And a triangle query's body runs for procedural candidates (0.69.0).
     @{ name = 'triproccand'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_tri_proccand.hlsl', '--mixed', '--contrib'); desc = 'triangle query, body runs for procedural candidates' },
     # A 128 byte payload removes the 1070's device when dispatched; the
@@ -750,6 +758,22 @@ $env:DXR_TIER11_WRITE_POISON = $null
 if ((& .\raytest.exe diff dp_pw_a.bin dp_pw_b.bin 2>&1) -match 'RESULT: DIVERGE') { Write-Host '  procwrites2: diverges with the stores dropped' }
 else { Write-Host '  NOT SENSITIVE: procwrites2 matched with the stores dropped'; $failed++ }
 foreach ($f in 'dp_pw_a.bin', 'dp_pw_b.bin') { if (Test-Path $f) { [IO.File]::Delete((Join-Path $PWD $f)) } }
+$env:DXR_TIER11 = ''
+
+# Exact Abort() in a procedural body (0.71.0): with
+# DXR_TIER11_PROCABORT_POISON=1 the intersection shader leaves its abort
+# unreported, so traversal runs on and procwriteabort must DIVERGE.
+Write-Host ''
+Write-Host '=== Abort() in a procedural body ==='
+$env:DXR_TIER11 = '1'
+$x = @('--cs', 'phase5\cases\rayquery_proc_writeabort.hlsl', '--proc', '--stack')
+& .\raytest.exe warp rayquery alpha dp_pa_a.bin @x | Out-Null
+$env:DXR_TIER11_PROCABORT_POISON = '1'
+& .\raytest.exe hw rayquery alpha dp_pa_b.bin @x | Out-Null
+$env:DXR_TIER11_PROCABORT_POISON = $null
+if ((& .\raytest.exe diff dp_pa_a.bin dp_pa_b.bin 2>&1) -match 'RESULT: DIVERGE') { Write-Host '  procwriteabort: diverges with the abort unreported' }
+else { Write-Host '  NOT SENSITIVE: procwriteabort matched with the abort unreported'; $failed++ }
+foreach ($f in 'dp_pa_a.bin', 'dp_pa_b.bin') { if (Test-Path $f) { [IO.File]::Delete((Join-Path $PWD $f)) } }
 $env:DXR_TIER11 = ''
 
 # Spec Tier 1.1 item 6: PIPELINE_CONFIG1 flags (0.64.0). The GTX 1070
