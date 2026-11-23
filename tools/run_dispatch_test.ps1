@@ -429,7 +429,15 @@ $cases = @(
     @{ name = 'twoexits'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_twoexits.hlsl', '--geom'); desc = 'a loop left top-tested, two exits with code of their own' },
     @{ name = 'procbreak'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_break.hlsl', '--proc'); desc = 'a break and a return out of a procedural body' },
     @{ name = 'procbreakstack'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_break.hlsl', '--proc', '--stack'); desc = 'the same, two boxes' },
-    @{ name = 'procbreakmix'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_break.hlsl', '--mixed', '--contrib'); desc = 'the same, a triangle beside the box' }
+    @{ name = 'procbreakmix'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_break.hlsl', '--mixed', '--contrib'); desc = 'the same, a triangle beside the box' },
+    # One query traced more than once (0.73.0, plan step 3 f): each search
+    # its own TraceRay; a branch choosing the ray, merged by phis.
+    @{ name = 'retrace'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_retrace.hlsl', '--geom'); desc = 'one query traced twice' },
+    @{ name = 'retracemulti'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_retrace.hlsl', '--multi'); desc = 'the same, two instances' },
+    @{ name = 'retracebranch'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_retracebranch.hlsl', '--geom'); desc = 'one query traced on either arm of a branch' },
+    @{ name = 'retracebranch1'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_retracebranch.hlsl'); desc = 'the same, one triangle' },
+    @{ name = 'retraceloop'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_retraceloop.hlsl', '--geom'); desc = 'one TraceRayInline run in a loop' },
+    @{ name = 'retraceloopm'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_retraceloop.hlsl', '--multi'); desc = 'the same, two instances' }
 )
 
 $failed = 0
@@ -793,13 +801,17 @@ $env:DXR_TIER11 = ''
 # twoexits (the code after the loop that the original skipped) must DIVERGE;
 # with the procedural abort poison, procbreakstack must too.
 Write-Host ''
-Write-Host '=== a break or return out of the loop body ==='
+Write-Host '=== a break or return out of the loop body, and a query traced again ==='
 $env:DXR_TIER11 = '1'
 $xg = @(
     @{ n = 'breakstack'; v = 'DXR_TIER11_EXIT_POISON'; x = @('--cs', 'phase5\cases\rayquery_break.hlsl', '--geom', '--stack') },
     @{ n = 'return'; v = 'DXR_TIER11_EXIT_POISON'; x = @('--cs', 'phase5\cases\rayquery_return.hlsl', '--geom') },
     @{ n = 'twoexits'; v = 'DXR_TIER11_EXIT_POISON'; x = @('--cs', 'phase5\cases\rayquery_twoexits.hlsl', '--geom') },
-    @{ n = 'procbreakstack'; v = 'DXR_TIER11_PROCABORT_POISON'; x = @('--cs', 'phase5\cases\rayquery_proc_break.hlsl', '--proc', '--stack') }
+    @{ n = 'procbreakstack'; v = 'DXR_TIER11_PROCABORT_POISON'; x = @('--cs', 'phase5\cases\rayquery_proc_break.hlsl', '--proc', '--stack') },
+    # One query traced more than once (0.73.0): every search running the
+    # first one's loop body, and a branch's ray always the first arm's.
+    @{ n = 'retrace'; v = 'DXR_TIER11_RETRACE_POISON'; x = @('--cs', 'phase5\cases\rayquery_retrace.hlsl', '--geom') },
+    @{ n = 'retracebranch'; v = 'DXR_TIER11_MERGE_POISON'; x = @('--cs', 'phase5\cases\rayquery_retracebranch.hlsl', '--geom') }
 )
 foreach ($g in $xg) {
     $x = $g.x
@@ -807,8 +819,8 @@ foreach ($g in $xg) {
     Set-Item "env:$($g.v)" '1'
     & .\raytest.exe hw rayquery alpha dp_xg_b.bin @x | Out-Null
     Remove-Item "env:$($g.v)"
-    if ((& .\raytest.exe diff dp_xg_a.bin dp_xg_b.bin 2>&1) -match 'RESULT: DIVERGE') { Write-Host "  $($g.n): diverges with the exit poisoned" }
-    else { Write-Host "  NOT SENSITIVE: $($g.n) matched with the exit poisoned"; $failed++ }
+    if ((& .\raytest.exe diff dp_xg_a.bin dp_xg_b.bin 2>&1) -match 'RESULT: DIVERGE') { Write-Host "  $($g.n): diverges with $($g.v)" }
+    else { Write-Host "  NOT SENSITIVE: $($g.n) matched with $($g.v)"; $failed++ }
 }
 foreach ($f in 'dp_xg_a.bin', 'dp_xg_b.bin') { if (Test-Path $f) { [IO.File]::Delete((Join-Path $PWD $f)) } }
 $env:DXR_TIER11 = ''

@@ -101,6 +101,11 @@ code (`rq_analyze.cpp`, `rq_lower.cpp`) on 2026-09-26, not from memory:
   meet (refused by name), and loop state or carried values in a body that is
   also an intersection shader (refused, as before).
 - f. One query traced twice (`TraceRayInline` again on the same object).
+  DONE 0.73.0: a search per trace (reaching definitions), lowered as
+  several queries are; traces a branch chooses between are one search,
+  their ray merged by phis where it starts. Left of it on the limits list: a
+  different acceleration structure on each arm, and such a search into a
+  top-tested loop.
 - g. `Proceed()` called without a loop, more than once.
 - h. General writes in the loop body (only counter appends lower today),
   and appends together with `Abort()` or an intersection shader. RayQuery's
@@ -178,7 +183,10 @@ Three-form matrix, dispatch suite, an Escher run. Then the limits list:
 - a candidate read after the Proceed loop where both ways out meet (0.72.0);
 - loop state, or values carried out, in a body that is also an
   intersection shader, which has no payload (0.69.0; a per-ray scratch UAV
-  would be the route).
+  would be the route);
+- a query traced on either arm of a branch against a different acceleration
+  structure on each (a phi of resource handles), or into a top-tested loop
+  (0.73.0).
 
 ## Size
 

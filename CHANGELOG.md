@@ -24,6 +24,44 @@ not.
 
 ---
 
+## 0.73.0
+
+**Plan step 3 f: one query traced more than once.** A second
+`TraceRayInline` on the same `RayQuery` object was refused ("more than one
+TraceRayInline on one query").
+
+- **Each search is a query of its own.** A `TraceRayInline` starts a new
+  search and forgets the old one, so which search an op reads is a reaching
+  definitions question: the traces that reach it with no other trace of the
+  query between. Each search gets its own `TraceRay`, payload and names, and
+  the shared any-hit picks its loop body by query id, exactly as several
+  queries do since 0.43.0.
+- **A search a branch chooses the ray of.** Traces on either arm of an `if`
+  that meet before one Proceed loop are one search. The differing ray
+  arguments become phis at the block holding the first `Proceed()`, where the
+  `TraceRay` now goes (0.72.0 put it there), and the traces go. Refused by
+  name: a different acceleration structure on each arm (a phi of resource
+  handles), such a search into a top-tested loop or one with no guard
+  `Proceed()`, an op of the query before the arms meet, and the query traced
+  again inside its own Proceed loop (`rayquery_refuse_retraceinloop.hlsl`;
+  the loop becomes an any-hit, which cannot call `TraceRay`).
+- **A trace inside a loop** (one `TraceRayInline` run several times) already
+  lowered; now tested.
+- **Tests.** `rayquery_retrace.hlsl` (two searches, the second ray shifted,
+  each with its own loop body), `rayquery_retracebranch.hlsl` (the flags and
+  direction chosen by a branch), `rayquery_retraceloop.hlsl`: the first two
+  refused on 0.72.0, all three match WARP on one triangle, four geometries and
+  two instances. `DXR_TIER11_RETRACE_POISON=1` (every search runs the first
+  one's loop body) diverges in 12212 rays; `DXR_TIER11_MERGE_POISON=1` (the
+  first arm's ray on every path) in 2956. Byte-identical in both rewriters on
+  65 cases; rewriter refusal checks 63 of 63; dispatch suite 116 of 116.
+- **Escher unchanged:** all 845 dumped Unreal shader inputs (781, and the 64
+  from the 0.72.0 run) lower byte-identically to 0.72.0.
+- **0.72.0 in the game (2026-11-23, 2 min 24 s):** clean end marker, 163
+  RayQuery shaders lowered, 0 not lowered, no `CreateStateObject` failure,
+  11701 lowered dispatches drawn (all indirect), REFUSED 0 of every kind, no
+  device removal.
+
 ## 0.72.0
 
 **Plan step 3 e: a `break` or `return` out of the Proceed loop body, and

@@ -139,7 +139,15 @@ $cases = @(
     @{ name = 'twoexits'; src = 'phase5\cases\rayquery_twoexits.ll'; pat = 'alpha'; flags = @('--geom');
        norender = $true; desc = 'a loop left top-tested, two exits with code of their own' },
     @{ name = 'procbreak'; src = 'phase5\cases\rayquery_proc_break.ll'; pat = 'alpha'; flags = @('--proc');
-       norender = $true; desc = 'a break and a return out of a procedural body' }
+       norender = $true; desc = 'a break and a return out of a procedural body' },
+    # One query traced more than once (0.73.0): a search per trace, lowered
+    # as several queries are, so these render through the proxy.
+    @{ name = 'retrace'; src = 'phase5\cases\rayquery_retrace.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = 'one query traced twice' },
+    @{ name = 'retracebranch'; src = 'phase5\cases\rayquery_retracebranch.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = 'one query traced on either arm of a branch' },
+    @{ name = 'retraceloop'; src = 'phase5\cases\rayquery_retraceloop.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = 'one TraceRayInline run in a loop' }
 )
 
 if (-not (Test-Path 'phase5\dxil\rayquery_opaque.ll')) {

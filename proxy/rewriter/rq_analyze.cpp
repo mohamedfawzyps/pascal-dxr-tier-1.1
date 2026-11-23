@@ -1,6 +1,7 @@
 #include "rq_analyze.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <regex>
 
@@ -116,31 +117,32 @@ std::string FlagNames(int value) {
     return out.empty() ? "NONE" : out;
 }
 
-int Query::DynFlags() const { return trace ? Imm(trace->args[3]) : 0; }
+int Query::DynFlags() const { return trace ? Imm(Args()[3]) : 0; }
 int Query::RayFlags() const { return constFlags | DynFlags(); }
 
 bool Query::StaticFlags() const {
     static const std::regex kImm(R"(^\s*i32\s+(-?\d+)\s*$)");
-    return trace && std::regex_match(trace->args[3], kImm);
+    return trace && std::regex_match(Args()[3], kImm);
 }
 
 std::pair<std::string, std::string> Query::FlagsOperand() const {
     if (StaticFlags())
         return { "", "i32 " + std::to_string(RayFlags()) };
-    const std::string dyn = llm::OperandName(trace->args[3]);
+    const std::string dyn = llm::OperandName(Args()[3]);
     return { "  %" + pfx + ".flags = or i32 " + dyn + ", " + std::to_string(constFlags),
              "i32 %" + pfx + ".flags" };
 }
 
 std::string Query::AsHandle() const {
-    return trace ? llm::OperandName(trace->args[2]) : "";
+    return trace ? llm::OperandName(Args()[2]) : "";
 }
 
 std::vector<std::string> Query::RayArgs() const {
     std::vector<std::string> out;
     if (!trace) return out;
-    for (size_t i = 4; i < trace->args.size() && i <= 12; ++i)
-        out.push_back(trace->args[i]);
+    const auto& a = Args();
+    for (size_t i = 4; i < a.size() && i <= 12; ++i)
+        out.push_back(a[i]);
     return out;   // mask, ox, oy, oz, tmin, dx, dy, dz, tmax
 }
 
@@ -187,6 +189,8 @@ std::string Collect(const llm::Function& fn, Query& q,
                            i.body.substr(0, 60) + "\" does not use the query handle";
                 continue;
             }
+            // Traced more than once (0.73.0): another search.
+            if (q.segmented && q.owner.at(&i) != q.search) continue;
             if (!IsKnownOpcode(op)) {
                 return "unrecognised rayQuery opcode " + std::to_string(op) + " at \"" +
                        i.body.substr(0, 60) + "\". This project has only verified the "
@@ -196,8 +200,9 @@ std::string Collect(const llm::Function& fn, Query& q,
             if (!no.empty()) return no;
 
             if (op == kTraceInline) {
-                if (q.trace) return "more than one TraceRayInline on one query";
-                q.trace = &i; q.traceBlock = &b;
+                if (q.trace && !q.segmented) return "more than one TraceRayInline on one query";
+                if (!q.trace) { q.trace = &i; q.traceBlock = &b; }
+                q.traces.emplace_back(&b, &i);
             } else if (op == kProceed) {
                 q.proceeds.emplace_back(&b, &i);
             } else if (op == kCommitNonOpaque) {
@@ -544,6 +549,159 @@ std::string RejectFunction(const llm::Function& fn, Query& q) {
 
 // Several queries in one entry point, 0.43.0. See _check_queries in
 // rayquery.py, which this mirrors message for message.
+// Which search each op of a query traced more than once reads (0.73.0):
+// reaching definitions, a trace killing the rest; traces that reach one op
+// together are one search. See _trace_owner in rayquery.py.
+static std::string TraceOwners(const llm::Function& fn, const std::string& handle,
+                               const std::vector<const llm::Instr*>& traces,
+                               std::map<const llm::Instr*, std::set<int>>& owner,
+                               std::map<std::string, std::set<int>>& outSets,
+                               std::vector<std::set<int>>& searches) {
+    std::map<const llm::Instr*, int> idx;
+    for (size_t k = 0; k < traces.size(); ++k) idx[traces[k]] = (int)k;
+    const auto preds = fn.Preds();
+    std::map<std::string, int> last;
+    for (const auto& b : fn.blocks)
+        for (const auto& i : b.instrs)
+            if (idx.count(&i)) last[b.label] = idx[&i];
+    std::map<std::string, std::set<int>> inn;
+    for (const auto& b : fn.blocks) {
+        inn[b.label];
+        if (last.count(b.label)) outSets[b.label] = { last[b.label] };
+        else outSets[b.label];
+    }
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (const auto& b : fn.blocks) {
+            std::set<int> r;
+            auto pit = preds.find(b.label);
+            if (pit != preds.end())
+                for (const auto& p : pit->second) {
+                    const auto& o = outSets[p];
+                    r.insert(o.begin(), o.end());
+                }
+            if (r != inn[b.label]) { inn[b.label] = r; changed = true; }
+            std::set<int> o = last.count(b.label) ? std::set<int>{ last[b.label] } : r;
+            if (o != outSets[b.label]) { outSets[b.label] = o; changed = true; }
+        }
+    }
+    std::vector<int> parent(traces.size());
+    for (size_t k = 0; k < parent.size(); ++k) parent[k] = (int)k;
+    auto find = [&](int k) { while (parent[k] != k) k = parent[k]; return k; };
+    std::map<const llm::Instr*, std::set<int>> reach;
+    for (const auto& b : fn.blocks) {
+        std::set<int> cur = inn[b.label];
+        for (const auto& i : b.instrs) {
+            if (idx.count(&i)) { cur = { idx[&i] }; reach[&i] = cur; continue; }
+            const int op = i.DxOp();
+            if (op < 0) continue;
+            const auto uses = i.Uses();
+            if (std::find(uses.begin(), uses.end(), handle) == uses.end()) continue;
+            if (cur.empty())
+                return (IsKnownOpcode(op) ? std::string(OpcodeName(op)) : std::to_string(op)) +
+                       " at \"" + i.body.substr(0, 60) + "\" can be reached with no "
+                       "TraceRayInline of its query before it";
+            reach[&i] = cur;
+            const int k0 = *cur.begin();
+            for (int k : cur) if (k != k0) parent[find(k)] = find(k0);
+        }
+    }
+    std::map<int, std::set<int>> groups;
+    for (size_t k = 0; k < traces.size(); ++k) groups[find((int)k)].insert((int)k);
+    std::map<int, std::set<int>> search;
+    for (const auto& g : groups) for (int k : g.second) search[k] = g.second;
+    for (const auto& g : groups) searches.push_back(g.second);
+    std::sort(searches.begin(), searches.end(),
+              [](const std::set<int>& x, const std::set<int>& y) { return *x.begin() < *y.begin(); });
+    for (const auto& kv : reach) owner[kv.first] = search[*kv.second.begin()];
+    return "";
+}
+
+static std::string Trim(const std::string& v) {
+    const size_t a = v.find_first_not_of(" \t"), b = v.find_last_not_of(" \t");
+    return a == std::string::npos ? std::string() : v.substr(a, b - a + 1);
+}
+
+// A search a branch chooses the ray of (0.73.0): see _merge_traces in
+// rayquery.py, which this mirrors message for message.
+static std::string MergeTraces(const llm::Function& fn, Query& q,
+                               const std::vector<const llm::Instr*>& all,
+                               const std::map<std::string, std::set<int>>& outSets) {
+    if (!q.hasLoop || q.top)
+        return "a query traced on either arm of a branch, without a rotated Proceed "
+               "loop to start the search at";
+    for (const auto& t : q.traces)
+        if (q.loop.body.count(t.first->label))
+            return "RayQuery " + q.handle + " is traced again inside its own Proceed loop; "
+                   "that loop becomes an any-hit shader, which cannot call TraceRay";
+    std::vector<const llm::Block*> guard;
+    for (const auto& p : q.proceeds)
+        if (p.first->label != q.loop.latch) guard.push_back(p.first);
+    if (guard.size() != 1)
+        return "a query traced on either arm of a branch, with no guard Proceed to start "
+               "the search at";
+    const llm::Block* p = guard[0];
+    std::map<int, const llm::Instr*> byK;
+    for (const auto& t : q.traces)
+        for (size_t k = 0; k < all.size(); ++k)
+            if (all[k] == t.second) byK[(int)k] = t.second;
+    for (const auto& t : q.traces)
+        if (t.first->label == p->label)
+            return "a query traced on either arm of a branch, and again in the block its "
+                   "search starts at";
+    const auto dom = fn.Dominators();
+    for (const auto* list : { &q.proceeds, &q.commits, &q.aborts, &q.procCommits,
+                              &q.candidateOps, &q.committedOps })
+        for (const auto& c : *list) {
+            auto d = dom.find(c.first->label);
+            if (d == dom.end() || !d->second.count(p->label))
+                return "a query traced on either arm of a branch is used at \"" +
+                       c.second->body.substr(0, 60) + "\" before the arms meet";
+        }
+    const auto preds = fn.Preds();
+    std::vector<std::pair<std::string, const llm::Instr*>> src;
+    auto pit = preds.find(p->label);
+    if (pit != preds.end())
+        for (const auto& pr : pit->second) {
+            const auto& o = outSets.at(pr);
+            std::vector<int> r;
+            for (int k : o) if (byK.count(k)) r.push_back(k);
+            if (r.size() != 1 || o.size() != 1)
+                return "a query traced on either arm of a branch, with " + pr +
+                       " reaching the search from more than one of them";
+            src.emplace_back(pr, byK[r[0]]);
+        }
+    const llm::Instr* first = q.traces[0].second;
+    std::vector<std::string> merged = first->args;
+    for (size_t j = 2; j < first->args.size(); ++j) {
+        std::vector<std::string> vals;
+        for (const auto& sp : src) vals.push_back(Trim(sp.second->args[j]));
+        bool same = true;
+        for (const auto& v : vals) if (v != vals[0]) same = false;
+        // DXR_TIER11_MERGE_POISON=1 (0.73.0): the first arm's ray on every path.
+        // The branch case must diverge (C++ only).
+        static const bool mergePoison = std::getenv("DXR_TIER11_MERGE_POISON") != nullptr;
+        if (same || mergePoison) { merged[j] = vals[0]; continue; }
+        const std::string ty = vals[0].substr(0, vals[0].find(' '));
+        if (ty == "%dx.types.Handle")
+            return "a query traced on either arm of a branch against a different "
+                   "acceleration structure on each";
+        const std::string name = "%" + q.pfx + ".ta" + std::to_string(j);
+        std::string phi = "  " + name + " = phi " + ty + " ";
+        for (size_t k = 0; k < src.size(); ++k) {
+            if (k) phi += ", ";
+            std::string v = Trim(src[k].second->args[j]);
+            v = Trim(v.substr(v.find(' ') + 1));
+            phi += "[ " + v + ", " + src[k].first + " ]";
+        }
+        q.tracePhis.push_back(phi);
+        merged[j] = ty + " " + name;
+    }
+    q.mergedArgs = merged;
+    q.routeBlock = p;
+    return "";
+}
+
 std::string CheckQueries(const llm::Function& fn, const std::vector<Query>& qs) {
     std::string names;
     for (size_t k = 0; k < qs.size(); ++k) {
@@ -570,6 +728,19 @@ std::string CheckQueries(const llm::Function& fn, const std::vector<Query>& qs) 
                                "shader, which cannot call TraceRay";
                 }
             }
+        }
+        // The same query traced again inside its own loop (0.73.0).
+        for (const auto& o : qs) {
+            if (&o == &q || o.handle != q.handle) continue;
+            std::vector<const llm::Block*> blocks{ o.traceBlock };
+            for (const auto* list : { &o.proceeds, &o.commits, &o.aborts, &o.procCommits,
+                                      &o.candidateOps, &o.committedOps })
+                for (const auto& c : *list) blocks.push_back(c.first);
+            for (const auto* b : blocks)
+                if (q.loop.body.count(b->label))
+                    return "RayQuery " + q.handle + " is traced again inside its own Proceed "
+                           "loop; that loop becomes an any-hit shader, which cannot call "
+                           "TraceRay";
         }
     }
     return "";
@@ -622,21 +793,47 @@ AnalyzeResult Analyze(const llm::Module& m) {
     for (const auto* a : allocs) handles.push_back(a->result);
 
     std::vector<Query> qs;
-    for (size_t k = 0; k < allocs.size(); ++k) {
-        Query q;
-        q.fn = &fn;
-        q.alloc = allocs[k];
-        q.handle = allocs[k]->result;
-        q.constFlags = Imm(allocs[k]->args[1]);
-        if (k) { q.pfx = "rq.q" + std::to_string(k); q.qid = (int)k; }
-        std::vector<std::string> others;
-        for (const auto& h : handles) if (h != q.handle) others.push_back(h);
-        std::string err = Collect(fn, q, others);
-        if (!err.empty()) { r.error = err; return r; }
-        err = FindLoop(fn, q);
-        if (!err.empty()) { r.error = err; return r; }
-        MarkProceduralEffects(m, fn, q);
-        qs.push_back(q);
+    for (size_t a = 0; a < allocs.size(); ++a) {
+        // A query traced more than once (0.73.0): see analyze in rayquery.py.
+        std::vector<const llm::Instr*> traces;
+        for (const auto* t : fn.FindOp(kTraceInline)) {
+            const auto uses = t->Uses();
+            if (std::find(uses.begin(), uses.end(), allocs[a]->result) != uses.end())
+                traces.push_back(t);
+        }
+        std::map<const llm::Instr*, std::set<int>> owner;
+        std::map<std::string, std::set<int>> outSets;
+        std::vector<std::set<int>> searches;
+        const bool segmented = traces.size() > 1;
+        if (segmented) {
+            const std::string err =
+                TraceOwners(fn, allocs[a]->result, traces, owner, outSets, searches);
+            if (!err.empty()) { r.error = err; return r; }
+        } else {
+            searches.emplace_back();
+        }
+        for (const auto& t : searches) {
+            Query q;
+            q.fn = &fn;
+            q.alloc = allocs[a];
+            q.handle = allocs[a]->result;
+            q.constFlags = Imm(allocs[a]->args[1]);
+            const size_t k = qs.size();
+            if (k) { q.pfx = "rq.q" + std::to_string(k); q.qid = (int)k; }
+            if (segmented) { q.segmented = true; q.search = t; q.owner = owner; }
+            std::vector<std::string> others;
+            for (const auto& h : handles) if (h != q.handle) others.push_back(h);
+            std::string err = Collect(fn, q, others);
+            if (!err.empty()) { r.error = err; return r; }
+            err = FindLoop(fn, q);
+            if (!err.empty()) { r.error = err; return r; }
+            if (q.traces.size() > 1) {
+                err = MergeTraces(fn, q, traces, outSets);
+                if (!err.empty()) { r.error = err; return r; }
+            }
+            MarkProceduralEffects(m, fn, q);
+            qs.push_back(q);
+        }
     }
     // Before the per-query checks, so a query nested in another's loop is
     // refused for THAT, not for whatever it happens to read there.

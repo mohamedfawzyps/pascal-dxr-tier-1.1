@@ -233,13 +233,29 @@ class Query(object):
         self.others = []
         self.pfx = 'rq'
         self.qid = 0
+        # One query traced more than once (0.73.0): each search is a query of
+        # its own here, owning the ops it reaches. (its traces, owner
+        # function); the traces that start it, more than one where a branch
+        # chooses; and then the ray as the phis at the block where the search
+        # starts make it, that block, and the phis.
+        self.segment = None
+        self.traces = []
+        self.merged_args = None
+        self.route_block = None
+        self.trace_phis = []
 
     # --- derived ---------------------------------------------------------
 
     @property
     def dyn_flags(self):
         """The flags passed to TraceRayInline, which OR with the template's."""
-        return _imm(self.trace.args[3])
+        return _imm(self.args[3])
+
+    @property
+    def args(self):
+        """TraceRayInline's operands; for a search a branch chooses the trace
+        of, the phis that merge them (0.73.0)."""
+        return self.merged_args or self.trace.args
 
     @property
     def ray_flags(self):
@@ -263,19 +279,19 @@ class Query(object):
         if self.dyn_flags is not None:
             return [], 'i32 %d' % self.ray_flags
         from dxil import operand_name
-        dyn = operand_name(self.trace.args[3])
+        dyn = operand_name(self.args[3])
         return (['  %%%s.flags = or i32 %s, %d' % (self.pfx, dyn, self.const_flags or 0)],
                 'i32 %%%s.flags' % self.pfx)
 
     @property
     def as_handle(self):
         from dxil import operand_name
-        return operand_name(self.trace.args[2])
+        return operand_name(self.args[2])
 
     @property
     def ray_args(self):
         """mask, origin xyz, tmin, direction xyz, tmax, as operand text."""
-        a = self.trace.args
+        a = self.args
         return {'mask': a[4], 'origin': a[5:8], 'tmin': a[8],
                 'direction': a[9:12], 'tmax': a[12]}
 
@@ -448,14 +464,27 @@ def analyze(module, fn_name=None):
     allocs = fn.find(ALLOCATE)
     handles = [a.result for _, a in allocs]
     queries = []
-    for k, (block, alloc) in enumerate(allocs):
-        q = Query(fn, block, alloc)
-        if k:
-            q.pfx, q.qid = 'rq.q%d' % k, k
-        _collect(fn, q, [h for h in handles if h != q.handle])
-        _find_loop(fn, q)
-        _mark_procedural_effects(module, fn, q)
-        queries.append(q)
+    for block, alloc in allocs:
+        # A query traced more than once (0.73.0): TraceRayInline again starts a
+        # new search and forgets the old one, so each trace is lowered as a
+        # query of its own, with its own TraceRay and payload, as several
+        # queries already are (0.43.0).
+        traces = [i for _, i in fn.find(TRACE_INLINE) if alloc.result in i.uses()]
+        owner, searches = _trace_owner(fn, alloc.result, traces) if len(traces) > 1 \
+            else (None, [None])
+        for t in searches:
+            q = Query(fn, block, alloc)
+            k = len(queries)
+            if k:
+                q.pfx, q.qid = 'rq.q%d' % k, k
+            if owner:
+                q.segment = (t, owner)
+            _collect(fn, q, [h for h in handles if h != q.handle])
+            _find_loop(fn, q)
+            if len(q.traces) > 1:
+                _merge_traces(fn, q, owner)
+            _mark_procedural_effects(module, fn, q)
+            queries.append(q)
     # Before the per-query checks, so a query nested in another's loop is
     # refused for THAT, not for whatever it happens to read there.
     if len(queries) > 1:
@@ -469,6 +498,136 @@ def analyze(module, fn_name=None):
         q.pattern_num, q.pattern_desc = q.pattern()
     queries[0].others = queries[1:]
     return queries[0]
+
+
+def _trace_owner(fn, handle, traces):
+    """Which search each op of a query traced more than once reads (0.73.0).
+
+    A TraceRayInline starts a search and forgets the one before, so an op
+    reads the search of the traces that reach it with no other trace of the
+    query between: reaching definitions, a trace killing the rest. Traces
+    that reach one op together are one search, a branch choosing its ray.
+    Returns owner(block, instr) -> that search (a frozenset of trace
+    indices), and the searches in order of their first trace."""
+    labels = [b.label for b in fn.blocks]
+    preds = fn.preds()
+    idx = dict((id(t), k) for k, t in enumerate(traces))
+    last = {}                      # block -> its last trace
+    for b in fn.blocks:
+        for i in b.instrs:
+            if id(i) in idx:
+                last[b.label] = idx[id(i)]
+    inn = dict((l, frozenset()) for l in labels)
+    out = dict((l, frozenset([last[l]]) if l in last else frozenset()) for l in labels)
+    changed = True
+    while changed:
+        changed = False
+        for l in labels:
+            r = frozenset().union(*[out[p] for p in preds[l]]) if preds[l] else frozenset()
+            if r != inn[l]:
+                inn[l] = r
+                changed = True
+            o = frozenset([last[l]]) if l in last else r
+            if o != out[l]:
+                out[l] = o
+                changed = True
+    parent = list(range(len(traces)))
+
+    def find(k):
+        while parent[k] != k:
+            k = parent[k]
+        return k
+
+    reach = {}
+    for b in fn.blocks:
+        cur = inn[b.label]
+        for i in b.instrs:
+            if id(i) in idx:
+                cur = frozenset([idx[id(i)]])
+                reach[id(i)] = cur
+                continue
+            if i.dxop is None or handle not in i.uses():
+                continue
+            if not cur:
+                raise Unsupported(
+                    '%s at "%s" can be reached with no TraceRayInline of its query '
+                    'before it' % (KNOWN.get(i.dxop, i.dxop), i.body[:60]))
+            reach[id(i)] = cur
+            ks = sorted(cur)
+            for k in ks[1:]:
+                parent[find(k)] = find(ks[0])
+    groups = {}
+    for k in range(len(traces)):
+        groups.setdefault(find(k), []).append(k)
+    search = dict((k, frozenset(g)) for g in groups.values() for k in g)
+    searches = sorted(set(search.values()), key=min)
+
+    def owner(block, instr):
+        return search[min(reach[id(instr)])]
+    owner.out = out
+    owner.traces = traces
+    return owner, searches
+
+
+def _merge_traces(fn, q, owner):
+    """A search a branch chooses the ray of (0.73.0): the traces on each arm
+    become phis at the block where the search starts, the first Proceed's,
+    and the TraceRay goes there. That block's predecessors each have to come
+    from exactly one of the traces, and everything else of the query has to
+    come after it."""
+    if not q.loop or q.top:
+        raise Unsupported(
+            'a query traced on either arm of a branch, without a rotated Proceed '
+            'loop to start the search at')
+    if any(b.label in q.loop[2] for b, _ in q.traces):
+        raise Unsupported(
+            'RayQuery %s is traced again inside its own Proceed loop; that loop '
+            'becomes an any-hit shader, which cannot call TraceRay' % q.handle)
+    guard =[(b, i) for b, i in q.proceeds if b.label != q.loop[1]]
+    if len(guard) != 1:
+        raise Unsupported('a query traced on either arm of a branch, with no '
+                          'guard Proceed to start the search at')
+    p = guard[0][0]
+    mine = dict((id(t), t) for _b, t in q.traces)
+    ks = dict((id(t), k) for k, t in enumerate(owner.traces))
+    by_k = dict((ks[id(t)], t) for t in mine.values())
+    if any(b.label == p.label for b, _ in q.traces):
+        raise Unsupported('a query traced on either arm of a branch, and again in '
+                          'the block its search starts at')
+    dom = fn.dominators()
+    for b, i in q.proceeds + q.commits + q.aborts + q.proc_commits + \
+            q.candidate_ops + q.committed_ops:
+        if p.label not in dom.get(b.label, ()):
+            raise Unsupported(
+                'a query traced on either arm of a branch is used at "%s" before '
+                'the arms meet' % i.body[:60])
+    preds = fn.preds()[p.label]
+    src = []
+    for pr in preds:
+        r = [k for k in owner.out[pr] if k in by_k]
+        if len(r) != 1 or len(owner.out[pr]) != 1:
+            raise Unsupported(
+                'a query traced on either arm of a branch, with %s reaching the '
+                'search from more than one of them' % pr)
+        src.append((pr, by_k[r[0]]))
+    first = q.traces[0][1]
+    merged = list(first.args)
+    for j in range(2, len(first.args)):
+        vals = [t.args[j].strip() for _pr, t in src]
+        if all(v == vals[0] for v in vals):
+            merged[j] = vals[0]
+            continue
+        ty = vals[0].split()[0]
+        if ty == '%dx.types.Handle':
+            raise Unsupported(
+                'a query traced on either arm of a branch against a different '
+                'acceleration structure on each')
+        name = '%%%s.ta%d' % (q.pfx, j)
+        q.trace_phis.append('  %s = phi %s %s' % (name, ty, ', '.join(
+            '[ %s, %s ]' % (t.args[j].strip().split(None, 1)[1], pr) for pr, t in src)))
+        merged[j] = '%s %s' % (ty, name)
+    q.merged_args = merged
+    q.route_block = p
 
 
 def _check_queries(fn, queries):
@@ -488,7 +647,7 @@ def _check_queries(fn, queries):
                 'says which query it serves' % (len(queries), fn.name, names, q.handle))
         if not q.loop:
             continue
-        others = [x.handle for x in queries if x is not q]
+        others = [x.handle for x in queries if x is not q and x.handle != q.handle]
         for label in q.loop[2]:
             for instr in fn.block(label).instrs:
                 used = instr.uses()
@@ -498,6 +657,21 @@ def _check_queries(fn, queries):
                             'RayQuery %s is used inside the Proceed loop of %s; '
                             'that loop becomes an any-hit shader, which cannot '
                             'call TraceRay' % (h, q.handle))
+        # The same query traced again inside its own loop (0.73.0).
+        for x in queries:
+            if x is q or x.handle != q.handle:
+                continue
+            if any(b.label in q.loop[2] for b, _ in _ops(x)):
+                raise Unsupported(
+                    'RayQuery %s is traced again inside its own Proceed loop; that '
+                    'loop becomes an any-hit shader, which cannot call TraceRay'
+                    % q.handle)
+
+
+def _ops(q):
+    """Every (block, instr) the query owns."""
+    return ([(q.trace_block, q.trace)] + q.proceeds + q.commits + q.aborts +
+            q.proc_commits + q.candidate_ops + q.committed_ops)
 
 
 def _collect(fn, q, others=()):
@@ -514,15 +688,20 @@ def _collect(fn, q, others=()):
                 raise Unsupported('%s at "%s" does not use the query handle'
                                   % (KNOWN[op], instr.body[:60]))
             continue
+        # Traced more than once (0.73.0): another search.
+        if q.segment and q.segment[1](block, instr) != q.segment[0]:
+            continue
         if op not in KNOWN:
             raise Unsupported(
                 'unrecognised rayQuery opcode %d at "%s". This project has '
                 'only verified %s. Refusing rather than guessing.'
                 % (op, instr.body[:60], ', '.join(str(k) for k in sorted(KNOWN))))
         if op == TRACE_INLINE:
-            if q.trace is not None:
+            if q.trace is not None and not q.segment:
                 raise Unsupported('more than one TraceRayInline on one query')
-            q.trace, q.trace_block = instr, block
+            if q.trace is None:
+                q.trace, q.trace_block = instr, block
+            q.traces.append((block, instr))
         elif op == PROCEED:
             q.proceeds.append((block, instr))
         elif op == COMMIT_NON_OPAQUE:

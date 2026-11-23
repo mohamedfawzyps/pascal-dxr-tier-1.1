@@ -523,7 +523,8 @@ def main():
                       ('rayquery_refuse_triabort.ll', None),
                       ('rayquery_refuse_procfx.ll', 'also writes for procedural candidates'),
                       ('rayquery_refuse_procdynabort.ll', 'with ray flags computed at run time'),
-                      ('rayquery_refuse_candafter.ll', 'which code that did not leave the loop also reaches')):
+                      ('rayquery_refuse_candafter.ll', 'which code that did not leave the loop also reaches'),
+                      ('rayquery_refuse_retraceinloop.ll', 'traced again inside its own Proceed loop')):
         path = os.path.join('phase5', 'cases', case)
         if not os.path.isfile(path):
             continue

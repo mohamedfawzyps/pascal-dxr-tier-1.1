@@ -771,11 +771,23 @@ def _edit_query(module, q, edits, exports, fields, base, multi=False):
     elif q.loop:
         for block, instr in q.proceeds:
             term = block.terminator
-            if block.label != q.loop[1] and block is q.trace_block and term is not instr:
+            if block.label != q.loop[1] and block is (q.route_block or q.trace_block) \
+                    and term is not instr:
                 m = re.match(r'\s*br\s+i1\s+(\S+),', term.line)
                 if m and m.group(1) == instr.result:
                     route = term
-    if route is not None:
+    if q.route_block is not None:
+        # A search a branch chooses the ray of (0.73.0): the traces go, the
+        # phis open the block where the search starts, and all of it is there.
+        if route is None:
+            raise rq.Unsupported('a query traced on either arm of a branch, where its '
+                                 'guard Proceed does not branch on its own result')
+        for _b, t in q.traces:
+            edits[t.index] = None
+        rb = q.route_block
+        edits[rb.index] = '\n'.join([module.lines[rb.index]] + q.trace_phis)
+        edits[route.index] = text
+    elif route is not None:
         cut = text.index('  call void @dx.op.traceRay.')
         edits[q.trace.index] = text[:cut].rstrip('\n')
         edits[route.index] = text[cut:]
@@ -1427,7 +1439,7 @@ def _edit_exit_phis(fn, q, exit_label, latch, edits):
     normal way on through %<pfx>.xn, exit k through %<pfx>.x<k>, so each
     phi on the way out names the block it is now reached from."""
     st = q.state
-    tb = q.trace_block.label
+    tb = (q.route_block or q.trace_block).label
     ren = []      # (block whose phis, old predecessor, new one)
     if st['exits']:
         norm = '%%%s.xn' % q.pfx
@@ -1532,7 +1544,10 @@ def _plan_carry(fn, q, outside, fields=None, base=CARRY_FIELD0):
             'than the %d the payload carries' % (len(outside), names, MAX_CARRY))
     defs = {i.result: (b, i) for b, i in fn.instrs() if i.result}
     dom = fn.dominators()
-    tb = q.trace_block.label
+    # Where the TraceRay goes: the trace, or for a search a branch chooses the
+    # ray of, the block where it starts (0.73.0).
+    tb = (q.route_block or q.trace_block).label
+    at = q.route_block.terminator.index if q.route_block is not None else q.trace.index
     plan = []
     for k, name in enumerate(outside):
         if name not in defs:
@@ -1540,7 +1555,7 @@ def _plan_carry(fn, q, outside, fields=None, base=CARRY_FIELD0):
                 'Proceed loop body reads %s, which no instruction defines; the '
                 'any-hit shader is a separate invocation' % name)
         b, i = defs[name]
-        before = (b.label == tb and i.index < q.trace.index) or \
+        before = (b.label == tb and i.index < at) or \
                  (b.label != tb and b.label in dom.get(tb, set()))
         if not before:
             raise rq.Unsupported(
@@ -1624,7 +1639,7 @@ def _edit_ray_flags(q, edits):
             # runtime operand dominates this point.
             from dxil import operand_name
             edits[instr.index] = '  %s = or i32 %s, %d' % (
-                instr.result, operand_name(q.trace.args[3]), q.const_flags or 0)
+                instr.result, operand_name(q.args[3]), q.const_flags or 0)
 
 
 def _edit_committed(q, edits):

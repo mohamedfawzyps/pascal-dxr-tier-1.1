@@ -16,6 +16,7 @@
 // application's address space.
 #pragma once
 
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -162,6 +163,22 @@ struct Query {
     std::vector<Query> others;
     std::string pfx = "rq";
     int qid = 0;
+    // One query traced more than once (0.73.0): each search is a query of its
+    // own, owning the ops it reaches; see rayquery.py. The search (trace
+    // indices), the search of every op on the handle, the traces that start
+    // this one (more than one where a branch chooses), and then the ray as
+    // the phis where the search starts make it, that block, and the phis.
+    bool segmented = false;
+    std::set<int> search;
+    std::map<const llm::Instr*, std::set<int>> owner;
+    std::vector<std::pair<const llm::Block*, const llm::Instr*>> traces;
+    std::vector<std::string> mergedArgs;
+    const llm::Block* routeBlock = nullptr;
+    std::vector<std::string> tracePhis;
+    // TraceRayInline's operands, or the merged ones.
+    const std::vector<std::string>& Args() const {
+        return mergedArgs.empty() ? trace->args : mergedArgs;
+    }
     // Over this query and the others: does any need a generated any-hit?
     bool AnyNeedsAnyHit() const {
         if (NeedsAnyHit()) return true;

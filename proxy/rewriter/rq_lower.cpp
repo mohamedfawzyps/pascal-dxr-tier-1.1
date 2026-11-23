@@ -1314,7 +1314,10 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 for (const auto& i : b.instrs)
                     if (!i.result.empty()) defs[i.result] = {&b, &i};
             const auto dom = fn.Dominators();
-            const std::string tb = x.traceBlock->label;
+            // Where the TraceRay goes: the trace, or for a search a branch
+            // chooses the ray of, the block where it starts (0.73.0).
+            const std::string tb = (x.routeBlock ? x.routeBlock : x.traceBlock)->label;
+            const int at = x.routeBlock ? x.routeBlock->Terminator()->index : x.trace->index;
             for (size_t k = 0; k < outside.size(); ++k) {
                 const std::string& name = outside[k];
                 auto it = defs.find(name);
@@ -1326,7 +1329,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 const llm::Block* db = it->second.first;
                 const llm::Instr* di = it->second.second;
                 bool before = false;
-                if (db->label == tb) before = di->index < x.trace->index;
+                if (db->label == tb) before = di->index < at;
                 else {
                     auto d = dom.find(tb);
                     before = d != dom.end() && d->second.count(db->label);
@@ -1488,7 +1491,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 // The loop's exit block now follows the trace block; with
                 // exits (0.72.0), the blocks the trace block routes through.
                 // See _edit_exit_phis in lower.py.
-                const std::string tb = x.traceBlock->label;
+                const std::string tb = (x.routeBlock ? x.routeBlock : x.traceBlock)->label;
                 std::vector<std::tuple<std::string, std::string, std::string>> ren;
                 if (!st.exits.empty()) {
                     const std::string norm = "%" + x.pfx + ".xn";
@@ -1662,7 +1665,12 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             lines.push_back("  %" + x.pfx + ".plq = getelementptr inbounds " + kPayload +
                             ", " + kPayload + "* %" + x.pfx + ".pl, i32 0, i32 " +
                             std::to_string(kQidField));
-            lines.push_back("  store i32 " + std::to_string(x.qid) + ", i32* %" + x.pfx +
+            // DXR_TIER11_RETRACE_POISON=1 (0.73.0): every trace of a query
+            // traced more than once runs the first trace's loop body. The
+            // retrace cases must diverge (C++ only).
+            static const bool retracePoison = std::getenv("DXR_TIER11_RETRACE_POISON") != nullptr;
+            const int qidStored = (retracePoison && x.segmented) ? q.qid : x.qid;
+            lines.push_back("  store i32 " + std::to_string(qidStored) + ", i32* %" + x.pfx +
                             ".plq, align 4");
         }
         for (const auto& c : qcarry) {
@@ -1813,7 +1821,8 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             static const std::regex kBr(R"(^\s*br\s+i1\s+(\S+),)");
             for (const auto& p : x.proceeds) {
                 const llm::Instr* term = p.first->Terminator();
-                if (p.first->label == x.loop.latch || p.first != x.traceBlock || !term ||
+                if (p.first->label == x.loop.latch ||
+                    p.first != (x.routeBlock ? x.routeBlock : x.traceBlock) || !term ||
                     term == p.second)
                     continue;
                 std::smatch bm;
@@ -1821,7 +1830,21 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     route = term;
             }
         }
-        if (route) {
+        if (x.routeBlock) {
+            // A search a branch chooses the ray of (0.73.0): the traces go,
+            // the phis open the block where the search starts, and all of it
+            // is there.
+            if (!route) {
+                r.error = "a query traced on either arm of a branch, where its guard Proceed "
+                          "does not branch on its own result";
+                return false;
+            }
+            for (const auto& t : x.traces) edits[t.second->index] = std::nullopt;
+            std::string head = m.lines[x.routeBlock->index];
+            for (const auto& ph : x.tracePhis) head += "\n" + ph;
+            edits[x.routeBlock->index] = head;
+            edits[route->index] = joined;
+        } else if (route) {
             const size_t cut = joined.find("  call void @dx.op.traceRay.");
             std::string head = joined.substr(0, cut);
             while (!head.empty() && head.back() == '\n') head.pop_back();
@@ -1887,7 +1910,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             // RayFlags() can only be called after TraceRayInline, so the
             // runtime operand dominates this point.
             edits[i.index] = "  " + i.result + " = or i32 " +
-                             llm::OperandName(x.trace->args[3]) + ", " +
+                             llm::OperandName(x.Args()[3]) + ", " +
                              std::to_string(x.constFlags);
         }
     }

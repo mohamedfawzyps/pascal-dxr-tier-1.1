@@ -165,6 +165,15 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.73.0: PLAN STEP 3 f DONE, ONE QUERY TRACED MORE THAN ONCE.** Which
+search an op reads is reaching definitions over the query's traces; each
+search is lowered as a query of its own (0.43.0's machinery), and traces a
+branch chooses between are one search, the ray merged by phis at the first
+`Proceed()`'s block. **0.72.0 IN THE GAME (2026-11-23, 2 min 24 s): CLEAN,**
+163 lowered, 0 not lowered, 11701 drawn, REFUSED 0. Escher 845 of 845
+byte-identical. NEXT: plan step 3 g (`Proceed()` called without a loop,
+more than once).
+
 **0.72.0: PLAN STEP 3 e DONE, A `break` OR `return` OUT OF THE PROCEED
 LOOP.** An exit ends the search with the committed state kept, as `Abort()`
 does, storing its exit id in the payload; the raygen branches on it after
