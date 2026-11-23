@@ -137,7 +137,10 @@ code (`rq_analyze.cpp`, `rq_lower.cpp`) on 2026-09-26, not from memory:
   reported as a hit of kind 127 that ends the search). STEP 3 h DONE; left
   of it on the limits list: a procedural query with `Abort()` and ray flags
   computed at run time (refused by name).
-- i. `Abort()` outside the loop.
+- i. `Abort()` outside the loop. DONE 0.75.0: before the search it makes
+  the search empty (instance mask 0 when the raygen's flag is set), after it
+  changes nothing. Left of it on the limits list: an `Abort()` between two
+  `Proceed()` calls without a loop.
 - j. More than 16 carried values, and carried values of other types.
 - k. Several queries where one needs an intersection shader: give each
   query its own hit group offset, so no query id has to travel in a payload.
@@ -195,7 +198,8 @@ Three-form matrix, dispatch suite, an Escher run. Then the limits list:
   (0.73.0);
 - `Proceed()` without a loop: a call nested in the body of the one before, a
   write between two calls that a later body may read, a body with more than
-  one way out, a chain in a query serving procedural primitives (0.74.0).
+  one way out, a chain in a query serving procedural primitives (0.74.0);
+- an `Abort()` between two `Proceed()` calls without a loop (0.75.0).
 
 ## Size
 

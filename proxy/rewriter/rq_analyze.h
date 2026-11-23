@@ -180,6 +180,9 @@ struct Query {
     };
     std::vector<ChainCall> chain;
     std::map<std::string, int> chainRegion;
+    // Abort() outside the Proceed loop (0.75.0): before the search, so it
+    // searches nothing; or after it, where it changes nothing.
+    std::vector<std::pair<const llm::Block*, const llm::Instr*>> preAborts, postAborts;
     bool segmented = false;
     std::set<int> search;
     std::map<const llm::Instr*, std::set<int>> owner;

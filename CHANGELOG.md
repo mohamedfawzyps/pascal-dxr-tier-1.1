@@ -24,6 +24,38 @@ not.
 
 ---
 
+## 0.75.0
+
+**Plan step 3 i: `Abort()` outside the Proceed loop.** Refused until now
+("traversal can only be stopped from the generated any-hit shader").
+
+- **An `Abort()` ends the search, and only the `Proceed()` calls after it
+  see that.** One that can reach the call where the search starts (with no
+  other `TraceRayInline` of the query between) makes the search empty: the
+  raygen keeps a flag the abort sets, cleared at the trace, and the
+  `TraceRay` is traced with instance mask 0 when it is set, so nothing is
+  met, nothing committed, the loop never runs and every chain call
+  yields nothing. One after the search changes nothing and is dropped. One
+  between two calls of a chain (0.74.0) is refused by name, since whether
+  the next call yields would depend on code that runs after the search in
+  the lowering. An `Abort()` DXC sinks into a break's way out still joins
+  the body, as in 0.72.0, but only where nothing else reaches it.
+- **The search now starts at the guard `Proceed()` wherever it is.** An
+  abort between `TraceRayInline` and the loop puts the guard in a block
+  after the trace's; the routing goes there and the phis after the loop
+  name it. A bare `Proceed()` of a query forced opaque with an abort before
+  it starts the search at itself.
+- **Tests.** `rayquery_abortpre.hlsl` (an abort on every third column before
+  the loop, one and two candidates), `rayquery_abortpost.hlsl` (after the
+  loop), `rayquery_abortopaque.hlsl` (before the one `Proceed()` of an opaque
+  query), `rayquery_abortchain.hlsl` (before a chain): all refused on 0.74.0,
+  all match WARP. `DXR_TIER11_PREABORT_POISON=1` (the flag never read)
+  diverges in 6256 and 4816 rays. `rayquery_refuse_abortbetween.hlsl`
+  provokes the one new refusal. Byte-identical in both rewriters on 76
+  cases; rewriter refusal checks 70 of 70; dispatch suite 129 of 129.
+- **Escher unchanged:** all 845 dumped Unreal shader inputs lower
+  byte-identically to 0.74.0.
+
 ## 0.74.0
 
 **Plan step 3 g: `Proceed()` called without a loop, once or more. And a

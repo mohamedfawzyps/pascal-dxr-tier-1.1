@@ -248,7 +248,7 @@ static std::string AbsorbExits(const llm::Function& fn, Query& q) {
     for (const auto& b : fn.blocks) succ[b.label] = b.Successors();
     const auto preds = fn.Preds();
     std::set<std::string> need;
-    for (const auto* list : { &q.commits, &q.procCommits, &q.aborts })
+    for (const auto* list : { &q.commits, &q.procCommits })
         for (const auto& c : *list) need.insert(c.first->label);
     for (const auto& c : q.candidateOps)
         if (c.second->DxOp() != kRayFlags) need.insert(c.first->label);
@@ -294,6 +294,35 @@ static std::string AbsorbExits(const llm::Function& fn, Query& q) {
                            "Proceed loop after the candidate is used there";
         }
         body.insert(back.begin(), back.end());
+    }
+    // An Abort() DXC sank into the way out joins too (0.75.0), where only the
+    // way out reaches it: see _absorb_exits in rayquery.py.
+    {
+        std::set<std::string> abs;
+        for (const auto& a : q.aborts)
+            if (!body.count(a.first->label)) abs.insert(a.first->label);
+        for (const auto& ab : byOrder(abs)) {
+            if (!reach.count(ab)) continue;
+            std::set<std::string> back;
+            std::vector<std::string> todo2{ ab };
+            while (!todo2.empty()) {
+                const std::string l = todo2.back();
+                todo2.pop_back();
+                if (back.count(l) || body.count(l) || !reach.count(l)) continue;
+                back.insert(l);
+                auto it = preds.find(l);
+                if (it != preds.end())
+                    for (const auto& p : it->second) todo2.push_back(p);
+            }
+            bool ok = true;
+            for (const auto& l : back) {
+                auto it = preds.find(l);
+                if (it == preds.end()) continue;
+                for (const auto& p : it->second)
+                    if (p == q.loop.latch || (!body.count(p) && !back.count(p))) ok = false;
+            }
+            if (ok) body.insert(back.begin(), back.end());
+        }
     }
     q.exits.clear();
     for (const auto& l : byOrder(body)) {
@@ -403,7 +432,7 @@ static std::string FindChain(const llm::Function& fn, Query& q) {
     std::set<std::string> body;
     for (size_t k = 0; k < chain.size(); ++k)
         for (const auto& l : chain[k].region) { body.insert(l); q.chainRegion[l] = (int)k; }
-    for (const auto* list : { &q.commits, &q.procCommits, &q.aborts, &q.candidateOps })
+    for (const auto* list : { &q.commits, &q.procCommits, &q.candidateOps })
         for (const auto& c : *list) {
             if (c.second->DxOp() == kRayFlags) continue;
             if (!body.count(c.first->label))
@@ -485,7 +514,91 @@ static std::string CheckChainBetween(const llm::Module& m, const llm::Function& 
     return "";
 }
 
+// Abort() outside the Proceed loop (0.75.0): see _place_aborts in
+// rayquery.py, which this mirrors.
+static std::string PlaceAborts(const llm::Function& fn, Query& q) {
+    std::vector<std::pair<const llm::Block*, const llm::Instr*>> outer, inner;
+    for (const auto& a : q.aborts)
+        (q.hasLoop && q.loop.body.count(a.first->label) ? inner : outer).push_back(a);
+    q.aborts = inner;
+    if (outer.empty()) return "";
+    const llm::Block* sb = nullptr;
+    const llm::Instr* si = nullptr;
+    if (q.proceeds.empty()) {
+    } else if (!q.chain.empty()) {
+        sb = q.chain[0].block; si = q.chain[0].instr;
+    } else if (q.hasLoop && q.top) {
+        sb = q.traceBlock; si = q.traceBlock->Terminator();
+    } else if (q.hasLoop) {
+        for (const auto& p : q.proceeds)
+            if (p.first->label != q.loop.latch) { sb = p.first; si = p.second; break; }
+    } else {
+        sb = q.proceeds[0].first; si = q.proceeds[0].second;
+    }
+    std::vector<const llm::Instr*> traces;
+    if (q.traces.empty()) traces.push_back(q.trace);
+    else for (const auto& t : q.traces) traces.push_back(t.second);
+    std::map<std::string, std::vector<std::string>> succ;
+    for (const auto& b : fn.blocks) succ[b.label] = b.Successors();
+    auto inBlock = [](const llm::Block* b, const llm::Instr* t) {
+        for (const auto& i : b->instrs) if (&i == t) return true;
+        return false;
+    };
+    auto reaches = [&](const llm::Block* ab, const llm::Instr* ai,
+                       const llm::Block* rb, const llm::Instr* ri) {
+        if (ab->label == rb->label && ai->index < ri->index) {
+            for (const auto* t : traces)
+                if (inBlock(ab, t) && ai->index < t->index && t->index < ri->index) return false;
+            return true;
+        }
+        for (const auto* t : traces)
+            if (inBlock(ab, t) && t->index > ai->index) return false;
+        std::set<std::string> seen;
+        std::vector<std::string> todo = succ[ab->label];
+        while (!todo.empty()) {
+            const std::string l = todo.back();
+            todo.pop_back();
+            if (seen.count(l)) continue;
+            seen.insert(l);
+            const llm::Block* blk = fn.FindBlock(l);
+            std::vector<const llm::Instr*> ts;
+            for (const auto* t : traces) if (inBlock(blk, t)) ts.push_back(t);
+            if (l == rb->label) {
+                bool killed = false;
+                for (const auto* t : ts) if (t->index < ri->index) killed = true;
+                if (!killed) return true;
+                continue;
+            }
+            if (!ts.empty()) continue;
+            for (const auto& s2 : succ[l]) todo.push_back(s2);
+        }
+        return false;
+    };
+    for (const auto& a : outer) {
+        if (sb && reaches(a.first, a.second, sb, si)) {
+            q.preAborts.push_back(a);
+            continue;
+        }
+        bool between = false;
+        for (size_t k = 1; k < q.chain.size(); ++k)
+            if (reaches(a.first, a.second, q.chain[k].block, q.chain[k].instr)) between = true;
+        if (between)
+            return "Abort() between two Proceed() calls without a loop; whether the next call "
+                   "yields depends on code that runs after the search in the lowering";
+        q.postAborts.push_back(a);
+    }
+    return "";
+}
+
+static std::string FindLoopShape(const llm::Function& fn, Query& q);
+
 std::string FindLoop(const llm::Function& fn, Query& q) {
+    const std::string err = FindLoopShape(fn, q);
+    if (!err.empty()) return err;
+    return PlaceAborts(fn, q);
+}
+
+static std::string FindLoopShape(const llm::Function& fn, Query& q) {
     std::set<std::string> proceedBlocks;
     for (const auto& p : q.proceeds) proceedBlocks.insert(p.first->label);
 
@@ -644,11 +757,6 @@ std::string RejectFunction(const llm::Function& fn, Query& q) {
                 return "shader uses wave intrinsics around the query; promotion to "
                        "raygen changes lane occupancy";
         }
-    }
-    for (const auto& a : q.aborts) {
-        if (!q.hasLoop || !q.loop.body.count(a.first->label))
-            return "Abort() outside the Proceed loop; traversal can only be "
-                   "stopped from the generated any-hit shader";
     }
 
     if (q.hasLoop) {

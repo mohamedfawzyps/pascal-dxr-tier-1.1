@@ -189,6 +189,13 @@ const char kHandleType[] = "%dx.types.Handle";
 // The global a Shader Model 6.6 binding lowers to: a handle, or for a
 // resource ARRAY an array of handles, `[4 x %dx.types.Handle]` (read off DXC,
 // phase5/cases/reference/lib_sm66_dynarray_ref.hlsl).
+// Where the part of the trace text that runs at the search's start begins:
+// the TraceRay, or the Abort() flag's read before it (0.75.0).
+size_t TraceCut(const std::string& joined, const std::string& pfx) {
+    const size_t k = joined.find("  %" + pfx + ".rav = load");
+    return k != std::string::npos ? k : joined.find("  call void @dx.op.traceRay.");
+}
+
 std::string BindingGty(const std::string& gty, const std::string& elem) {
     static const std::regex kN(R"(^\[(\d+) x )");
     std::smatch m;
@@ -1200,6 +1207,8 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         std::string pending = first.line;
         auto it = edits.find(first.index);
         if (it != edits.end() && it->second.has_value()) pending = *it->second;
+        if (!x.preAborts.empty())   // Abort() before the search (0.75.0)
+            pending = "  %" + x.pfx + ".rab = alloca i32, align 4\n" + pending;
         edits[first.index] = std::string("  %" + x.pfx + ".pl = alloca ") + kPayload +
                              ", align 8\n" + pending;
     }
@@ -1207,6 +1216,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
     edits[x.alloc->index] = std::nullopt;
 
     // --- the loop, if there is one -----------------------------------------
+    std::string bareRoute;
     std::string exitLabel;
     std::string preheader;
     if (x.hasLoop) {
@@ -1540,7 +1550,11 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 // The loop's exit block now follows the trace block; with
                 // exits (0.72.0), the blocks the trace block routes through.
                 // See _edit_exit_phis in lower.py.
-                const std::string tb = (x.routeBlock ? x.routeBlock : x.traceBlock)->label;
+                // The block the routing ends up in: the guard's (0.75.0).
+                std::string tb = (x.routeBlock ? x.routeBlock : x.traceBlock)->label;
+                if (!x.top)
+                    for (const auto& gp : x.proceeds)
+                        if (gp.first->label != x.loop.latch) { tb = gp.first->label; break; }
                 std::vector<std::tuple<std::string, std::string, std::string>> ren;
                 if (!st.exits.empty()) {
                     const std::string norm = "%" + x.pfx + ".xn";
@@ -1786,10 +1800,27 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 flags.second = "i32 %" + x.pfx + ".tf";
             }
         }
+        std::string mask = ra[0];
+        if (!x.preAborts.empty()) {
+            // Abort() before the search (0.75.0): see _trace_block in lower.py.
+            // DXR_TIER11_PREABORT_POISON=1: the flag is never read, so an
+            // aborted query searches anyway. The cases must diverge (C++ only).
+            static const bool preAbortPoison = std::getenv("DXR_TIER11_PREABORT_POISON") != nullptr;
+            lines.push_back("  store i32 0, i32* %" + x.pfx + ".rab, align 4");
+            if (!x.proceeds.empty()) {
+                const std::string on = llm::OperandName(ra[0]);
+                const std::string mv = on.empty() ? ra[0].substr(ra[0].find_last_of(' ') + 1) : on;
+                lines.push_back("  %" + x.pfx + ".rav = load i32, i32* %" + x.pfx + ".rab, align 4");
+                lines.push_back("  %" + x.pfx + ".rac = icmp ne i32 %" + x.pfx + ".rav, 0");
+                lines.push_back("  %" + x.pfx + ".ram = select i1 %" + x.pfx + ".rac, i32 " +
+                                (preAbortPoison ? mv : std::string("0")) + ", i32 " + mv);
+                mask = "i32 %" + x.pfx + ".ram";
+            }
+        }
         std::ostringstream tr;
         tr << "  call void @dx.op.traceRay." << std::string(kPayload).substr(1)
            << "(i32 157, %dx.types.Handle " << x.AsHandle() << ", " << flags.second
-           << ", " << ra[0] << ", i32 0, i32 "
+           << ", " << mask << ", i32 0, i32 "
            << (x.needsRecordConstants ? 1 : 0)
            << ", i32 0, " << ra[1] << ", " << ra[2]
            << ", " << ra[3] << ", " << ra[4] << ", " << ra[5] << ", " << ra[6]
@@ -1871,8 +1902,9 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             static const std::regex kBr(R"(^\s*br\s+i1\s+(\S+),)");
             for (const auto& p : x.proceeds) {
                 const llm::Instr* term = p.first->Terminator();
+                // The guard's block, wherever it is (0.75.0).
                 if (p.first->label == x.loop.latch ||
-                    p.first != (x.routeBlock ? x.routeBlock : x.traceBlock) || !term ||
+                    (x.routeBlock && p.first != x.routeBlock) || !term ||
                     term == p.second)
                     continue;
                 std::smatch bm;
@@ -1935,7 +1967,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     edits[i.index] = phi;
                 }
             }
-            const size_t cut = joined.find("  call void @dx.op.traceRay.");
+            const size_t cut = TraceCut(joined, x.pfx);
             std::string head = joined.substr(0, cut);
             while (!head.empty() && head.back() == '\n') head.pop_back();
             edits[x.trace->index] = head;
@@ -1970,7 +2002,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             edits[x.routeBlock->index] = head;
             edits[route->index] = joined;
         } else if (route) {
-            const size_t cut = joined.find("  call void @dx.op.traceRay.");
+            const size_t cut = TraceCut(joined, x.pfx);
             std::string head = joined.substr(0, cut);
             while (!head.empty() && head.back() == '\n') head.pop_back();
             edits[x.trace->index] = head;
@@ -1978,6 +2010,19 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         } else {
             edits[x.trace->index] = joined;
         }
+        if (x.chain.empty() && !x.hasLoop && !x.preAborts.empty() && !x.proceeds.empty()) {
+            // One bare Proceed() with an Abort() before it (0.75.0).
+            const size_t cut = TraceCut(joined, x.pfx);
+            std::string head = joined.substr(0, cut);
+            while (!head.empty() && head.back() == '\n') head.pop_back();
+            edits[x.trace->index] = head;
+            bareRoute = joined.substr(cut);
+        }
+        // Abort() outside the loop (0.75.0): before the search it sets the
+        // flag, after it changes nothing.
+        for (const auto& a : x.preAborts)
+            edits[a.second->index] = "  store i32 1, i32* %" + x.pfx + ".rab, align 4";
+        for (const auto& a : x.postAborts) edits[a.second->index] = std::nullopt;
     }
 
     // --- Proceed calls vanish ----------------------------------------------
@@ -1994,6 +2039,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 edits[term->index] = std::nullopt;   // folded into the trace replacement
         }
     }
+    if (!bareRoute.empty()) edits[x.proceeds[0].second->index] = bareRoute;
 
     // --- the loop blocks go --------------------------------------------------
     if (x.hasLoop) {

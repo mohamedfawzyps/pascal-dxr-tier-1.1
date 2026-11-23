@@ -157,7 +157,17 @@ $cases = @(
     @{ name = 'proceedbare'; src = 'phase5\cases\rayquery_proceedbare.ll'; pat = 'alpha'; flags = @('--geom');
        norender = $true; desc = 'a bare Proceed(), not forced opaque' },
     @{ name = 'noproceed'; src = 'phase5\cases\rayquery_noproceed.ll'; pat = 'opaque'; flags = @();
-       norender = $true; desc = 'never asked to Proceed(), never searched' }
+       norender = $true; desc = 'never asked to Proceed(), never searched' },
+    # Abort() outside the loop (0.75.0): before the search it searches
+    # nothing, after it changes nothing.
+    @{ name = 'abortpre'; src = 'phase5\cases\rayquery_abortpre.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = 'Abort() before the Proceed loop' },
+    @{ name = 'abortpost'; src = 'phase5\cases\rayquery_abortpost.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = 'Abort() after the Proceed loop' },
+    @{ name = 'abortopaque'; src = 'phase5\cases\rayquery_abortopaque.ll'; pat = 'opaque'; flags = @();
+       norender = $true; desc = 'Abort() before the one Proceed() of an opaque query' },
+    @{ name = 'abortchain'; src = 'phase5\cases\rayquery_abortchain.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = 'Abort() before a Proceed() without a loop' }
 )
 
 if (-not (Test-Path 'phase5\dxil\rayquery_opaque.ll')) {

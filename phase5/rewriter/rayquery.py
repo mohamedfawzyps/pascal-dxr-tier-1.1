@@ -243,6 +243,10 @@ class Query(object):
         # with the region its true edge guards (see _find_chain).
         self.chain = None
         self.chain_region = {}
+        # Abort() outside the Proceed loop (0.75.0): before the search, so it
+        # searches nothing; or after it, where it changes nothing.
+        self.pre_aborts = []
+        self.post_aborts = []
         self.traces = []
         self.merged_args = None
         self.route_block = None
@@ -751,6 +755,69 @@ def _collect(fn, q, others=()):
 
 
 def _find_loop(fn, q):
+    _find_loop_shape(fn, q)
+    _place_aborts(fn, q)
+
+
+def _place_aborts(fn, q):
+    """Abort() outside the Proceed loop (0.75.0). It ends the search; only
+    the Proceed() calls after it see that. One that can reach the call where
+    the search starts makes that search empty, so the TraceRay is traced with
+    instance mask 0 when it ran; one that cannot is after the search and
+    changes nothing; one between two calls of a chain is refused."""
+    body = q.loop[2] if q.loop else set()
+    outer = [(b, i) for b, i in q.aborts if b.label not in body]
+    q.aborts = [(b, i) for b, i in q.aborts if b.label in body]
+    if not outer:
+        return
+    # Where the search starts.
+    if not q.proceeds:
+        start = None
+    elif q.chain:
+        start = (q.chain[0]['block'], q.chain[0]['instr'])
+    elif q.loop and q.top:
+        start = (q.trace_block, q.trace_block.terminator)
+    elif q.loop:
+        start = [(b, i) for b, i in q.proceeds if b.label != q.loop[1]][0]
+    else:
+        start = q.proceeds[0]
+    traces = [i for _b, i in (q.traces or [(q.trace_block, q.trace)])]
+    succ = dict((b.label, b.successors()) for b in fn.blocks)
+
+    def reaches(ab, ai, rb, ri):
+        if ab.label == rb.label and ai.index < ri.index:
+            return not any(ai.index < t.index < ri.index for t in traces
+                           if t in ab.instrs)
+        if any(t.index > ai.index for t in traces if t in ab.instrs):
+            return False
+        seen, todo = set(), list(succ[ab.label])
+        while todo:
+            l = todo.pop()
+            if l in seen:
+                continue
+            seen.add(l)
+            blk = fn.block(l)
+            ts = [t for t in traces if t in blk.instrs]
+            if l == rb.label:
+                if not any(t.index < ri.index for t in ts):
+                    return True
+                continue
+            if ts:
+                continue
+            todo.extend(succ[l])
+        return False
+    for b, i in outer:
+        if start is not None and reaches(b, i, start[0], start[1]):
+            q.pre_aborts.append((b, i))
+        elif q.chain and any(reaches(b, i, c['block'], c['instr']) for c in q.chain[1:]):
+            raise Unsupported(
+                'Abort() between two Proceed() calls without a loop; whether the next call '
+                'yields depends on code that runs after the search in the lowering')
+        else:
+            q.post_aborts.append((b, i))
+
+
+def _find_loop_shape(fn, q):
     """Locate the rotated Proceed loop, if there is one.
 
     The source's `while (q.Proceed())` becomes two Proceed calls: a guard in
@@ -891,7 +958,7 @@ def _find_chain(fn, q):
         body |= c['region']
         for l in c['region']:
             q.chain_region[l] = k
-    for b, i in q.commits + q.proc_commits + q.aborts + q.candidate_ops:
+    for b, i in q.commits + q.proc_commits + q.candidate_ops:
         if i.dxop == RAY_FLAGS:
             continue
         if b.label not in body:
@@ -969,7 +1036,7 @@ def _absorb_exits(fn, q):
     labels = [b.label for b in fn.blocks]
     succ = {b.label: b.successors() for b in fn.blocks}
     preds = fn.preds()
-    need = set(b.label for b, i in q.commits + q.proc_commits + q.aborts)
+    need = set(b.label for b, i in q.commits + q.proc_commits)
     need |= set(b.label for b, i in q.candidate_ops if i.dxop != RAY_FLAGS)
     need -= body
     # Outside blocks the body reaches without coming back to it, other than
@@ -1003,6 +1070,20 @@ def _absorb_exits(fn, q):
                         'committed state is read in %s, on the way out of the Proceed '
                         'loop after the candidate is used there' % l)
         body |= back
+    # An Abort() DXC sank into the way out joins too (0.75.0), where only the
+    # way out reaches it; anywhere else it is an Abort() after the loop.
+    for ab in sorted(set(b.label for b, i in q.aborts) - body, key=labels.index):
+        if ab not in reach:
+            continue
+        back, todo = set(), [ab]
+        while todo:
+            l = todo.pop()
+            if l in back or l in body or l not in reach:
+                continue
+            back.add(l)
+            todo.extend(preds[l])
+        if all(p != latch and (p in body or p in back) for l in back for p in preds[l]):
+            body |= back
     q.loop = (header, latch, body)
     q.exits = [(l, s) for l in sorted(body, key=labels.index) if l != latch
                for s in succ[l] if s not in body]
@@ -1038,11 +1119,6 @@ def _reject_function(fn, q):
             raise Unsupported('shader uses wave intrinsics around the query; '
                               'promotion to raygen changes lane occupancy')
 
-    for block, instr in q.aborts:
-        if not q.loop or block.label not in q.loop[2]:
-            raise Unsupported(
-                'Abort() outside the Proceed loop; traversal can only be '
-                'stopped from the generated any-hit shader')
 
     if q.loop:
         _, _, body = q.loop

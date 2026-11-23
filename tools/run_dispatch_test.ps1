@@ -447,7 +447,15 @@ $cases = @(
     @{ name = 'proceed2s'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proceed2.hlsl', '--geom', '--stack'); desc = 'the same, two candidates: a body each' },
     @{ name = 'proceedbare'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proceedbare.hlsl', '--geom', '--opaquemix'); desc = 'a bare Proceed(), opaque quadrants committed, the others not' },
     @{ name = 'proceedbares'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proceedbare.hlsl', '--geom', '--opaquemix', '--stack'); desc = 'the same, two layers' },
-    @{ name = 'noproceed'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_noproceed.hlsl'); desc = 'never asked to Proceed(), never searched' }
+    @{ name = 'noproceed'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_noproceed.hlsl'); desc = 'never asked to Proceed(), never searched' },
+    # Abort() outside the loop (0.75.0, plan step 3 i): before the search it
+    # searches nothing (traced with instance mask 0), after it changes nothing.
+    @{ name = 'abortpre'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_abortpre.hlsl', '--geom'); desc = 'Abort() before the Proceed loop' },
+    @{ name = 'abortpres'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_abortpre.hlsl', '--geom', '--stack'); desc = 'the same, two candidates' },
+    @{ name = 'abortpost'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_abortpost.hlsl', '--geom'); desc = 'Abort() after the Proceed loop' },
+    @{ name = 'abortopaque'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_abortopaque.hlsl'); desc = 'Abort() before the one Proceed() of an opaque query' },
+    @{ name = 'abortchain'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_abortchain.hlsl', '--geom'); desc = 'Abort() before a Proceed() without a loop' },
+    @{ name = 'abortchains'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_abortchain.hlsl', '--geom', '--stack'); desc = 'the same, two candidates' }
 )
 
 $failed = 0
@@ -825,13 +833,17 @@ $xg = @(
     # Proceed() without a loop (0.74.0): every candidate running the first
     # call's body, nothing ending the search.
     @{ n = 'proceed1s'; v = 'DXR_TIER11_CHAIN_POISON'; x = @('--cs', 'phase5\cases\rayquery_proceed1.hlsl', '--geom', '--stack') },
-    @{ n = 'proceed2s'; v = 'DXR_TIER11_CHAIN_POISON'; x = @('--cs', 'phase5\cases\rayquery_proceed2.hlsl', '--geom', '--stack') }
+    @{ n = 'proceed2s'; v = 'DXR_TIER11_CHAIN_POISON'; x = @('--cs', 'phase5\cases\rayquery_proceed2.hlsl', '--geom', '--stack') },
+    # Abort() before the search (0.75.0): the flag never read.
+    @{ n = 'abortpre'; v = 'DXR_TIER11_PREABORT_POISON'; x = @('--cs', 'phase5\cases\rayquery_abortpre.hlsl', '--geom') },
+    @{ n = 'abortopaque'; v = 'DXR_TIER11_PREABORT_POISON'; x = @('--cs', 'phase5\cases\rayquery_abortopaque.hlsl'); p = 'opaque' }
 )
 foreach ($g in $xg) {
     $x = $g.x
-    & .\raytest.exe warp rayquery alpha dp_xg_a.bin @x | Out-Null
+    $pt = if ($g.p) { $g.p } else { 'alpha' }
+    & .\raytest.exe warp rayquery $pt dp_xg_a.bin @x | Out-Null
     Set-Item "env:$($g.v)" '1'
-    & .\raytest.exe hw rayquery alpha dp_xg_b.bin @x | Out-Null
+    & .\raytest.exe hw rayquery $pt dp_xg_b.bin @x | Out-Null
     Remove-Item "env:$($g.v)"
     if ((& .\raytest.exe diff dp_xg_a.bin dp_xg_b.bin 2>&1) -match 'RESULT: DIVERGE') { Write-Host "  $($g.n): diverges with $($g.v)" }
     else { Write-Host "  NOT SENSITIVE: $($g.n) matched with $($g.v)"; $failed++ }

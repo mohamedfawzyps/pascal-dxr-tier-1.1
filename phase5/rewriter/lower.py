@@ -725,6 +725,9 @@ def _edit_query(module, q, edits, exports, fields, base, multi=False):
         raise LowerError('entry block is empty')
     first = entry.instrs[0]
     pending = edits.get(first.index, first.line)
+    if q.pre_aborts:
+        # Abort() before the search (0.75.0): a flag the raygen sets.
+        pending = '  %%%s.rab = alloca i32, align 4\n%s' % (q.pfx, pending)
     edits[first.index] = ('  %%%s.pl = alloca %s, align 8\n%s' % (q.pfx, PAYLOAD, pending))
 
     # The allocate disappears entirely; the handle it produced is only ever
@@ -774,7 +777,9 @@ def _edit_query(module, q, edits, exports, fields, base, multi=False):
     elif q.loop:
         for block, instr in q.proceeds:
             term = block.terminator
-            if block.label != q.loop[1] and block is (q.route_block or q.trace_block) \
+            # The guard's block, wherever it is (0.75.0: an Abort() before
+            # it puts it after the trace's block).
+            if block.label != q.loop[1] and (q.route_block is None or block is q.route_block) \
                     and term is not instr:
                 m = re.match(r'\s*br\s+i1\s+(\S+),', term.line)
                 if m and m.group(1) == instr.result:
@@ -791,11 +796,19 @@ def _edit_query(module, q, edits, exports, fields, base, multi=False):
         edits[rb.index] = '\n'.join([module.lines[rb.index]] + q.trace_phis)
         edits[route.index] = text
     elif route is not None:
-        cut = text.index('  call void @dx.op.traceRay.')
+        cut = _trace_cut(text, q)
         edits[q.trace.index] = text[:cut].rstrip('\n')
         edits[route.index] = text[cut:]
     else:
         edits[q.trace.index] = text
+    bare = None
+    if not q.loop and q.pre_aborts and q.proceeds:
+        # One bare Proceed() with an Abort() before it (0.75.0): the search
+        # starts there.
+        cut = _trace_cut(text, q)
+        edits[q.trace.index] = text[:cut].rstrip('\n')
+        bare = (q.proceeds[0][1], text[cut:])
+    _edit_outer_aborts(q, edits)
 
     # Proceed calls vanish. The guard's branch is rewired past the loop; the
     # latch goes with the rest of the loop blocks.
@@ -808,6 +821,8 @@ def _edit_query(module, q, edits, exports, fields, base, multi=False):
             m = re.match(r'\s*br\s+i1\s+(\S+),', term.line)
             if m and m.group(1) == instr.result:
                 edits[term.index] = None   # folded into the trace replacement
+    if bare:
+        edits[bare[0].index] = bare[1]
 
     if q.loop:
         header, latch, body = q.loop
@@ -885,7 +900,7 @@ def _edit_chain(module, q, edits, fields, base, multi):
             edits[i.index] = '  %s = phi %s %s' % (i.result, ty, ', '.join(
                 '[ %s, %s ]' % e for e in ents))
     text = _trace_block(q, q.ray_args, None, multi)
-    cut = text.index('  call void @dx.op.traceRay.')
+    cut = _trace_cut(text, q)
     edits[q.trace.index] = text[:cut].rstrip('\n')
     first = q.chain[0]['instr']
     call = [text[cut:],
@@ -899,6 +914,7 @@ def _edit_chain(module, q, edits, fields, base, multi):
             edits[i.index] = '\n'.join(call)
         else:
             edits[i.index] = res
+    _edit_outer_aborts(q, edits)
     for label in body:
         blk = fn.block(label)
         if blk.index >= 0:
@@ -907,6 +923,22 @@ def _edit_chain(module, q, edits, fields, base, multi):
             edits[i.index] = None
     _edit_committed(q, edits)
     _edit_ray_flags(q, edits)
+
+
+def _edit_outer_aborts(q, edits):
+    """Abort() outside the loop (0.75.0): before the search it sets the flag,
+    after it changes nothing."""
+    for _b, i in q.pre_aborts:
+        edits[i.index] = '  store i32 1, i32* %%%s.rab, align 4' % q.pfx
+    for _b, i in q.post_aborts:
+        edits[i.index] = None
+
+
+def _trace_cut(text, q):
+    """Where the part of the trace text that runs at the search's start
+    begins: the TraceRay, or the Abort() flag's read before it (0.75.0)."""
+    k = text.find('  %%%s.rav = load' % q.pfx)
+    return k if k >= 0 else text.index('  call void @dx.op.traceRay.')
 
 
 def _plan_chain_state(fn, q, escapes, fields, base):
@@ -1044,12 +1076,23 @@ def _trace_block(q, ra, exit_label, multi=False):
             lines.append('  %%%s.tf0 = and i32 %s, -196' % (q.pfx, v))
             lines.append('  %%%s.tf = or i32 %%%s.tf0, 2' % (q.pfx, q.pfx))
             flag_text = 'i32 %%%s.tf' % q.pfx
+    mask = ra['mask']
+    if q.pre_aborts:
+        # Abort() before the search (0.75.0): the flag starts clear at the
+        # trace; set when the search starts, it searches nothing.
+        lines.append('  store i32 0, i32* %%%s.rab, align 4' % q.pfx)
+        if q.proceeds:
+            lines += ['  %%%s.rav = load i32, i32* %%%s.rab, align 4' % (q.pfx, q.pfx),
+                      '  %%%s.rac = icmp ne i32 %%%s.rav, 0' % (q.pfx, q.pfx),
+                      '  %%%s.ram = select i1 %%%s.rac, i32 0, i32 %s'
+                      % (q.pfx, q.pfx, rq_operand(ra['mask']))]
+            mask = 'i32 %%%s.ram' % q.pfx
     # Never asked to Proceed(), so never searched: no TraceRay (0.74.0).
     lines += [] if not q.proceeds else [
         '  call void @dx.op.traceRay.%s(i32 157, %%dx.types.Handle %s, %s, '
         '%s, i32 0, i32 %d, i32 0, %s, %s, %s, %s, %s, %s, %s, %s, %s* nonnull %%%s.pl)'
         '  ; TraceRay(...)' % (
-            PAYLOAD[1:], q.as_handle, flag_text, ra['mask'], geom_mult,
+            PAYLOAD[1:], q.as_handle, flag_text, mask, geom_mult,
             ra['origin'][0], ra['origin'][1], ra['origin'][2], ra['tmin'],
             ra['direction'][0], ra['direction'][1], ra['direction'][2], ra['tmax'],
             PAYLOAD, q.pfx),
@@ -1584,7 +1627,9 @@ def _edit_exit_phis(fn, q, exit_label, latch, edits):
     normal way on through %<pfx>.xn, exit k through %<pfx>.x<k>, so each
     phi on the way out names the block it is now reached from."""
     st = q.state
-    tb = (q.route_block or q.trace_block).label
+    # The block the routing ends up in: the guard's (0.75.0), else the trace's.
+    guard = [b for b, _ in q.proceeds if b.label != latch] if not q.top else []
+    tb = guard[0].label if guard else (q.route_block or q.trace_block).label
     ren = []      # (block whose phis, old predecessor, new one)
     if st['exits']:
         norm = '%%%s.xn' % q.pfx

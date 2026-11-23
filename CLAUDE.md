@@ -165,6 +165,14 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.75.0: PLAN STEP 3 i DONE, `Abort()` OUTSIDE THE LOOP.** Before the
+search it makes the search empty (a raygen flag, the `TraceRay` traced with
+instance mask 0 when set); after it changes nothing; between two chain calls
+it is refused by name. The search now starts at the guard `Proceed()`
+wherever it is, not only in the trace's block. Escher 845 of 845
+byte-identical. NEXT: plan step 3 j (more than 16 carried values, and
+carried values of other types).
+
 **0.74.0: PLAN STEP 3 g DONE, `Proceed()` WITHOUT A LOOP; AND A FOURTH
 SILENT WRONG RESULT: A QUERY NEVER ASKED TO `Proceed()` WAS TRACED AS IF IT
 HAD SEARCHED** (14450 rays; now no `TraceRay`, nothing committed). The calls

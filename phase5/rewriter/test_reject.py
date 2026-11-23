@@ -529,7 +529,8 @@ def main():
                       ('rayquery_refuse_candafter.ll', 'which code that did not leave the loop also reaches'),
                       ('rayquery_refuse_retraceinloop.ll', 'traced again inside its own Proceed loop'),
                       ('rayquery_refuse_proceednest.ll', 'inside the body of the Proceed() before it'),
-                      ('rayquery_refuse_proceedwrite.ll', 'code between two Proceed() calls writes memory')):
+                      ('rayquery_refuse_proceedwrite.ll', 'code between two Proceed() calls writes memory'),
+                      ('rayquery_refuse_abortbetween.ll', 'Abort() between two Proceed() calls')):
         path = os.path.join('phase5', 'cases', case)
         if not os.path.isfile(path):
             continue
