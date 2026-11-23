@@ -39,9 +39,88 @@ int PayloadBytesFor(bool multi, int carried) {
 // Values the loop body reads from before it and the hit shader cannot rebuild
 // ride after the fixed fields, 4 bytes each. See _plan_carry in lower.py.
 const int kCarryField0 = 11;
-const int kMaxCarry = 16;
+// 2024 since 0.76.0 (16 before): the payload then stays at or under 8192 bytes,
+// the largest the GTX 1070 was measured right at (every 4 bytes from 132 to
+// 1032, and 1500, 2048, 3072, 4096 and 8192, against WARP). See lower.py.
+const int kMaxCarry = 2024;
 // With several queries, field 11 says which one a trace serves.
 const int kQidField = 11;
+
+// Carried in other shapes (0.76.0): see _OTHER_CARRY in lower.py.
+bool CarryType(const std::string& ty) {
+    return ty == "i32" || ty == "float" || ty == "i1" || ty == "half" || ty == "i16" ||
+           ty == "i64" || ty == "double";
+}
+bool OtherCarry(const std::string& ty) {
+    return ty == "half" || ty == "i16" || ty == "i64" || ty == "double";
+}
+int Words(const std::string& ty) { return (ty == "i64" || ty == "double") ? 2 : 1; }
+std::vector<std::string> Slots(const std::string& ty) {
+    if (ty == "float" || ty == "half") return { "float" };
+    if (ty == "i64" || ty == "double") return { "i32", "i32" };
+    return { "i32" };
+}
+int CarryWords(const std::map<std::string, std::pair<std::string, int>>& f) {
+    int n = 0;
+    for (const auto& kv : f) n += Words(kv.second.first);
+    return n;
+}
+const char* kPayloadName = "%struct.Payload";
+std::vector<std::string> CarryStore(const std::string& ty, const std::string& v, int f,
+                                    const std::string& p0, const std::string& basep) {
+    const std::string t = p0 + ".w";
+    if (ty == "half")
+        return { "  " + t + " = fpext half " + v + " to float",
+                 "  store float " + t + ", float* " + p0 + ", align 4" };
+    if (ty == "i16")
+        return { "  " + t + " = zext i16 " + v + " to i32",
+                 "  store i32 " + t + ", i32* " + p0 + ", align 4" };
+    const std::string p1 = p0 + ".h";
+    std::vector<std::string> out{ "  " + p1 + " = getelementptr inbounds " + kPayloadName + ", " +
+                                  kPayloadName + "* " + basep + ", i32 0, i32 " + std::to_string(f + 1) };
+    if (ty == "i64") {
+        out.push_back("  " + t + ".l = trunc i64 " + v + " to i32");
+        out.push_back("  " + t + ".s = lshr i64 " + v + ", 32");
+        out.push_back("  " + t + ".u = trunc i64 " + t + ".s to i32");
+    } else {
+        out.push_back("  " + t + ".d = call %dx.types.splitdouble @dx.op.splitDouble.f64(i32 102, double " +
+                      v + ")  ; SplitDouble(value)");
+        out.push_back("  " + t + ".l = extractvalue %dx.types.splitdouble " + t + ".d, 0");
+        out.push_back("  " + t + ".u = extractvalue %dx.types.splitdouble " + t + ".d, 1");
+    }
+    // DXR_TIER11_CARRY_POISON=1 (0.76.0): the high word of a carried i64 or
+    // double is dropped. The carried-types case must diverge (C++ only).
+    static const bool carryPoison = std::getenv("DXR_TIER11_CARRY_POISON") != nullptr;
+    out.push_back("  store i32 " + t + ".l, i32* " + p0 + ", align 4");
+    out.push_back("  store i32 " + (carryPoison ? std::string("0") : t + ".u") + ", i32* " + p1 + ", align 4");
+    return out;
+}
+std::vector<std::string> CarryLoad(const std::string& ty, const std::string& name, int f,
+                                   const std::string& p0, const std::string& basep) {
+    const std::string t = p0 + ".w";
+    if (ty == "half")
+        return { "  " + t + " = load float, float* " + p0 + ", align 4",
+                 "  " + name + " = fptrunc float " + t + " to half" };
+    if (ty == "i16")
+        return { "  " + t + " = load i32, i32* " + p0 + ", align 4",
+                 "  " + name + " = trunc i32 " + t + " to i16" };
+    const std::string p1 = p0 + ".h";
+    std::vector<std::string> out{
+        "  " + p1 + " = getelementptr inbounds " + kPayloadName + ", " + kPayloadName + "* " + basep +
+            ", i32 0, i32 " + std::to_string(f + 1),
+        "  " + t + ".l = load i32, i32* " + p0 + ", align 4",
+        "  " + t + ".u = load i32, i32* " + p1 + ", align 4" };
+    if (ty == "i64") {
+        out.push_back("  " + t + ".a = zext i32 " + t + ".l to i64");
+        out.push_back("  " + t + ".b = zext i32 " + t + ".u to i64");
+        out.push_back("  " + t + ".c = shl i64 " + t + ".b, 32");
+        out.push_back("  " + name + " = or i64 " + t + ".c, " + t + ".a");
+    } else {
+        out.push_back("  " + name + " = call double @dx.op.makeDouble.f64(i32 101, i32 " + t + ".l, i32 " +
+                      t + ".u)  ; MakeDouble(lo,hi)");
+    }
+    return out;
+}
 
 // The record's own two numbers, and how the generated shaders reach them.
 //
@@ -943,6 +1022,11 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
     std::map<const Query*, LoopState> states;
     // Every value carried by any query, in field order, once all are planned.
     std::vector<Carry> carry;
+    auto CarryWordsOf = [](const std::vector<Carry>& cs) {
+        int n = 0;
+        for (const auto& c : cs) n += Words(c.ty);
+        return n;
+    };
     // Several queries in one entry point, 0.43.0: each its own TraceRay and
     // payload, one any-hit choosing the loop body from the query id. See
     // lower.py. A value two loop bodies read travels in one field.
@@ -1356,20 +1440,20 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     return false;
                 }
                 const std::string ty = ResultType(*di);
-                if (ty != "i32" && ty != "float" && ty != "i1") {
+                if (!CarryType(ty)) {
                     r.error = "Proceed loop body reads " + name + ", of type " +
                               (ty.empty() ? std::string("None") : ty) +
-                              ", from before it; the payload carries i32, float and i1";
+                              ", from before it; the payload carries i32, float, i1, half, i16, i64 and double";
                     return false;
                 }
                 auto fit = carryFields.find(name);
                 if (fit == carryFields.end())
                     fit = carryFields.emplace(name, std::make_pair(
-                        ty, carryBase + (int)carryFields.size())).first;
+                        ty, carryBase + CarryWords(carryFields))).first;
                 qcarry.push_back({name, ty, fit->second.second});
             }
-            if ((int)carryFields.size() > kMaxCarry) {
-                r.error = "the Proceed loops read " + std::to_string(carryFields.size()) +
+            if (CarryWords(carryFields) > kMaxCarry) {
+                r.error = "the Proceed loops read " + std::to_string(CarryWords(carryFields)) +
                           " values defined outside them between them; more than the " +
                           std::to_string(kMaxCarry) + " the payload carries";
                 return false;
@@ -1394,24 +1478,24 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             auto field = [&](const std::string& key, const std::string& ty) {
                 auto it = carryFields.find(key);
                 if (it == carryFields.end())
-                    it = carryFields.emplace(key, std::make_pair(ty, carryBase + (int)carryFields.size())).first;
+                    it = carryFields.emplace(key, std::make_pair(ty, carryBase + CarryWords(carryFields))).first;
                 return it->second.second;
             };
             LoopState& st = states[&x];
             for (const auto& s : escapes) {
                 auto d = defs.find(s);
                 const std::string ty = d == defs.end() ? std::string() : ResultType(*d->second);
-                if (ty != "i32" && ty != "float" && ty != "i1") {
+                if (!CarryType(ty)) {
                     r.error = "Proceed loop state " + s + " is of type " +
                               (ty.empty() ? std::string("None") : ty) +
-                              "; the payload carries i32, float and i1";
+                              "; the payload carries i32, float, i1, half, i16, i64 and double";
                     return false;
                 }
                 st.outs.push_back({s, ty, field(s + ".out", ty)});
             }
             st.pcount = field("%rq.pc" + std::to_string(x.qid) + ".out", "i32");
-            if ((int)carryFields.size() > kMaxCarry) {
-                r.error = "the Proceed loops carry " + std::to_string(carryFields.size()) +
+            if (CarryWords(carryFields) > kMaxCarry) {
+                r.error = "the Proceed loops carry " + std::to_string(CarryWords(carryFields)) +
                           " values between them; more than the " + std::to_string(kMaxCarry) +
                           " the payload carries";
                 return false;
@@ -1453,16 +1537,16 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 auto typed = [&](const std::string& name) -> std::string {
                     auto d = defs.find(name);
                     const std::string ty = d == defs.end() ? std::string() : ResultType(*d->second);
-                    if (ty != "i32" && ty != "float" && ty != "i1")
+                    if (!CarryType(ty))
                         terr = "Proceed loop state " + name + " is of type " +
                                (ty.empty() ? std::string("None") : ty) +
-                               "; the payload carries i32, float and i1";
+                               "; the payload carries i32, float, i1, half, i16, i64 and double";
                     return ty;
                 };
                 auto field = [&](const std::string& key, const std::string& ty) {
                     auto it = carryFields.find(key);
                     if (it == carryFields.end())
-                        it = carryFields.emplace(key, std::make_pair(ty, carryBase + (int)carryFields.size())).first;
+                        it = carryFields.emplace(key, std::make_pair(ty, carryBase + CarryWords(carryFields))).first;
                     return it->second.second;
                 };
                 LoopState& st = states[&x];
@@ -1502,8 +1586,8 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                         st.exits.emplace_back(x.exits[k].first, x.exits[k].second, (int)k + 1);
                 }
                 if (!x.top) st.iter = field("%rq.iter", "i32");
-                if ((int)carryFields.size() > kMaxCarry) {
-                    r.error = "the Proceed loops carry " + std::to_string(carryFields.size()) +
+                if (CarryWords(carryFields) > kMaxCarry) {
+                    r.error = "the Proceed loops carry " + std::to_string(CarryWords(carryFields)) +
                               " values between them; more than the " + std::to_string(kMaxCarry) +
                               " the payload carries";
                     return false;
@@ -1591,9 +1675,9 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         if (x.track) {
             if (!carryFields.count("%rq.oflags"))
                 carryFields.emplace("%rq.oflags", std::make_pair(std::string("i32"),
-                                                                 carryBase + (int)carryFields.size()));
-            if ((int)carryFields.size() > kMaxCarry) {
-                r.error = "the Proceed loops carry " + std::to_string(carryFields.size()) +
+                                                                 carryBase + CarryWords(carryFields)));
+            if (CarryWords(carryFields) > kMaxCarry) {
+                r.error = "the Proceed loops carry " + std::to_string(CarryWords(carryFields)) +
                           " values between them; more than the " + std::to_string(kMaxCarry) +
                           " the payload carries";
                 return false;
@@ -1743,6 +1827,9 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             if (c.ty == "i1") {
                 lines.push_back("  %" + x.pfx + ".plz" + f + " = zext i1 " + c.name + " to i32");
                 lines.push_back("  store i32 %" + x.pfx + ".plz" + f + ", i32* %" + x.pfx + ".plc" + f + ", align 4");
+            } else if (OtherCarry(c.ty)) {
+                for (const auto& l : CarryStore(c.ty, c.name, c.field, "%" + x.pfx + ".plc" + f, "%" + x.pfx + ".pl"))
+                    lines.push_back(l);
             } else {
                 lines.push_back("  store " + c.ty + " " + c.name + ", " + c.ty + "* %" + x.pfx + ".plc" +
                                 f + ", align 4");
@@ -1760,6 +1847,9 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 if (p.ty == "i1") {
                     lines.push_back("  %" + x.pfx + ".plz" + f + " = zext i1 " + p.init + " to i32");
                     lines.push_back("  store i32 %" + x.pfx + ".plz" + f + ", i32* %" + x.pfx + ".plc" + f + ", align 4");
+                } else if (OtherCarry(p.ty)) {
+                    for (const auto& l : CarryStore(p.ty, p.init, p.field, "%" + x.pfx + ".plc" + f, "%" + x.pfx + ".pl"))
+                        lines.push_back(l);
                 } else {
                     lines.push_back("  store " + p.ty + " " + p.init + ", " + p.ty + "* %" + x.pfx + ".plc" + f +
                                     ", align 4");
@@ -1833,16 +1923,23 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             // guard's two ways on, by whether any iteration ran.
             std::vector<StateOut> loads = st->outs;
             loads.insert(loads.end(), st->souts.begin(), st->souts.end());
-            for (const auto& o : loads) {
+            for (size_t li = 0; li < loads.size(); ++li) {
+                const auto& o = loads[li];
+                // A top-tested loop's state field has its GEP from the start
+                // stores already (0.76.0: it was defined twice).
+                const std::string c = li < st->outs.size() ? "plc" : "pls";
                 const std::string f = std::to_string(o.field);
-                lines.push_back("  %" + x.pfx + ".plc" + f + " = getelementptr inbounds " + kPayload + ", " +
+                lines.push_back("  %" + x.pfx + "." + c + f + " = getelementptr inbounds " + kPayload + ", " +
                                 kPayload + "* %" + x.pfx + ".pl, i32 0, i32 " + f);
                 if (o.ty == "i1") {
-                    lines.push_back("  %" + x.pfx + ".plv" + f + " = load i32, i32* %" + x.pfx + ".plc" + f +
+                    lines.push_back("  %" + x.pfx + ".plv" + f + " = load i32, i32* %" + x.pfx + "." + c + f +
                                     ", align 4");
                     lines.push_back("  " + o.name + " = icmp ne i32 %" + x.pfx + ".plv" + f + ", 0");
+                } else if (OtherCarry(o.ty)) {
+                    for (const auto& l : CarryLoad(o.ty, o.name, o.field, "%" + x.pfx + "." + c + f, "%" + x.pfx + ".pl"))
+                        lines.push_back(l);
                 } else {
-                    lines.push_back("  " + o.name + " = load " + o.ty + ", " + o.ty + "* %" + x.pfx + ".plc" +
+                    lines.push_back("  " + o.name + " = load " + o.ty + ", " + o.ty + "* %" + x.pfx + "." + c +
                                     f + ", align 4");
                 }
             }
@@ -2153,9 +2250,13 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         std::string ptype = kPayloadType;
         ptype = ptype.substr(0, ptype.size() - 2);
         if (multi) ptype += ", i32";
-        for (const auto& c : carry) ptype += c.ty == "i1" ? ", i32" : ", " + c.ty;
-        for (int n = kPayloadBytes + 4 * ((multi ? 1 : 0) + (int)carry.size());
-             n < PayloadBytesFor(multi, (int)carry.size()); n += 4)
+        int carryWords = 0;
+        for (const auto& c : carry) {
+            for (const auto& sl : Slots(c.ty)) ptype += ", " + sl;
+            carryWords += Words(c.ty);
+        }
+        for (int n = kPayloadBytes + 4 * ((multi ? 1 : 0) + carryWords);
+             n < PayloadBytesFor(multi, carryWords); n += 4)
             ptype += ", i32";
         ptype += " }";
         decls.push_back(std::string(kPayload) + " = type " + ptype);
@@ -2684,6 +2785,8 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 if (c.ty == "i1") {
                     ah.push_back("  %rq.pav" + f + " = load i32, i32* %rq.pac" + f + ", align 4");
                     ah.push_back("  " + c.name + " = icmp ne i32 %rq.pav" + f + ", 0");
+                } else if (OtherCarry(c.ty)) {
+                    for (const auto& l : CarryLoad(c.ty, c.name, c.field, "%rq.pac" + f, "%p")) ah.push_back(l);
                 } else {
                     ah.push_back("  " + c.name + " = load " + c.ty + ", " + c.ty + "* %rq.pac" +
                                  f + ", align 4");
@@ -3027,6 +3130,8 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                             const std::string z = "%rq.z" + f + "." + qs + "." + bl;
                             ah.push_back("  " + z + " = zext i1 " + v + " to i32");
                             ah.push_back("  store i32 " + z + ", i32* " + ptr + ", align 4");
+                        } else if (OtherCarry(ty)) {
+                            for (const auto& l : CarryStore(ty, v, std::get<0>(s), ptr, "%p")) ah.push_back(l);
                         } else {
                             ah.push_back("  store " + ty + " " + v + ", " + ty + "* " + ptr + ", align 4");
                         }
@@ -3050,6 +3155,8 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                             const std::string z = "%rq.z" + f + "." + qs + ".x" + k;
                             ah.push_back("  " + z + " = zext i1 " + o.name + " to i32");
                             ah.push_back("  store i32 " + z + ", i32* " + ptr + ", align 4");
+                        } else if (OtherCarry(o.ty)) {
+                            for (const auto& l : CarryStore(o.ty, o.name, o.field, ptr, "%p")) ah.push_back(l);
                         } else {
                             ah.push_back("  store " + o.ty + " " + o.name + ", " + o.ty + "* " + ptr + ", align 4");
                         }
@@ -3084,6 +3191,8 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                             const std::string z = "%rq.z" + f + "." + qs + ".e" + bl;
                             ah.push_back("  " + z + " = zext i1 " + o.name + " to i32");
                             ah.push_back("  store i32 " + z + ", i32* " + ptr + ", align 4");
+                        } else if (OtherCarry(o.ty)) {
+                            for (const auto& l : CarryStore(o.ty, o.name, o.field, ptr, "%p")) ah.push_back(l);
                         } else {
                             ah.push_back("  store " + o.ty + " " + o.name + ", " + o.ty + "* " + ptr + ", align 4");
                         }
@@ -3486,7 +3595,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             if (payload) {
                 props.push_back("i32 6");
                 props.push_back("i32 " + std::to_string(
-                    PayloadBytesFor(multi, (int)carry.size())));
+                    PayloadBytesFor(multi, CarryWordsOf(carry))));
             }
             if (attrs) { props.push_back("i32 7"); props.push_back("i32 8"); }
             props.push_back("i32 5");
@@ -3550,6 +3659,53 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
     }
 
     {
+        bool dbl = false;
+        for (const auto& c : carry) dbl = dbl || c.ty == "double";
+        if (dbl) {
+            // A carried double travels as two words (0.76.0): see lower().
+            if (out.find("%dx.types.splitdouble = type") == std::string::npos) {
+                const size_t k = out.find(std::string(kPayload) + " = type ");
+                out.insert(k, "%dx.types.splitdouble = type { i32, i32 }\n");
+            }
+            std::vector<std::string> ls;
+            {
+                size_t a = 0;
+                while (true) {
+                    const size_t b2 = out.find('\n', a);
+                    ls.push_back(out.substr(a, b2 == std::string::npos ? std::string::npos : b2 - a));
+                    if (b2 == std::string::npos) break;
+                    a = b2 + 1;
+                }
+            }
+            bool haveSplit = false, haveMake = false;
+            int lastDecl = -1;
+            for (size_t n = 0; n < ls.size(); ++n) {
+                if (ls[n].rfind("declare %dx.types.splitdouble @dx.op.splitDouble.f64(", 0) == 0) haveSplit = true;
+                if (ls[n].rfind("declare double @dx.op.makeDouble.f64(", 0) == 0) haveMake = true;
+                if (ls[n].rfind("declare ", 0) == 0) lastDecl = (int)n;
+            }
+            std::vector<std::string> add;
+            if (!haveSplit) {
+                add.push_back("");
+                add.push_back("; Function Attrs: nounwind readnone");
+                add.push_back("declare %dx.types.splitdouble @dx.op.splitDouble.f64(i32, double) #RQNONE");
+            }
+            if (!haveMake) {
+                add.push_back("");
+                add.push_back("; Function Attrs: nounwind readnone");
+                add.push_back("declare double @dx.op.makeDouble.f64(i32, i32, i32) #RQNONE");
+            }
+            if (!add.empty()) {
+                ls.insert(ls.begin() + lastDecl + 1, add.begin(), add.end());
+                out.clear();
+                for (size_t n = 0; n < ls.size(); ++n) {
+                    if (n) out += "\n";
+                    out += ls[n];
+                }
+            }
+        }
+    }
+    {
         std::string attrErr;
         out = ResolveAttrs(out, &attrErr);
         if (!attrErr.empty()) { r.error = attrErr; return r; }
@@ -3557,7 +3713,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
 
     r.ok = true;
     r.text = out;
-    r.payloadBytes = PayloadBytesFor(multi, (int)carry.size());
+    r.payloadBytes = PayloadBytesFor(multi, CarryWordsOf(carry));
     r.carried = (int)carry.size();
     return r;
 }

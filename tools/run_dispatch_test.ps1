@@ -455,7 +455,15 @@ $cases = @(
     @{ name = 'abortpost'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_abortpost.hlsl', '--geom'); desc = 'Abort() after the Proceed loop' },
     @{ name = 'abortopaque'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_abortopaque.hlsl'); desc = 'Abort() before the one Proceed() of an opaque query' },
     @{ name = 'abortchain'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_abortchain.hlsl', '--geom'); desc = 'Abort() before a Proceed() without a loop' },
-    @{ name = 'abortchains'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_abortchain.hlsl', '--geom', '--stack'); desc = 'the same, two candidates' }
+    @{ name = 'abortchains'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_abortchain.hlsl', '--geom', '--stack'); desc = 'the same, two candidates' },
+    # Carried values past 16 and of other types (0.76.0, plan step 3 j): the
+    # GTX 1070 measured right to an 8192 byte payload.
+    @{ name = 'carrymany'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_carrymany.hlsl', '--geom', '--stack'); desc = '77 carried values, a 400 byte payload' },
+    @{ name = 'carrytypes'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_carrytypes.hlsl', '--geom'); desc = 'double, i64 and half carried' },
+    @{ name = 'carrytypess'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_carrytypes.hlsl', '--geom', '--stack'); desc = 'the same, two candidates' },
+    @{ name = 'carrytypesm'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_carrytypes.hlsl', '--multi'); desc = 'the same, two instances' },
+    @{ name = 'toploopstate'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_toploopstate.hlsl', '--geom'); desc = 'a top-tested loop whose state leaves it' },
+    @{ name = 'toploopstatem'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_toploopstate.hlsl', '--multi'); desc = 'the same, two instances' }
 )
 
 $failed = 0
@@ -819,7 +827,7 @@ $env:DXR_TIER11 = ''
 # twoexits (the code after the loop that the original skipped) must DIVERGE;
 # with the procedural abort poison, procbreakstack must too.
 Write-Host ''
-Write-Host '=== a break or return out of the loop body, and a query traced again ==='
+Write-Host '=== exits, retraces, Proceed() chains, aborts outside the loop, carried values ==='
 $env:DXR_TIER11 = '1'
 $xg = @(
     @{ n = 'breakstack'; v = 'DXR_TIER11_EXIT_POISON'; x = @('--cs', 'phase5\cases\rayquery_break.hlsl', '--geom', '--stack') },
@@ -836,7 +844,11 @@ $xg = @(
     @{ n = 'proceed2s'; v = 'DXR_TIER11_CHAIN_POISON'; x = @('--cs', 'phase5\cases\rayquery_proceed2.hlsl', '--geom', '--stack') },
     # Abort() before the search (0.75.0): the flag never read.
     @{ n = 'abortpre'; v = 'DXR_TIER11_PREABORT_POISON'; x = @('--cs', 'phase5\cases\rayquery_abortpre.hlsl', '--geom') },
-    @{ n = 'abortopaque'; v = 'DXR_TIER11_PREABORT_POISON'; x = @('--cs', 'phase5\cases\rayquery_abortopaque.hlsl'); p = 'opaque' }
+    @{ n = 'abortopaque'; v = 'DXR_TIER11_PREABORT_POISON'; x = @('--cs', 'phase5\cases\rayquery_abortopaque.hlsl'); p = 'opaque' },
+    # Carried values (0.76.0): the high word of an i64 or double dropped, and
+    # no iteration storing its state.
+    @{ n = 'carrytypes'; v = 'DXR_TIER11_CARRY_POISON'; x = @('--cs', 'phase5\cases\rayquery_carrytypes.hlsl', '--geom') },
+    @{ n = 'carrymany'; v = 'DXR_TIER11_STATE_POISON'; x = @('--cs', 'phase5\cases\rayquery_carrymany.hlsl', '--geom', '--stack') }
 )
 foreach ($g in $xg) {
     $x = $g.x

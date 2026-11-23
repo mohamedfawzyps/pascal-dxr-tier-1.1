@@ -302,6 +302,24 @@ def lower(module, q, exports=None):
     out = _swap_declarations(out, q, globals_, binding)
     out = _append_shaders(out, module, q, exports, table, globals_, binds)
     out = _rewrite_metadata(out, md, table, globals_, q, exports, binding)
+    if any(ty == 'double' for ty, _f in q.carry_fields.values()):
+        # A carried double travels as two words (0.76.0).
+        if '%dx.types.splitdouble = type' not in out:
+            first = '%s = type ' % PAYLOAD
+            k = out.index(first)
+            out = out[:k] + '%dx.types.splitdouble = type { i32, i32 }\n' + out[k:]
+        lines = out.split('\n')
+        add = []
+        if not any(l.startswith('declare %dx.types.splitdouble @dx.op.splitDouble.f64(') for l in lines):
+            add += ['', '; Function Attrs: nounwind readnone',
+                    'declare %dx.types.splitdouble @dx.op.splitDouble.f64(i32, double) #RQNONE']
+        if not any(l.startswith('declare double @dx.op.makeDouble.f64(') for l in lines):
+            add += ['', '; Function Attrs: nounwind readnone',
+                    'declare double @dx.op.makeDouble.f64(i32, i32, i32) #RQNONE']
+        if add:
+            k = max(n for n, l in enumerate(lines) if l.startswith('declare '))
+            lines[k + 1:k + 1] = add
+            out = '\n'.join(lines)
     return _resolve_attrs(out)
 
 
@@ -750,11 +768,11 @@ def _edit_query(module, q, edits, exports, fields, base, multi=False):
         q.carry_fields_ref = fields
         if q.track:
             if '%rq.oflags' not in fields:
-                fields['%rq.oflags'] = ('i32', base + len(fields))
-            if len(fields) > MAX_CARRY:
+                fields['%rq.oflags'] = ('i32', base + _carry_words(fields))
+            if _carry_words(fields) > MAX_CARRY:
                 raise rq.Unsupported(
                     'the Proceed loops carry %d values between them; more than the %d '
-                    'the payload carries' % (len(fields), MAX_CARRY))
+                    'the payload carries' % (_carry_words(fields), MAX_CARRY))
         _check_loop_side_effects(module, fn, q, body)
         if q.state:
             _edit_exit_phis(fn, q, exit_label, latch, edits)
@@ -855,11 +873,11 @@ def _edit_chain(module, q, edits, fields, base, multi):
     q.carry_fields_ref = fields
     if q.track:
         if '%rq.oflags' not in fields:
-            fields['%rq.oflags'] = ('i32', base + len(fields))
-        if len(fields) > MAX_CARRY:
+            fields['%rq.oflags'] = ('i32', base + _carry_words(fields))
+        if _carry_words(fields) > MAX_CARRY:
             raise rq.Unsupported(
                 'the Proceed loops carry %d values between them; more than the %d '
-                'payload carries' % (len(fields), MAX_CARRY))
+                'payload carries' % (_carry_words(fields), MAX_CARRY))
     _check_loop_side_effects(module, fn, q, body)
     st = q.state
     p = q.pfx
@@ -953,7 +971,7 @@ def _plan_chain_state(fn, q, escapes, fields, base):
 
     def field(key, ty):
         if key not in fields:
-            fields[key] = (ty, base + len(fields))
+            fields[key] = (ty, base + _carry_words(fields))
         return fields[key][1]
     st = {'phis': [], 'outs': [], 'souts': [], 'iter': None, 'guard_false': None,
           'exits': [], 'exit': None, 'pcount': None}
@@ -961,13 +979,13 @@ def _plan_chain_state(fn, q, escapes, fields, base):
         ty = _result_type(defs[e][1]) if e in defs else None
         if ty not in _CARRY_TYPES:
             raise rq.Unsupported('Proceed loop state %s is of type %s; the payload carries '
-                                 'i32, float and i1' % (e, ty))
+                                 'i32, float, i1, half, i16, i64 and double' % (e, ty))
         st['outs'].append((e, ty, field(e + '.out', ty)))
     st['pcount'] = field('%%rq.pc%d.out' % q.qid, 'i32')
-    if len(fields) > MAX_CARRY:
+    if _carry_words(fields) > MAX_CARRY:
         raise rq.Unsupported(
             'the Proceed loops carry %d values between them; more than the %d the '
-            'payload carries' % (len(fields), MAX_CARRY))
+            'payload carries' % (_carry_words(fields), MAX_CARRY))
     st['def'] = dict((i.result, b.label) for b, i in fn.instrs() if i.result)
     st['dom'] = fn.dominators()
     st['latch_phis'] = {}
@@ -1037,6 +1055,8 @@ def _trace_block(q, ra, exit_label, multi=False):
             lines.append('  %%%s.plz%d = zext i1 %s to i32' % (q.pfx, field, name))
             lines.append('  store i32 %%%s.plz%d, i32* %%%s.plc%d, align 4'
                          % (q.pfx, field, q.pfx, field))
+        elif ty in _OTHER_CARRY:
+            lines += _carry_store(ty, name, field, '%%%s.plc%d' % (q.pfx, field), '%%%s.pl' % q.pfx)
         else:
             lines.append('  store %s %s, %s* %%%s.plc%d, align 4'
                          % (ty, name, ty, q.pfx, field))
@@ -1051,6 +1071,9 @@ def _trace_block(q, ra, exit_label, multi=False):
                 lines.append('  %%%s.plz%d = zext i1 %s to i32' % (q.pfx, field, init))
                 lines.append('  store i32 %%%s.plz%d, i32* %%%s.plc%d, align 4'
                              % (q.pfx, field, q.pfx, field))
+            elif ty in _OTHER_CARRY:
+                lines += _carry_store(ty, init, field, '%%%s.plc%d' % (q.pfx, field),
+                                      '%%%s.pl' % q.pfx)
             else:
                 lines.append('  store %s %s, %s* %%%s.plc%d, align 4'
                              % (ty, init, ty, q.pfx, field))
@@ -1102,15 +1125,21 @@ def _trace_block(q, ra, exit_label, multi=False):
         # guard's two ways on, by whether any iteration ran. With none, the
         # original took the guard's other edge, so this does too.
         for name, ty, field in st['outs'] + st['souts']:
-            lines.append('  %%%s.plc%d = getelementptr inbounds %s, %s* %%%s.pl, i32 0, i32 %d'
-                         % (q.pfx, field, PAYLOAD, PAYLOAD, q.pfx, field))
+            # A top-tested loop's state field has its GEP from the start
+            # stores already (0.76.0: it was defined twice).
+            c = 'plc' if (name, ty, field) in st['outs'] else 'pls'
+            lines.append('  %%%s.%s%d = getelementptr inbounds %s, %s* %%%s.pl, i32 0, i32 %d'
+                         % (q.pfx, c, field, PAYLOAD, PAYLOAD, q.pfx, field))
             if ty == 'i1':
-                lines.append('  %%%s.plv%d = load i32, i32* %%%s.plc%d, align 4'
-                             % (q.pfx, field, q.pfx, field))
+                lines.append('  %%%s.plv%d = load i32, i32* %%%s.%s%d, align 4'
+                             % (q.pfx, field, q.pfx, c, field))
                 lines.append('  %s = icmp ne i32 %%%s.plv%d, 0' % (name, q.pfx, field))
+            elif ty in _OTHER_CARRY:
+                lines += _carry_load(ty, name, field, '%%%s.%s%d' % (q.pfx, c, field),
+                                     '%%%s.pl' % q.pfx)
             else:
-                lines.append('  %s = load %s, %s* %%%s.plc%d, align 4'
-                             % (name, ty, ty, q.pfx, field))
+                lines.append('  %s = load %s, %s* %%%s.%s%d, align 4'
+                             % (name, ty, ty, q.pfx, c, field))
         if st['exits']:
             # Which way the loop was left (0.72.0): through exit k, the
             # raygen goes on where that edge went.
@@ -1557,13 +1586,13 @@ def _plan_state(fn, q, header, latch, body, escapes, fields, base):
         ty = _result_type(defs[name][1]) if name in defs else None
         if ty not in _CARRY_TYPES:
             raise rq.Unsupported(
-                'Proceed loop state %s is of type %s; the payload carries i32, float '
-                'and i1' % (name, ty))
+                'Proceed loop state %s is of type %s; the payload carries i32, float, '
+                'i1, half, i16, i64 and double' % (name, ty))
         return ty
 
     def field(key, ty):
         if key not in fields:
-            fields[key] = (ty, base + len(fields))
+            fields[key] = (ty, base + _carry_words(fields))
         return fields[key][1]
 
     st = {'phis': [], 'outs': [], 'souts': [], 'iter': None, 'guard_false': None,
@@ -1597,10 +1626,10 @@ def _plan_state(fn, q, header, latch, body, escapes, fields, base):
         st['exits'] = [(b, t, k) for k, (b, t) in enumerate(q.exits, 1)]
     if not q.top:
         st['iter'] = field('%rq.iter', 'i32')
-    if len(fields) > MAX_CARRY:
+    if _carry_words(fields) > MAX_CARRY:
         raise rq.Unsupported(
             'the Proceed loops carry %d values between them; more than the %d the '
-            'payload carries' % (len(fields), MAX_CARRY))
+            'payload carries' % (_carry_words(fields), MAX_CARRY))
     st['def'] = dict((i.result, b.label) for b, i in fn.instrs() if i.result)
     st['dom'] = fn.dominators()
     st['latch_phis'] = {i.result: dict((b, v.strip()) for v, b in i.phi_incoming)
@@ -1667,11 +1696,86 @@ def _edit_exit_phis(fn, q, exit_label, latch, edits):
 # i1; more than MAX_CARRY values; and a loop body that becomes an INTERSECTION
 # shader, which has no payload in DXR 1.0.
 CARRY_FIELD0 = 11
-MAX_CARRY = 16
+# 2024 since 0.76.0, 16 before. DXR sets no limit on a payload (d3d12.h has
+# one for attributes, 32 bytes, none for payloads), so the GTX 1070 was
+# measured: a loop carrying K integer sums against WARP, every 4 bytes from 132
+# to 1032, and 1500, 2048, 3072, 4096 and 8192 bytes, all right. 16384 could not
+# be measured: the compute shader itself overflows the compiler's stack. So the
+# payload stays at or under 8192 bytes: 92 fixed, a query id, 2024 values.
+MAX_CARRY = 2024
 # With several queries, field 11 says which one a trace serves and the carried
 # values start at 12.
 QID_FIELD = 11
-_CARRY_TYPES = ('i32', 'float', 'i1')
+_CARRY_TYPES = ('i32', 'float', 'i1', 'half', 'i16', 'i64', 'double')
+# Carried in other shapes (0.76.0): half in a float field, i16 in an i32,
+# i64 and double in two i32 fields (a double through splitDouble and
+# makeDouble, as DXC does for asuint).
+_OTHER_CARRY = ('half', 'i16', 'i64', 'double')
+
+
+def _words(ty):
+    return 2 if ty in ('i64', 'double') else 1
+
+
+def _slots(ty):
+    return {'float': ['float'], 'half': ['float'],
+            'i64': ['i32', 'i32'], 'double': ['i32', 'i32']}.get(ty, ['i32'])
+
+
+def _carry_words(fields):
+    return sum(_words(ty) for ty, _f in fields.values())
+
+
+def _carry_store(ty, v, f, p0, basep):
+    """Store a carried value of a type the payload holds in another shape;
+    p0 is the GEP of its first field, already emitted (0.76.0)."""
+    t = p0 + '.w'
+    if ty == 'half':
+        return ['  %s = fpext half %s to float' % (t, v),
+                '  store float %s, float* %s, align 4' % (t, p0)]
+    if ty == 'i16':
+        return ['  %s = zext i16 %s to i32' % (t, v),
+                '  store i32 %s, i32* %s, align 4' % (t, p0)]
+    p1 = p0 + '.h'
+    out = ['  %s = getelementptr inbounds %s, %s* %s, i32 0, i32 %d'
+           % (p1, PAYLOAD, PAYLOAD, basep, f + 1)]
+    if ty == 'i64':
+        out += ['  %s.l = trunc i64 %s to i32' % (t, v),
+                '  %s.s = lshr i64 %s, 32' % (t, v),
+                '  %s.u = trunc i64 %s.s to i32' % (t, t)]
+    else:
+        out += ['  %s.d = call %%dx.types.splitdouble @dx.op.splitDouble.f64(i32 102, double %s)'
+                '  ; SplitDouble(value)' % (t, v),
+                '  %s.l = extractvalue %%dx.types.splitdouble %s.d, 0' % (t, t),
+                '  %s.u = extractvalue %%dx.types.splitdouble %s.d, 1' % (t, t)]
+    out += ['  store i32 %s.l, i32* %s, align 4' % (t, p0),
+            '  store i32 %s.u, i32* %s, align 4' % (t, p1)]
+    return out
+
+
+def _carry_load(ty, name, f, p0, basep):
+    """Load what _carry_store stored, under `name` (0.76.0)."""
+    t = p0 + '.w'
+    if ty == 'half':
+        return ['  %s = load float, float* %s, align 4' % (t, p0),
+                '  %s = fptrunc float %s to half' % (name, t)]
+    if ty == 'i16':
+        return ['  %s = load i32, i32* %s, align 4' % (t, p0),
+                '  %s = trunc i32 %s to i16' % (name, t)]
+    p1 = p0 + '.h'
+    out = ['  %s = getelementptr inbounds %s, %s* %s, i32 0, i32 %d'
+           % (p1, PAYLOAD, PAYLOAD, basep, f + 1),
+           '  %s.l = load i32, i32* %s, align 4' % (t, p0),
+           '  %s.u = load i32, i32* %s, align 4' % (t, p1)]
+    if ty == 'i64':
+        out += ['  %s.a = zext i32 %s.l to i64' % (t, t),
+                '  %s.b = zext i32 %s.u to i64' % (t, t),
+                '  %s.c = shl i64 %s.b, 32' % (t, t),
+                '  %s = or i64 %s.c, %s.a' % (name, t, t)]
+    else:
+        out += ['  %s = call double @dx.op.makeDouble.f64(i32 101, i32 %s.l, i32 %s.u)'
+                '  ; MakeDouble(lo,hi)' % (name, t, t)]
+    return out
 _FLAGS = {'nuw', 'nsw', 'exact', 'fast', 'nnan', 'ninf', 'nsz', 'arcp', 'contract',
           'afn', 'reassoc'}
 _RET_SUFFIX = {'i32': 'i32', 'f32': 'float', 'i16': 'i16', 'f16': 'half',
@@ -1755,21 +1859,21 @@ def _plan_carry(fn, q, outside, fields=None, base=CARRY_FIELD0):
         if ty not in _CARRY_TYPES:
             raise rq.Unsupported(
                 'Proceed loop body reads %s, of type %s, from before it; the '
-                'payload carries i32, float and i1' % (name, ty))
+                'payload carries i32, float, i1, half, i16, i64 and double' % (name, ty))
         if name not in fields:
-            fields[name] = (ty, base + len(fields))
+            fields[name] = (ty, base + _carry_words(fields))
         plan.append((name, ty, fields[name][1]))
-    if len(fields) > MAX_CARRY:
+    if _carry_words(fields) > MAX_CARRY:
         raise rq.Unsupported(
             'the Proceed loops read %d values defined outside them between them; '
-            'more than the %d the payload carries' % (len(fields), MAX_CARRY))
+            'more than the %d the payload carries' % (_carry_words(fields), MAX_CARRY))
     return plan
 
 
 def _payload_type(q):
     extra = ', i32' if q.others else ''
     for _, (ty, _f) in sorted(q.carry_fields.items(), key=lambda kv: kv[1][1]):
-        extra += ', i32' if ty == 'i1' else ', ' + ty
+        extra += ''.join(', ' + t for t in _slots(ty))
     extra += ', i32' * _payload_pad(q)
     return PAYLOAD_TYPE[:-2] + extra + ' }'
 
@@ -1787,12 +1891,12 @@ DRIVER_SAFE_PAYLOAD_BYTES = 132
 
 
 def _payload_pad(q):
-    n = PAYLOAD_BYTES + 4 * ((1 if q.others else 0) + len(q.carry_fields))
+    n = PAYLOAD_BYTES + 4 * ((1 if q.others else 0) + _carry_words(q.carry_fields))
     return (DRIVER_SAFE_PAYLOAD_BYTES - n) // 4 if n in DRIVER_BAD_PAYLOAD_BYTES else 0
 
 
 def _payload_bytes(q):
-    n = PAYLOAD_BYTES + 4 * ((1 if q.others else 0) + len(q.carry_fields))
+    n = PAYLOAD_BYTES + 4 * ((1 if q.others else 0) + _carry_words(q.carry_fields))
     return n + 4 * _payload_pad(q)
 
 
@@ -2420,6 +2524,8 @@ def _anyhit(module, q, exports, table, globals_, binds=None):
         if ty == 'i1':
             out.append('  %%rq.pav%d = load i32, i32* %%rq.pac%d, align 4' % (field, field))
             out.append('  %s = icmp ne i32 %%rq.pav%d, 0' % (name, field))
+        elif ty in _OTHER_CARRY:
+            out += _carry_load(ty, name, field, '%%rq.pac%d' % field, '%p')
         else:
             out.append('  %s = load %s, %s* %%rq.pac%d, align 4' % (name, ty, ty, field))
 
@@ -2822,6 +2928,8 @@ def _anyhit_tails(q, out):
                 z = '%%rq.z%d.%d.%s' % (f, q.qid, label[1:])
                 out.append('  %s = zext i1 %s to i32' % (z, v))
                 out.append('  store i32 %s, i32* %s, align 4' % (z, ptr))
+            elif ty in _OTHER_CARRY:
+                out += _carry_store(ty, v, f, ptr, '%p')
             else:
                 out.append('  store %s %s, %s* %s, align 4' % (ty, v, ty, ptr))
         out.append('  br label %s' % target)
@@ -2838,6 +2946,8 @@ def _anyhit_tails(q, out):
                 z = '%%rq.z%d.%d.x%d' % (f, q.qid, k)
                 out.append('  %s = zext i1 %s to i32' % (z, v))
                 out.append('  store i32 %s, i32* %s, align 4' % (z, ptr))
+            elif ty in _OTHER_CARRY:
+                out += _carry_store(ty, v, f, ptr, '%p')
             else:
                 out.append('  store %s %s, %s* %s, align 4' % (ty, v, ty, ptr))
         out.append('  %%rq.xe%d.%d = getelementptr inbounds %s, %s* %%p, i32 0, i32 %d'
@@ -2859,6 +2969,8 @@ def _anyhit_tails(q, out):
                 z = '%%rq.z%d.%d.e%s' % (f, q.qid, label[1:])
                 out.append('  %s = zext i1 %s to i32' % (z, v))
                 out.append('  store i32 %s, i32* %s, align 4' % (z, ptr))
+            elif ty in _OTHER_CARRY:
+                out += _carry_store(ty, v, f, ptr, '%p')
             else:
                 out.append('  store %s %s, %s* %s, align 4' % (ty, v, ty, ptr))
         out.append('  store i32 1, i32* %rq.pab, align 4')

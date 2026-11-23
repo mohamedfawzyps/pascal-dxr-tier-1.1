@@ -24,6 +24,42 @@ not.
 
 ---
 
+## 0.76.0
+
+**Plan step 3 j: more than 16 carried values, and carried values of other
+types.** Values the loop body reads from before it, loop state and values
+leaving the loop travel in the payload; there were at most 16, each an
+`i32`, `float` or `i1`.
+
+- **The cap is measured, not assumed.** DXR sets no limit on a payload
+  (`d3d12.h` has one for attributes, 32 bytes, none for payloads), and the
+  GTX 1070 has refused two sizes before (124 and 128 bytes). So the 1070 was
+  swept against WARP with a loop carrying K integer sums (each a different
+  nonlinear function of the candidate, so DXC cannot merge them; on
+  `--geom --stack`): every 4 bytes from 132 to 1032, and 1500, 2048, 3072,
+  4096 and 8192 bytes, all match. 16384 could not be measured: that compute
+  shader overflows the compiler's own stack, on WARP too. The cap is now 2024
+  values, a payload of at most 8192 bytes.
+- **Other types.** `half` (what DXC makes of `min16float`) travels in a
+  `float` field, `i16` in an `i32`, `i64` in two `i32` fields, and `double`
+  in two through `splitDouble` and `makeDouble`, as DXC does for `asuint`.
+  Fields are now counted in 32-bit words.
+- **Found doing it, fixed:** a loop left top-tested (0.72.0) whose header phi
+  is used after the loop got the GEP of that phi's field defined twice in the
+  raygen, once to start it and once to read it back; the assembler refused
+  the module ("multiple definition of local value"), so such a shader was not
+  lowered. `rayquery_toploopstate.hlsl`; the 0.75.0 rewriter refuses it.
+- **Tests.** `rayquery_carrymany.hlsl` (77 values, a 400 byte payload),
+  `rayquery_carrytypes.hlsl` (a `double`, an `i64` and a `min16float` read
+  from a UAV, a `double` and an `i64` as loop state leaving the loop): refused
+  on 0.75.0, both match WARP on one and two candidates and two instances.
+  `DXR_TIER11_CARRY_POISON=1` (the high word of an `i64` or `double` dropped)
+  diverges in 18496 rays; `DXR_TIER11_STATE_POISON=1` on the many-values case
+  too. Byte-identical in both rewriters on 79 cases; rewriter refusal checks
+  70 of 70; dispatch suite 135 of 135.
+- **Escher unchanged:** all 845 dumped Unreal shader inputs lower
+  byte-identically to 0.75.0.
+
 ## 0.75.0
 
 **Plan step 3 i: `Abort()` outside the Proceed loop.** Refused until now

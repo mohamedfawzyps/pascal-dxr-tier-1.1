@@ -141,7 +141,11 @@ code (`rq_analyze.cpp`, `rq_lower.cpp`) on 2026-09-26, not from memory:
   the search empty (instance mask 0 when the raygen's flag is set), after it
   changes nothing. Left of it on the limits list: an `Abort()` between two
   `Proceed()` calls without a loop.
-- j. More than 16 carried values, and carried values of other types.
+- j. More than 16 carried values, and carried values of other types. DONE
+  0.76.0: the cap is 2024 values (a payload of at most 8192 bytes, the
+  largest the 1070 was measured right at); `half`, `i16`, `i64` and `double`
+  travel in 32-bit fields. Found doing it, fixed: a top-tested loop whose
+  state leaves it was not lowered (a GEP defined twice).
 - k. Several queries where one needs an intersection shader: give each
   query its own hit group offset, so no query id has to travel in a payload.
 - l. A query used inside another query's loop (nested), and a dynamically

@@ -167,7 +167,14 @@ $cases = @(
     @{ name = 'abortopaque'; src = 'phase5\cases\rayquery_abortopaque.ll'; pat = 'opaque'; flags = @();
        norender = $true; desc = 'Abort() before the one Proceed() of an opaque query' },
     @{ name = 'abortchain'; src = 'phase5\cases\rayquery_abortchain.ll'; pat = 'alpha'; flags = @('--geom');
-       norender = $true; desc = 'Abort() before a Proceed() without a loop' }
+       norender = $true; desc = 'Abort() before a Proceed() without a loop' },
+    # Carried values past 16, and of other types (0.76.0).
+    @{ name = 'carrymany'; src = 'phase5\cases\rayquery_carrymany.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = '77 carried values, a 400 byte payload' },
+    @{ name = 'carrytypes'; src = 'phase5\cases\rayquery_carrytypes.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = 'double, i64 and half carried' },
+    @{ name = 'toploopstate'; src = 'phase5\cases\rayquery_toploopstate.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = 'a top-tested loop whose state leaves it' }
 )
 
 if (-not (Test-Path 'phase5\dxil\rayquery_opaque.ll')) {

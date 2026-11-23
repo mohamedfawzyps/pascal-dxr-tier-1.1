@@ -165,6 +165,15 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.76.0: PLAN STEP 3 j DONE, CARRIED VALUES PAST 16 AND OF OTHER TYPES.**
+DXR sets no payload limit, so the 1070 was swept against WARP: every 4 bytes
+from 132 to 1032, and 1500 to 8192 bytes, all right (16384: the compiler's
+own stack overflows). Cap 2024 values, 8192 bytes. `half`, `i16`, `i64`,
+`double` carried in 32-bit fields. Fixed on the way: a top-tested loop whose
+state leaves it was not lowered (a GEP defined twice). Escher 845 of 845
+byte-identical. NEXT: plan step 3 k (several queries where one needs an
+intersection shader).
+
 **0.75.0: PLAN STEP 3 i DONE, `Abort()` OUTSIDE THE LOOP.** Before the
 search it makes the search empty (a raygen flag, the `TraceRay` traced with
 instance mask 0 when set); after it changes nothing; between two chain calls
