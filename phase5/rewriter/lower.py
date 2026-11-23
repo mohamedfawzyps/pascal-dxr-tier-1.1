@@ -1871,10 +1871,6 @@ def _intersection(module, q, exports, table, globals_, binds=None):
         for i in fn.block(label).instrs:
             if i.dxop == rq.CANDIDATE_TYPE:
                 subst[i.result] = '1'          # CANDIDATE_PROCEDURAL_PRIMITIVE
-            elif i.dxop == rq.CANDIDATE_PROC_NON_OPAQUE:
-                # Only non-opaque procedural primitives ever reach a Proceed
-                # loop, so this is a tautology here, as CandidateType is.
-                subst[i.result] = 'true'
             elif i.dxop == rq.CANDIDATE_BARY:
                 # Triangle barycentrics have NO source in an intersection
                 # shader: there is no attributes parameter to read them from.
@@ -1919,7 +1915,29 @@ def _intersection(module, q, exports, table, globals_, binds=None):
             out.append('')
             out.append('%s:' % label[1:])
         for i in blk.instrs:
-            if i.dxop in (rq.CANDIDATE_TYPE, rq.CANDIDATE_PROC_NON_OPAQUE,
+            if i.dxop == rq.CANDIDATE_PROC_NON_OPAQUE:
+                # WRONG until 0.70.0, folded to true on the premise that only
+                # non-opaque procedural primitives reach a Proceed loop. Every
+                # one does: on an opaque box 7396 rays read it non-opaque.
+                # The ray's FORCE_OPAQUE / FORCE_NON_OPAQUE first, else the
+                # record's word 2 (the instance's force flags, else the
+                # geometry's OPAQUE), as traversal decides it. The query is
+                # traced with its own flags, so RayFlags() is the query's.
+                t = 'pn' + i.result[1:]
+                out += _record_read(t, 2, '%%rq.%s.w' % t, q.record_sm66)
+                out += [
+                    '  %%rq.%s.f = call i32 @dx.op.rayFlags.i32(i32 144)  ; RayFlags()' % t,
+                    '  %%rq.%s.fo = and i32 %%rq.%s.f, 1' % (t, t),
+                    '  %%rq.%s.fn = and i32 %%rq.%s.f, 2' % (t, t),
+                    '  %%rq.%s.a = icmp ne i32 %%rq.%s.fo, 0' % (t, t),
+                    '  %%rq.%s.b = icmp ne i32 %%rq.%s.fn, 0' % (t, t),
+                    '  %%rq.%s.c = icmp ne i32 %%rq.%s.w, 0' % (t, t),
+                    '  %%rq.%s.d = select i1 %%rq.%s.b, i1 false, i1 %%rq.%s.c' % (t, t, t),
+                    '  %%rq.%s.op = select i1 %%rq.%s.a, i1 true, i1 %%rq.%s.d' % (t, t, t),
+                    '  %s = xor i1 %%rq.%s.op, true' % (i.result, t),
+                ]
+                continue
+            if i.dxop in (rq.CANDIDATE_TYPE,
                           rq.CANDIDATE_BARY, rq.CANDIDATE_FRONT_FACE):
                 continue
             if i.dxop == rq.COMMIT_NON_OPAQUE:

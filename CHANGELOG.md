@@ -24,6 +24,35 @@ not.
 
 ---
 
+## 0.70.0
+
+**A third silent wrong result in procedural queries, fixed:
+`CandidateProceduralPrimitiveNonOpaque()` was folded to true.** The comment
+said only non-opaque procedural primitives reach a Proceed loop. Every one
+does: RayQuery hands each box to the body, and this accessor is how the body
+tells an opaque one. Measured on an opaque box (raytest's `opaque` pattern):
+7396 rays read it non-opaque.
+
+- **Now computed in the intersection shader, as traversal decides it:** the
+  ray's `FORCE_OPAQUE` / `FORCE_NON_OPAQUE` first, else the record's word 2,
+  which since 0.66.0 holds the instance's force flags, else the geometry's
+  `OPAQUE`, for every geometry kind. A procedural query is traced with its own
+  flags, so `RayFlags()` there is the query's. A procedural body reading the
+  accessor now reads record data (`needs_record_constants`).
+- **Measured, against WARP on the 1070:** `rayquery_proc_opacity.hlsl` on an
+  opaque box, a non-opaque one, and both in the mixed scene: all match, the
+  per-candidate histograms identical; on 0.69.0 the opaque box diverges in
+  7396 rays. Dispatch suite 96 of 96, rewriter suite 57 of 57.
+- **Escher unchanged:** no Unreal shader commits a procedural hit (0.69.0).
+- **Still open, next: exact `Abort()` in a procedural body.** Found reading
+  for it: exactness needs every commit to pass an any-hit that records it in
+  the payload, so the trace is forced non-opaque, as 0.66.0 does for
+  triangles. A procedural hit group then needs its own any-hit (recording
+  procedural commits, ending the search for an abort reported as a hit of a
+  reserved kind), and the intersection shader loses the query's own
+  opacity and cull flags, which it would then take as constants (refused by
+  name when they are computed at run time).
+
 ## 0.69.0
 
 **Two silent wrong results, found starting on exact `Abort()` in a procedural

@@ -369,6 +369,17 @@ std::string RejectFunction(const llm::Function& fn, Query& q) {
             q.track = true;
             q.needsRecordConstants = true;
         }
+        // CandidateProceduralPrimitiveNonOpaque() in the intersection shader
+        // (0.70.0): see _reject_function in rayquery.py.
+        if (!q.procCommits.empty()) {
+            for (const auto& c : q.candidateOps)
+                if (c.second->DxOp() == kCandidateProcNonOpaque &&
+                    q.loop.body.count(c.first->label)) {
+                    q.needsRecordConstants = true;
+                    q.rayFlagsInLoop = true;
+                    break;
+                }
+        }
         // Its intersection shader has no payload to read committed state
         // from (0.69.0).
         if (q.procEffects && q.committedInLoop)

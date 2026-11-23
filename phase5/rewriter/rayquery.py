@@ -644,6 +644,13 @@ def _reject_function(fn, q):
                 and not (q.ray_flags & 1)):
             q.track = True
             q.needs_record_constants = True
+        # CandidateProceduralPrimitiveNonOpaque() in the intersection shader
+        # (0.70.0): computed from the ray's flags and the record's word 2,
+        # the geometry's and instance's opacity, as traversal decides it.
+        if q.proc_commits and any(i.dxop == CANDIDATE_PROC_NON_OPAQUE
+                                  for b, i in q.candidate_ops if b.label in body):
+            q.needs_record_constants = True
+            q.rayflags_in_loop = True
         # Its intersection shader has no payload to read committed state from
         # (0.69.0).
         if q.proc_effects and q.committed_in_loop:

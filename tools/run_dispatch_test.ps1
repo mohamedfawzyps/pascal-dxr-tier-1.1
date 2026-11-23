@@ -399,6 +399,11 @@ $cases = @(
     @{ name = 'proctricand'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_tricand.hlsl', '--mixed', '--contrib'); desc = 'procedural query, body runs for triangle candidates' },
     @{ name = 'procopaquetri'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_proc_status.hlsl', '--mixed', '--contrib'); desc = 'procedural query, an opaque triangle committed' },
     @{ name = 'procstatus'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_status.hlsl', '--mixed', '--contrib'); desc = 'the same, the triangle non-opaque' },
+    # A procedural candidate's opacity, computed (0.70.0): an opaque box, a
+    # non-opaque one, and the opaque box in a mixed scene.
+    @{ name = 'procopaque'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_proc_opacity.hlsl', '--proc'); desc = 'CandidateProceduralPrimitiveNonOpaque on an opaque box' },
+    @{ name = 'procnonopaque'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_opacity.hlsl', '--proc'); desc = 'the same, a non-opaque box' },
+    @{ name = 'procopaquemix'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_proc_opacity.hlsl', '--mixed', '--contrib'); desc = 'the same, an opaque box and triangle' },
     # And a triangle query's body runs for procedural candidates (0.69.0).
     @{ name = 'triproccand'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_tri_proccand.hlsl', '--mixed', '--contrib'); desc = 'triangle query, body runs for procedural candidates' },
     # A 128 byte payload removes the 1070's device when dispatched; the

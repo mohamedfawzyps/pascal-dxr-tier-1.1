@@ -165,6 +165,17 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.70.0: `CandidateProceduralPrimitiveNonOpaque()` WAS FOLDED TO TRUE.** A
+third silent wrong result in procedural queries (7396 rays on an opaque box):
+every box reaches the body, opaque or not. Now computed in the intersection
+shader from the ray's force flags and the record's word 2. NEXT, exact
+`Abort()` in a procedural body, designed in the CHANGELOG entry: forced
+non-opaque trace, a procedural any-hit recording commits and ending the
+search for an abort reported as a reserved hit kind, the query's opacity and
+cull flags as constants in the intersection shader. Probe first: whether
+`ReportHit(RayTCurrent())` is accepted, on the 1070 and WARP. **Every fold
+in the lowering is a claim about the API: check each against the spec.**
+
 **0.69.0: A QUERY WAS LOWERED AS IF THE SCENE HELD ONLY THE KIND IT COMMITS.**
 Two silent wrong results, fixed. RayQuery yields triangles AND boxes to every
 Proceed body and commits opaque triangles itself; the lowering gave the

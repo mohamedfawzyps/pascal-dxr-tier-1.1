@@ -2037,8 +2037,6 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 if (!b) continue;
                 for (const auto& i : b->instrs) {
                     if (i.DxOp() == kCandidateType) subst[i.result] = "1";
-                    else if (i.DxOp() == kCandidateProcNonOpaque)
-                        subst[i.result] = "true";
                     // Triangle barycentrics have NO source in an intersection
                     // shader: there is no attributes parameter to read them
                     // from. HitKind() is not available either. Both appear
@@ -2107,7 +2105,24 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 }
                 for (const auto& i : b->instrs) {
                     const int op = i.DxOp();
-                    if (op == kCandidateType || op == kCandidateProcNonOpaque ||
+                    // CandidateProceduralPrimitiveNonOpaque, computed (0.70.0):
+                    // see _intersection in lower.py.
+                    if (op == kCandidateProcNonOpaque) {
+                        const std::string t = "pn" + i.result.substr(1);
+                        const std::string n = "%rq." + t;
+                        for (const auto& l : RecordRead(t, 2, n + ".w", sm66)) is.push_back(l);
+                        is.push_back("  " + n + ".f = call i32 @dx.op.rayFlags.i32(i32 144)  ; RayFlags()");
+                        is.push_back("  " + n + ".fo = and i32 " + n + ".f, 1");
+                        is.push_back("  " + n + ".fn = and i32 " + n + ".f, 2");
+                        is.push_back("  " + n + ".a = icmp ne i32 " + n + ".fo, 0");
+                        is.push_back("  " + n + ".b = icmp ne i32 " + n + ".fn, 0");
+                        is.push_back("  " + n + ".c = icmp ne i32 " + n + ".w, 0");
+                        is.push_back("  " + n + ".d = select i1 " + n + ".b, i1 false, i1 " + n + ".c");
+                        is.push_back("  " + n + ".op = select i1 " + n + ".a, i1 true, i1 " + n + ".d");
+                        is.push_back("  " + i.result + " = xor i1 " + n + ".op, true");
+                        continue;
+                    }
+                    if (op == kCandidateType ||
                         op == kCandidateBary || op == kCandidateFrontFace) continue;
                     // A TRIANGLE commit, in the arm CandidateType folded away.
                     // Dead, and an intersection shader has nothing to lower it
