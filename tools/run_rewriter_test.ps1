@@ -30,7 +30,7 @@ $cases = @(
     @{ name = 'sm66'; src = 'phase5\cases\rayquery_sm66.ll'; pat = 'alpha'; flags = @();
        gt = @('--cs', 'phase5\cases\rayquery_sm66.hlsl');
        desc = 'Shader Model 6.6 resource binding, in the raygen AND the any-hit' },
-    @{ name = 'proc'; src = 'phase5\cases\rayquery_proc.ll'; pat = 'alpha'; flags = @('--proc');
+    @{ name = 'proc'; src = 'phase5\cases\rayquery_proc.ll'; pat = 'alpha'; flags = @('--proc', '--procch');
        gt = @('--cs', 'phase5\cases\rayquery_proc.hlsl', '--proc');
        desc = 'procedural primitives, generated INTERSECTION shader' },
     # Abort() is exact since 0.67.0: traced forced non-opaque, the any-hit
@@ -105,7 +105,7 @@ $cases = @(
     @{ name = 'committedq2'; src = 'phase5\cases\rayquery_committed_twoq.ll'; pat = 'alpha'; flags = @('--geom');
        norender = $true; desc = 'the same, two queries' },
     # Procedural: CommittedRayT inside the loop is RayTCurrent.
-    @{ name = 'proccmt'; src = 'phase5\cases\rayquery_proc_committed.ll'; pat = 'alpha'; flags = @('--proc');
+    @{ name = 'proccmt'; src = 'phase5\cases\rayquery_proc_committed.ll'; pat = 'alpha'; flags = @('--proc', '--procch');
        gt = @('--cs', 'phase5\cases\rayquery_proc_committed.hlsl', '--proc');
        desc = 'procedural: CommittedRayT inside the loop' },
     # Writes in the loop body and exact Abort() (0.67.0): record words, so
@@ -119,7 +119,7 @@ $cases = @(
     @{ name = 'abortstack'; src = 'phase5\cases\rayquery_abortstack.ll'; pat = 'alpha'; flags = @('--geom');
        norender = $true; desc = 'committed state saved at Abort()' },
     # Writes in a body that becomes an intersection shader (0.68.0).
-    @{ name = 'procwrites'; src = 'phase5\cases\rayquery_proc_writes.ll'; pat = 'alpha'; flags = @('--proc');
+    @{ name = 'procwrites'; src = 'phase5\cases\rayquery_proc_writes.ll'; pat = 'alpha'; flags = @('--proc', '--procch');
        gt = @('--cs', 'phase5\cases\rayquery_proc_writes.hlsl', '--proc');
        desc = 'a store and an atomic in a procedural body' }
 )

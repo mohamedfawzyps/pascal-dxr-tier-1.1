@@ -512,6 +512,21 @@ def main():
         ok.append(expect_lower_ok(name, t) if why is None else expect_lower_reject(name, t, why))
         ok.append(cpp_agrees(name, t, why))
 
+    # A procedural query is lowered with both kinds' shaders (0.69.0). What a
+    # TRIANGLE candidate reaches in its body must be lowerable in the any-hit:
+    # no committed state (the payload cannot hold procedural commits) and no
+    # Abort() (not exact there yet). The reachability folds CandidateType().
+    for case, why in (('rayquery_refuse_tricmt.ll', 'committed state is read for a triangle'),
+                      ('rayquery_refuse_triabort.ll', 'reached by a triangle candidate'),
+                      ('rayquery_refuse_procfx.ll', 'also writes for procedural candidates')):
+        path = os.path.join('phase5', 'cases', case)
+        if not os.path.isfile(path):
+            continue
+        t = load(path)
+        name = case[len('rayquery_refuse_'):-3]
+        ok.append(expect_lower_reject(name, t, why))
+        ok.append(cpp_agrees(name, t, why))
+
     # NVAPI shader extension calls (0.41.1). What 0.41.0 took for an append is
     # NVIDIA's encoding of an intrinsic: stores to a RWStructuredBuffer of
     # NvShaderExtnStruct, which the driver reads as a RayQuery cluster-ID call

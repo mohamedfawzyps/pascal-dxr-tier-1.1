@@ -139,6 +139,9 @@ struct Query {
     // any-hit keeps it in the payload; see rayquery.py.
     bool committedInLoop = false;
     bool track = false;
+    // A triangle query whose body writes where a procedural candidate
+    // reaches it (0.69.0): see _mark_procedural_effects in rayquery.py.
+    bool procEffects = false;
 
     int patternNum = 0;
     std::string patternDesc;
@@ -180,7 +183,11 @@ struct Query {
     // them, and two closest-hits as well, because one writes committed status
     // 1 and the other 2. Which record a geometry resolves to is the scene's
     // business, handled by the typed shader table.
-    bool NeedsBoth() const { return !commits.empty() && !procCommits.empty(); }
+    // Since 0.69.0 every procedural query: RayQuery treats triangles too (a
+    // non-opaque one is yielded to the body, an opaque one committed), so it
+    // gets the triangle any-hit and closest-hit. See needs_both in
+    // rayquery.py.
+    bool NeedsBoth() const { return !procCommits.empty() || procEffects; }
 };
 
 struct AnalyzeResult {

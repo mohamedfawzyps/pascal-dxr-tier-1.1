@@ -288,6 +288,7 @@ static bool g_mixed = false;
 // hit table needs a record for each. Record 0 is triangles and record 1 is
 // procedural, which is what --mixed --contrib builds.
 static bool g_both = false;
+static bool g_procCH = false;   // --procch: see the hit group setup
 
 static bool g_table = false;
 // --indirect: the RayQuery compute shader is dispatched through ExecuteIndirect
@@ -1912,6 +1913,10 @@ static void RunTraceRay(Gpu& g, Dxc& dxc, const Scene& s,
         // any-hit one, and is a different hit group TYPE.
         hg.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
         hg.IntersectionShaderImport = L"Isect";
+        // --procch (0.69.0): since 0.69.0 the rewriter lowers every procedural
+        // query with both kinds' shaders, and its procedural closest-hit is
+        // ClosestHitProc; ClosestHit is the triangle one.
+        if (g_procCH) hg.ClosestHitShaderImport = L"ClosestHitProc";
     } else if (anyHit) {
         hg.AnyHitShaderImport = L"AnyHit";
     }
@@ -2237,6 +2242,12 @@ int main(int argc, char** argv) {
             }
             if (std::strcmp(argv[i], "--both") == 0) {
                 g_both = true;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--procch") == 0) {
+                g_procCH = true;
+                for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+                --argc; --i;
                 continue;
             }
             if (std::strcmp(argv[i], "--mixed") == 0) {

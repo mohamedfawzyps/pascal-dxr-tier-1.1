@@ -1256,7 +1256,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 if (k) names += ", ";
                 names += outside[k];
             }
-            if (x.NeedsIntersection()) {
+            if (x.NeedsBoth()) {
                 r.error = "Proceed loop body reads values defined outside it (" + names +
                           ") and becomes an intersection shader, which has no payload "
                           "to carry them in";
@@ -1325,7 +1325,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 for (const auto& i : hdr->instrs)
                     if (i.isPhi) phis.push_back(&i);
             if (!phis.empty() || !escapes.empty()) {
-                if (x.NeedsIntersection()) {
+                if (x.NeedsBoth()) {
                     std::string names;
                     for (const auto* p : phis) names += (names.empty() ? "" : ", ") + p->result;
                     for (const auto& s : escapes) names += (names.empty() ? "" : ", ") + s;
@@ -1519,7 +1519,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             // geometry). See _check_loop_side_effects in lower.py. Refused:
             // a write beside an Abort(), which an intersection shader cannot
             // act on.
-            if (!writes.empty() && x.NeedsIntersection() && !x.aborts.empty()) {
+            if (!writes.empty() && x.NeedsBoth() && !x.aborts.empty()) {
                 r.error = "Proceed loop body writes (" + writes[0]->callee +
                           ") and calls Abort() and becomes an intersection shader, which "
                           "cannot stop traversal, so the write would happen for procedural "
@@ -2018,7 +2018,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         // intersection shader, folded to CANDIDATE_NON_OPAQUE_TRIANGLE the
         // procedural arm dies and it is an any-hit. Each keeps the other's
         // dead arm as valid but unreachable IR.
-        if (q.NeedsIntersection()) {
+        if (q.NeedsBoth()) {
             // The Proceed loop body re-rooted as an INTERSECTION shader. Same
             // body as the any-hit case, with one substitution changed: an
             // any-hit folds CandidateType to CANDIDATE_NON_OPAQUE_TRIANGLE (0)
@@ -2399,7 +2399,8 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                                          std::to_string(kHitKindFront));
                             continue;
                         }
-                        if (x.track && PayloadField(op)) {
+                        // A procedural query's are dead here (0.69.0).
+                        if ((x.track || x.NeedsBoth()) && PayloadField(op)) {
                             for (const auto& l : CommittedRead(i)) ah.push_back(l);
                             continue;
                         }

@@ -1209,7 +1209,7 @@ def _check_loop_side_effects(module, fn, q, body):
     # types". The proxy sets it on AABB geometry as on triangles. What stays
     # refused is a write beside an Abort(): an intersection shader cannot
     # stop traversal, so it would write for AABBs RayQuery never yields.
-    if writes and q.needs_intersection and q.aborts:
+    if writes and q.needs_both and q.aborts:
         raise rq.Unsupported(
             'Proceed loop body writes (%s) and calls Abort() and becomes an '
             'intersection shader, which cannot stop traversal, so the write '
@@ -1284,7 +1284,7 @@ def _plan_state(fn, q, header, latch, body, escapes, fields, base):
     phis = [i for i in hdr.instrs if i.is_phi]
     if not phis and not escapes:
         return None
-    if q.needs_intersection:
+    if q.needs_both:
         raise rq.Unsupported(
             'Proceed loop carries state across candidates or out of the loop (%s) '
             'and becomes an intersection shader, which has no payload to carry it in'
@@ -1430,7 +1430,7 @@ def _plan_carry(fn, q, outside, fields=None, base=CARRY_FIELD0):
     if not outside:
         return []
     names = ', '.join(outside)
-    if q.needs_intersection:
+    if q.needs_both:
         raise rq.Unsupported(
             'Proceed loop body reads values defined outside it (%s) and becomes '
             'an intersection shader, which has no payload to carry them in' % names)
@@ -2275,7 +2275,9 @@ def _anyhit_body(fn, q, order, header, latch, body, commit_blocks, subst, multi,
                            '  ; HitKind()' % hk)
                 out.append('  %s = icmp eq i32 %s, %d' % (i.result, hk, HIT_KIND_FRONT))
                 continue
-            if q.track and i.dxop in PAYLOAD_FIELD:
+            # A procedural query's committed reads here are ones no triangle
+            # candidate reaches (refused otherwise, 0.69.0): dead, but valid.
+            if (q.track or q.needs_both) and i.dxop in PAYLOAD_FIELD:
                 out += _committed_read(i)
                 continue
             if q.track and i.dxop == rq.RAY_FLAGS:

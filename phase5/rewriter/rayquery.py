@@ -214,6 +214,9 @@ class Query(object):
         # the any-hit keeps it in the payload as it changes; see lower.py.
         self.committed_in_loop = False
         self.track = False
+        # A triangle query whose body WRITES where a procedural candidate
+        # reaches it (0.69.0): see _mark_procedural_effects.
+        self.proc_effects = False
         # Several queries in one entry point, 0.43.0: the first is returned and
         # carries the rest here. Each names its raygen values with its own
         # prefix, so two traces never define the same %name; the first keeps
@@ -280,7 +283,18 @@ class Query(object):
 
     @property
     def needs_both(self):
-        """Commits of BOTH kinds, so the loop body becomes TWO shaders.
+        """A procedural query: the loop body becomes TWO shaders, 0.69.0.
+
+        Until 0.69.0 this meant commits of BOTH kinds. A query committing only
+        procedural hits got an empty triangle hit group, but RayQuery treats
+        triangles too: Proceed() yields a non-opaque one to the body (whose
+        writes and Abort() then apply to it) and commits an opaque one
+        itself. Both were lost, measured: a body counting every candidate
+        missed 14450 triangle candidates, and an opaque triangle came back as
+        nothing committed. So every procedural query gets the triangle
+        any-hit made from its body and the triangle closest-hit as well.
+
+        Commits of BOTH kinds, so the loop body becomes TWO shaders.
 
         A hit group is either triangles or procedural, never both, so this
         needs two of them, and two closest-hits as well, because one writes
@@ -290,7 +304,7 @@ class Query(object):
         handled by the typed shader table, and is refused only when the
         application routed both kinds to the SAME record.
         """
-        return bool(self.commits) and bool(self.proc_commits)
+        return bool(self.proc_commits) or self.proc_effects
 
     def pattern(self):
         if self.needs_both:
@@ -309,6 +323,98 @@ class Query(object):
         raise Unsupported(
             'query has no Proceed loop but is not FORCE_OPAQUE '
             '(flags %s); no lowering is defined for this' % flag_names(self.ray_flags))
+
+
+_ICMP_CONST = re.compile(r'^icmp (eq|ne) i32 (\S+), (\S+?)\s*$')
+
+
+def attr_groups(module):
+    """callee name -> the attribute group TEXT its declaration carries: a
+    bare `nounwind` writes memory, `readnone` and `readonly` do not. The same
+    reader as _attr_groups in lower.py."""
+    attrs = {}
+    for line in module.lines:
+        m = re.match(r'^attributes\s+#(\d+)\s*=\s*\{(.*)\}\s*$', line)
+        if m:
+            attrs[m.group(1)] = m.group(2)
+    out = {}
+    for line in module.lines:
+        m = re.match(r'^declare\s+.*@([\w.$]+)\s*\(.*\)\s*#(\d+)\s*$', line)
+        if m:
+            out[m.group(1)] = attrs.get(m.group(2), '')
+    return out
+
+
+def _mark_procedural_effects(module, fn, q):
+    """A triangle query whose body WRITES where a procedural candidate
+    reaches it gets an intersection shader made from its body too (0.69.0).
+    RayQuery yields procedural candidates to every body; the empty
+    intersection shader such a query had made those writes vanish: a body
+    counting every candidate missed 7396 procedural ones, measured."""
+    if not q.loop or q.proc_commits:
+        return
+    groups = attr_groups(module)
+    for label in sorted(reach_as(fn, q, 1)):
+        for i in fn.block(label).instrs:
+            if not i.callee or not i.callee.startswith('dx.op.'):
+                continue
+            if (i.callee.startswith('dx.op.rayQuery_')
+                    or i.callee == 'dx.op.allocateRayQuery'):
+                continue
+            attr = groups.get(i.callee)
+            if attr is not None and ('readnone' in attr or 'readonly' in attr):
+                continue
+            q.proc_effects = True
+            return
+
+
+def reach_as_triangle(fn, q):
+    """The loop-body blocks a TRIANGLE candidate can reach (0.69.0)."""
+    return reach_as(fn, q, 0)
+
+
+def reach_as(fn, q, kind):
+    """The loop-body blocks a candidate of `kind` can reach (0.69.0): 0 a
+    non-opaque triangle, 1 a procedural primitive.
+
+    CandidateType() folds to `kind` in the shader made for that kind, so an
+    `icmp eq|ne` of it against a constant is known, and a branch on one has a
+    dead edge. Followed from the loop header; anything this cannot decide
+    counts as reachable."""
+    header, _, body = q.loop
+    types = set()
+    for label in body:
+        for i in fn.block(label).instrs:
+            if i.dxop == CANDIDATE_TYPE and i.result:
+                types.add(i.result)
+    known = {}
+    for label in body:
+        for i in fn.block(label).instrs:
+            m = _ICMP_CONST.match(i.body) if i.result else None
+            if not m:
+                continue
+            a, b = m.group(2), m.group(3)
+            if a in types and re.match(r'^-?\d+$', b):
+                k = int(b)
+            elif b in types and re.match(r'^-?\d+$', a):
+                k = int(a)
+            else:
+                continue
+            known[i.result] = (k == kind) == (m.group(1) == 'eq')
+    seen, todo = set(), [header]
+    while todo:
+        label = todo.pop()
+        if label in seen or label not in body:
+            continue
+        seen.add(label)
+        blk = fn.block(label)
+        term = blk.terminator
+        m = re.match(r'^br i1 (\S+), label (\S+), label (\S+)$', term.body) if term else None
+        if m and m.group(1) in known:
+            todo.append(m.group(2) if known[m.group(1)] else m.group(3))
+        else:
+            todo.extend(blk.successors())
+    return seen
 
 
 def _imm(arg):
@@ -339,6 +445,7 @@ def analyze(module, fn_name=None):
             q.pfx, q.qid = 'rq.q%d' % k, k
         _collect(fn, q, [h for h in handles if h != q.handle])
         _find_loop(fn, q)
+        _mark_procedural_effects(module, fn, q)
         queries.append(q)
     # Before the per-query checks, so a query nested in another's loop is
     # refused for THAT, not for whatever it happens to read there.
@@ -365,7 +472,7 @@ def _check_queries(fn, queries):
     ALLOCATIONS and called them concurrent; what actually matters is below."""
     names = ', '.join(q.handle for q in queries)
     for q in queries:
-        if q.needs_intersection:
+        if q.needs_both:
             raise Unsupported(
                 '%d RayQuery objects in %s (%s), and query %s becomes an '
                 'intersection shader, which cannot read the payload field that '
@@ -537,8 +644,29 @@ def _reject_function(fn, q):
                 and not (q.ray_flags & 1)):
             q.track = True
             q.needs_record_constants = True
-        if q.committed_in_loop and q.needs_both:
+        # Its intersection shader has no payload to read committed state from
+        # (0.69.0).
+        if q.proc_effects and q.committed_in_loop:
             raise Unsupported(
-                'committed state is read inside a Proceed loop that commits both '
-                'kinds; a procedural commit is made in an intersection shader, '
-                'which cannot record it in the payload')
+                'committed state is read inside a Proceed loop whose body also writes '
+                'for procedural candidates; the intersection shader that serves them '
+                'has no payload to read it from')
+        # A procedural query's triangle any-hit (0.69.0) sees only what a
+        # TRIANGLE candidate reaches: committed state read there would need
+        # the payload to hold procedural commits too, which an intersection
+        # shader cannot write; and an Abort() there is not exact yet.
+        if q.needs_both:
+            tri = reach_as_triangle(fn, q)
+            for label in sorted(tri):
+                for instr in fn.block(label).instrs:
+                    if instr.dxop in COMMITTED_OPS:
+                        raise Unsupported(
+                            'committed state is read for a triangle candidate in a '
+                            'Proceed loop that commits procedural hits; those are made '
+                            'in an intersection shader, which cannot record them in '
+                            'the payload')
+                    if instr.dxop == ABORT:
+                        raise Unsupported(
+                            'Abort() is reached by a triangle candidate in a Proceed '
+                            'loop that commits procedural hits, which this lowering '
+                            'cannot stop exactly yet')

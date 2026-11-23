@@ -394,6 +394,13 @@ $cases = @(
     @{ name = 'procwrites'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_writes.hlsl', '--proc'); desc = 'a store and an atomic in a procedural body' },
     @{ name = 'procwrites2'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_writes.hlsl', '--proc', '--stack'); desc = 'the same, two boxes per ray' },
     @{ name = 'procwritesmix'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_writes.hlsl', '--mixed', '--contrib'); desc = 'the same, a mixed scene' },
+    # A procedural query treats triangles too (0.69.0): its body runs for a
+    # non-opaque triangle candidate, and an opaque one is committed.
+    @{ name = 'proctricand'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_tricand.hlsl', '--mixed', '--contrib'); desc = 'procedural query, body runs for triangle candidates' },
+    @{ name = 'procopaquetri'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_proc_status.hlsl', '--mixed', '--contrib'); desc = 'procedural query, an opaque triangle committed' },
+    @{ name = 'procstatus'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_status.hlsl', '--mixed', '--contrib'); desc = 'the same, the triangle non-opaque' },
+    # And a triangle query's body runs for procedural candidates (0.69.0).
+    @{ name = 'triproccand'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_tri_proccand.hlsl', '--mixed', '--contrib'); desc = 'triangle query, body runs for procedural candidates' },
     # A 128 byte payload removes the 1070's device when dispatched; the
     # lowering pads it to 132 (0.67.0).
     @{ name = 'carry128'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_carry128.hlsl', '--geom', '--opaquemix'); desc = 'a payload that would be 128 bytes' },

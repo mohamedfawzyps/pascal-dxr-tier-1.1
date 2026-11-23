@@ -242,6 +242,87 @@ std::string FindLoop(const llm::Function& fn, Query& q) {
     return "";
 }
 
+// The loop-body blocks a TRIANGLE candidate can reach (0.69.0): see
+// reach_as_triangle in rayquery.py, which this mirrors.
+std::set<std::string> ReachAs(const llm::Function& fn, const Query& q, int kind) {
+    static const std::regex kIcmp(R"(^icmp (eq|ne) i32 (\S+), (\S+?)\s*$)");
+    static const std::regex kInt(R"(^-?\d+$)");
+    static const std::regex kBr(R"(^br i1 (\S+), label (\S+), label (\S+)$)");
+    std::set<std::string> types;
+    for (const auto& label : q.loop.body) {
+        const llm::Block* b = fn.FindBlock(label);
+        if (!b) continue;
+        for (const auto& i : b->instrs)
+            if (i.DxOp() == kCandidateType && !i.result.empty()) types.insert(i.result);
+    }
+    std::map<std::string, bool> known;
+    for (const auto& label : q.loop.body) {
+        const llm::Block* b = fn.FindBlock(label);
+        if (!b) continue;
+        for (const auto& i : b->instrs) {
+            std::smatch m;
+            if (i.result.empty() || !std::regex_match(i.body, m, kIcmp)) continue;
+            const std::string a = m[2].str(), c = m[3].str();
+            long long k;
+            if (types.count(a) && std::regex_match(c, kInt)) k = std::stoll(c);
+            else if (types.count(c) && std::regex_match(a, kInt)) k = std::stoll(a);
+            else continue;
+            known[i.result] = (k == kind) == (m[1].str() == "eq");
+        }
+    }
+    std::set<std::string> seen;
+    std::vector<std::string> todo{ q.loop.header };
+    while (!todo.empty()) {
+        const std::string label = todo.back();
+        todo.pop_back();
+        if (seen.count(label) || !q.loop.body.count(label)) continue;
+        seen.insert(label);
+        const llm::Block* b = fn.FindBlock(label);
+        if (!b) continue;
+        const llm::Instr* term = b->Terminator();
+        std::smatch m;
+        if (term && std::regex_match(term->body, m, kBr) && known.count(m[1].str())) {
+            todo.push_back(known[m[1].str()] ? m[2].str() : m[3].str());
+        } else {
+            for (const auto& s : b->Successors()) todo.push_back(s);
+        }
+    }
+    return seen;
+}
+
+// A triangle query whose body writes where a procedural candidate reaches it
+// (0.69.0): see _mark_procedural_effects in rayquery.py.
+void MarkProceduralEffects(const llm::Module& m, const llm::Function& fn, Query& q) {
+    if (!q.hasLoop || !q.procCommits.empty()) return;
+    static const std::regex kAttrLine(R"(^attributes\s+#(\d+)\s*=\s*\{(.*)\}\s*$)");
+    static const std::regex kDeclLine(R"(^declare\s+.*@([\w.$]+)\s*\(.*\)\s*#(\d+)\s*$)");
+    std::map<std::string, std::string> byNum, groups;
+    std::smatch mm;
+    for (const auto& line : m.lines)
+        if (std::regex_match(line, mm, kAttrLine)) byNum[mm[1].str()] = mm[2].str();
+    for (const auto& line : m.lines)
+        if (std::regex_match(line, mm, kDeclLine)) {
+            auto it = byNum.find(mm[2].str());
+            groups[mm[1].str()] = it == byNum.end() ? "" : it->second;
+        }
+    for (const auto& label : ReachAs(fn, q, 1)) {
+        const llm::Block* b = fn.FindBlock(label);
+        if (!b) continue;
+        for (const auto& i : b->instrs) {
+            if (i.callee.compare(0, 6, "dx.op.") != 0) continue;
+            if (i.callee.compare(0, 15, "dx.op.rayQuery_") == 0 ||
+                i.callee == "dx.op.allocateRayQuery")
+                continue;
+            auto g = groups.find(i.callee);
+            if (g != groups.end() && (g->second.find("readnone") != std::string::npos ||
+                                      g->second.find("readonly") != std::string::npos))
+                continue;
+            q.procEffects = true;
+            return;
+        }
+    }
+}
+
 std::string RejectFunction(const llm::Function& fn, Query& q) {
     for (const auto& b : fn.blocks) {
         for (const auto& i : b.instrs) {
@@ -288,10 +369,32 @@ std::string RejectFunction(const llm::Function& fn, Query& q) {
             q.track = true;
             q.needsRecordConstants = true;
         }
-        if (q.committedInLoop && !q.commits.empty() && !q.procCommits.empty())
-            return "committed state is read inside a Proceed loop that commits both kinds; "
-                   "a procedural commit is made in an intersection shader, which cannot "
-                   "record it in the payload";
+        // Its intersection shader has no payload to read committed state
+        // from (0.69.0).
+        if (q.procEffects && q.committedInLoop)
+            return "committed state is read inside a Proceed loop whose body also writes "
+                   "for procedural candidates; the intersection shader that serves them "
+                   "has no payload to read it from";
+        // A procedural query's triangle any-hit sees only what a TRIANGLE
+        // candidate reaches (0.69.0): see _reject_function in rayquery.py.
+        if (q.NeedsBoth()) {
+            const std::set<std::string> tri = ReachAs(fn, q, 0);
+            for (const auto& label : tri) {
+                const llm::Block* blk = fn.FindBlock(label);
+                if (!blk) continue;
+                for (const auto& i : blk->instrs) {
+                    if (IsCommittedOp(i.DxOp()))
+                        return "committed state is read for a triangle candidate in a "
+                               "Proceed loop that commits procedural hits; those are made "
+                               "in an intersection shader, which cannot record them in "
+                               "the payload";
+                    if (i.DxOp() == kAbort)
+                        return "Abort() is reached by a triangle candidate in a Proceed "
+                               "loop that commits procedural hits, which this lowering "
+                               "cannot stop exactly yet";
+                }
+            }
+        }
     }
     return "";
 }
@@ -305,7 +408,7 @@ std::string CheckQueries(const llm::Function& fn, const std::vector<Query>& qs) 
         names += qs[k].handle;
     }
     for (const auto& q : qs) {
-        if (q.NeedsIntersection())
+        if (q.NeedsBoth())
             return std::to_string(qs.size()) + " RayQuery objects in " + fn.name + " (" +
                    names + "), and query " + q.handle + " becomes an intersection "
                    "shader, which cannot read the payload field that says which query "
@@ -389,6 +492,7 @@ AnalyzeResult Analyze(const llm::Module& m) {
         if (!err.empty()) { r.error = err; return r; }
         err = FindLoop(fn, q);
         if (!err.empty()) { r.error = err; return r; }
+        MarkProceduralEffects(m, fn, q);
         qs.push_back(q);
     }
     // Before the per-query checks, so a query nested in another's loop is

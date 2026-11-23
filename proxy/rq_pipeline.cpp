@@ -699,8 +699,10 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
     self->m_rootSig = desc->pRootSignature;
     if (self->m_rootSig) self->m_rootSig->AddRef();
     for (int i = 0; i < 3; ++i) self->m_threads[i] = static_cast<UINT>(x.threads[i]);
-    // A both-kinds shader serves both; otherwise exactly one.
-    self->m_servesProc = x.hasIntersection;
+    // A both-kinds shader serves both; otherwise exactly one. Since 0.69.0
+    // that includes a triangle query whose body writes for procedural
+    // candidates: needsBoth without procedural commits.
+    self->m_servesProc = x.hasIntersection || x.needsBoth;
     self->m_servesTri = x.needsBoth || !x.hasIntersection;
     self->m_hasAnyHit = x.hasAnyHit;
     self->m_hasIntersection = x.hasIntersection;

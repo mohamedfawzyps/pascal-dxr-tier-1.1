@@ -24,6 +24,50 @@ not.
 
 ---
 
+## 0.69.0
+
+**Two silent wrong results, found starting on exact `Abort()` in a procedural
+body, and fixed: a query was lowered as if the scene held only the kind of
+geometry it commits.** RayQuery yields every candidate to the Proceed loop,
+triangles and boxes alike, whatever the body commits, and commits an opaque
+triangle itself. The lowering gave the other kind an empty hit group.
+
+- **A procedural query lost its triangles.** Its triangle records ran
+  `AnyHitNull`, with no closest-hit. Measured on `--mixed --contrib`, against
+  WARP: a body counting every candidate missed 14450 triangle candidates
+  (`rayquery_proc_tricand.hlsl`), and with the triangle opaque, the committed
+  status and t came back wrong in 14450 rays (`rayquery_proc_status.hlsl`,
+  raytest's `opaque` pattern), because the commit traversal made was never
+  recorded. That one predates 0.68.0; the first became reachable with it.
+  Now every procedural query is lowered with both kinds' shaders: the triangle
+  any-hit made from the same body, and the triangle closest-hit.
+- **A triangle query lost its boxes**, the mirror case. A body counting every
+  candidate missed 7396 procedural ones (`rayquery_tri_proccand.hlsl`). Now a
+  triangle query whose body WRITES where a procedural candidate can reach it
+  gets the intersection shader made from its body too. The shader table
+  serves both kinds for it (`m_servesProc`).
+- **Where a candidate can reach is decided, not assumed:** CandidateType()
+  folds to the shader's kind, so an `icmp` of it against a constant is known
+  and a branch on one has a dead edge (`reach_as` in `rayquery.py`, `ReachAs`
+  in `rq_analyze.cpp`). Only what a candidate of the other kind reaches has
+  to be lowerable in the other shader.
+- **Refused by name, all new, none reached by Escher:** committed state read
+  where a triangle candidate reaches it in a procedural query (the payload
+  cannot hold procedural commits); `Abort()` reached by a triangle candidate
+  in a procedural query (not exact there yet); committed state read in a
+  triangle query whose body writes for procedural candidates.
+- **Escher unchanged, measured:** all 781 dumped Unreal shader inputs lower
+  as before, pattern 3, none both-kinds, none refused. No Unreal shader
+  commits a procedural hit, and none writes, aborts or reads committed state
+  where a procedural candidate reaches it.
+- **Measured, against WARP on the 1070:** the three cases above match;
+  on 0.68.0 they diverge in 14450, 14450 and 7396 rays. `raytest --procch`
+  (new) gives the harness's procedural hit group `ClosestHitProc`, as a
+  both-kinds library exports it. Dispatch suite 93 of 93, rewriter suite 57
+  of 57 with the three refusals provoked, Python and C++ byte-identical.
+- **Still open, next:** exact `Abort()` in a procedural body (0.68.0), and
+  `Abort()` reached by a candidate of the kind the query does not commit.
+
 ## 0.68.0
 
 **Plan step 3 (spec item 3), gap h, the procedural half: writes in a Proceed

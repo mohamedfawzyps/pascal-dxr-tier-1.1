@@ -108,6 +108,11 @@ code (`rq_analyze.cpp`, `rq_lower.cpp`) on 2026-09-26, not from memory:
   procedural body, where traversal continues (legal where a commit uses the
   committed t only as "nearer than it", not in general:
   `rayquery_proc_abort.hlsl`), and a write beside it, refused by name.
+  Found starting it, fixed in 0.69.0: a query was lowered as if the scene
+  held only the kind of geometry it commits (procedural queries lost
+  triangle candidates and opaque triangle commits, triangle queries lost box
+  candidates). LEFT also: `Abort()` reached by a candidate of the kind a
+  query does not commit (refused by name in a procedural query).
 - i. `Abort()` outside the loop.
 - j. More than 16 carried values, and carried values of other types.
 - k. Several queries where one needs an intersection shader: give each

@@ -165,6 +165,19 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.69.0: A QUERY WAS LOWERED AS IF THE SCENE HELD ONLY THE KIND IT COMMITS.**
+Two silent wrong results, fixed. RayQuery yields triangles AND boxes to every
+Proceed body and commits opaque triangles itself; the lowering gave the
+other kind an empty hit group. A procedural query lost triangle candidates
+(14450 rays) and opaque triangle commits (14450); a triangle query lost box
+candidates (7396). Now every procedural query gets the triangle any-hit and
+closest-hit, and a triangle query that writes where a box reaches gets the
+intersection shader, decided by folding CandidateType() (`reach_as`). Escher
+unchanged: 781 of 781 dumped inputs lower as before. Suites 93 of 93, 57 of
+57. **A test scene with one kind of geometry cannot see this: mixed scenes
+for every new lowering.** NEXT: exact `Abort()` in a procedural body, and
+`Abort()` reached by the kind a query does not commit.
+
 **0.68.0: PLAN STEP 3 h, THE PROCEDURAL HALF.** Writes in a Proceed body
 that becomes an intersection shader lower. The refusal rested on "the spec
 lets an intersection shader run more than once per primitive whatever the
