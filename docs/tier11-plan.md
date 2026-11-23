@@ -106,7 +106,13 @@ code (`rq_analyze.cpp`, `rq_lower.cpp`) on 2026-09-26, not from memory:
   their ray merged by phis where it starts. Left of it on the limits list: a
   different acceleration structure on each arm, and such a search into a
   top-tested loop.
-- g. `Proceed()` called without a loop, more than once.
+- g. `Proceed()` called without a loop, more than once. DONE 0.74.0: the
+  calls are a virtual loop, the any-hit counting candidates and ending the
+  search after the last call's body. Found doing it, fixed: a query never
+  asked to `Proceed()` was traced as if it had searched (14450 rays). Left
+  of it on the limits list: a call nested in the body of the one before, a
+  write between two calls that a later body may read, a body with more than
+  one way out, and a chain in a query serving procedural primitives.
 - h. General writes in the loop body (only counter appends lower today),
   and appends together with `Abort()` or an intersection shader. RayQuery's
   candidate order is itself implementation-defined, so the question is the
@@ -186,7 +192,10 @@ Three-form matrix, dispatch suite, an Escher run. Then the limits list:
   would be the route);
 - a query traced on either arm of a branch against a different acceleration
   structure on each (a phi of resource handles), or into a top-tested loop
-  (0.73.0).
+  (0.73.0);
+- `Proceed()` without a loop: a call nested in the body of the one before, a
+  write between two calls that a later body may read, a body with more than
+  one way out, a chain in a query serving procedural primitives (0.74.0).
 
 ## Size
 

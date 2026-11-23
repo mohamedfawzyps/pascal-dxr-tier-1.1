@@ -147,7 +147,17 @@ $cases = @(
     @{ name = 'retracebranch'; src = 'phase5\cases\rayquery_retracebranch.ll'; pat = 'alpha'; flags = @('--geom');
        norender = $true; desc = 'one query traced on either arm of a branch' },
     @{ name = 'retraceloop'; src = 'phase5\cases\rayquery_retraceloop.ll'; pat = 'alpha'; flags = @('--geom');
-       norender = $true; desc = 'one TraceRayInline run in a loop' }
+       norender = $true; desc = 'one TraceRayInline run in a loop' },
+    # Proceed() without a loop (0.74.0): a chain of calls, one any-hit
+    # counting candidates; and a query never asked, never searched.
+    @{ name = 'proceed1'; src = 'phase5\cases\rayquery_proceed1.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = 'Proceed() once, without a loop' },
+    @{ name = 'proceed2'; src = 'phase5\cases\rayquery_proceed2.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = 'Proceed() twice, a body each' },
+    @{ name = 'proceedbare'; src = 'phase5\cases\rayquery_proceedbare.ll'; pat = 'alpha'; flags = @('--geom');
+       norender = $true; desc = 'a bare Proceed(), not forced opaque' },
+    @{ name = 'noproceed'; src = 'phase5\cases\rayquery_noproceed.ll'; pat = 'opaque'; flags = @();
+       norender = $true; desc = 'never asked to Proceed(), never searched' }
 )
 
 if (-not (Test-Path 'phase5\dxil\rayquery_opaque.ll')) {

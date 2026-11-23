@@ -280,14 +280,17 @@ def main():
     ok.append(expect_pattern('committed state read in loop', inloop, 3))
     ok.append(cpp_agrees('committed state read in loop', inloop))
 
-    # No loop and not FORCE_OPAQUE: traversal would yield candidates the
-    # shader never inspects, so there is nothing to lower to.
+    # No loop and not FORCE_OPAQUE: refused until 0.74.0 as "traversal would
+    # yield candidates the shader never inspects". That is what it does: the
+    # one Proceed() stops the search at the first non-opaque candidate, and
+    # the lowering now says so (a chain of one call, see _find_chain). So
+    # this FLIPS to an acceptance, kept so the refusal cannot creep back.
     noflag = opaque.replace('@dx.op.allocateRayQuery(i32 178, i32 1)',
                             '@dx.op.allocateRayQuery(i32 178, i32 0)')
     noflag = noflag.replace('i32 %v33, %dx.types.Handle %v2, i32 1, i32 255',
                             'i32 %v33, %dx.types.Handle %v2, i32 0, i32 255')
-    ok.append(expect_reject('no loop, not FORCE_OPAQUE', noflag,
-                            'no lowering is defined'))
+    ok.append(expect_pattern('no loop, not FORCE_OPAQUE', noflag, 3))
+    ok.append(cpp_agrees('no loop, not FORCE_OPAQUE', noflag))
 
     # CommittedGeometryIndex FLIPS from a refusal to an acceptance, and the
     # case is kept rather than deleted so the refusal cannot creep back.
@@ -524,7 +527,9 @@ def main():
                       ('rayquery_refuse_procfx.ll', 'also writes for procedural candidates'),
                       ('rayquery_refuse_procdynabort.ll', 'with ray flags computed at run time'),
                       ('rayquery_refuse_candafter.ll', 'which code that did not leave the loop also reaches'),
-                      ('rayquery_refuse_retraceinloop.ll', 'traced again inside its own Proceed loop')):
+                      ('rayquery_refuse_retraceinloop.ll', 'traced again inside its own Proceed loop'),
+                      ('rayquery_refuse_proceednest.ll', 'inside the body of the Proceed() before it'),
+                      ('rayquery_refuse_proceedwrite.ll', 'code between two Proceed() calls writes memory')):
         path = os.path.join('phase5', 'cases', case)
         if not os.path.isfile(path):
             continue

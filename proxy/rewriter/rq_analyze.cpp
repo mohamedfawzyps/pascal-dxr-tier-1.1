@@ -304,6 +304,187 @@ static std::string AbsorbExits(const llm::Function& fn, Query& q) {
     return "";
 }
 
+// Proceed() without a loop, once or more (0.74.0): see _find_chain in
+// rayquery.py, which this mirrors message for message.
+static std::string FindChain(const llm::Function& fn, Query& q) {
+    std::map<std::string, int> order;
+    for (size_t k = 0; k < fn.blocks.size(); ++k) order[fn.blocks[k].label] = (int)k;
+    auto byOrder = [&](const std::set<std::string>& in) {
+        std::vector<std::string> v(in.begin(), in.end());
+        std::sort(v.begin(), v.end(), [&](const std::string& a, const std::string& b) {
+            return order[a] < order[b];
+        });
+        return v;
+    };
+    const auto dom = fn.Dominators();
+    const auto preds = fn.Preds();
+    std::map<std::string, std::vector<std::string>> succ;
+    for (const auto& b : fn.blocks) succ[b.label] = b.Successors();
+    auto calls = q.proceeds;
+    std::sort(calls.begin(), calls.end(), [](const auto& a, const auto& b) {
+        return a.second->index < b.second->index;
+    });
+    auto before = [&](const std::pair<const llm::Block*, const llm::Instr*>& a,
+                      const std::pair<const llm::Block*, const llm::Instr*>& b) {
+        if (a.first->label == b.first->label) return a.second->index < b.second->index;
+        auto d = dom.find(b.first->label);
+        return d != dom.end() && d->second.count(a.first->label) != 0;
+    };
+    for (size_t k = 0; k + 1 < calls.size(); ++k)
+        if (!before(calls[k], calls[k + 1]))
+            return "Proceed() calls without a loop that are not one after another on every "
+                   "path";
+    static const std::regex kBr(R"(^br i1 (\S+), label (\S+), label (\S+)$)");
+    std::vector<Query::ChainCall> chain;
+    for (size_t k = 0; k < calls.size(); ++k) {
+        Query::ChainCall c;
+        c.block = calls[k].first;
+        c.instr = calls[k].second;
+        const llm::Instr* term = c.block->Terminator();
+        std::smatch m;
+        if (term && std::regex_match(term->body, m, kBr) && m[1].str() == c.instr->result &&
+            m[2].str() != m[3].str()) {
+            auto pit = preds.find(m[2].str());
+            if (pit != preds.end() && pit->second == std::vector<std::string>{ c.block->label })
+                c.entry = m[2].str();
+        }
+        if (!c.entry.empty()) {
+            for (const auto& b : fn.blocks) {
+                auto d = dom.find(b.label);
+                if (d != dom.end() && d->second.count(c.entry)) c.region.insert(b.label);
+            }
+            if (k + 1 < calls.size() && c.region.count(calls[k + 1].first->label))
+                return "a Proceed() inside the body of the Proceed() before it, without a loop";
+        }
+        std::set<std::string> targets;
+        for (const auto& l : byOrder(c.region)) {
+            for (const auto& s2 : succ[l])
+                if (!c.region.count(s2)) { c.exits.emplace_back(l, s2); targets.insert(s2); }
+            const llm::Instr* t = fn.FindBlock(l)->Terminator();
+            if (t) {
+                std::string tb = t->body;
+                while (!tb.empty() && (tb.back() == ' ' || tb.back() == '\t')) tb.pop_back();
+                if (tb == "ret void") c.rets.push_back(l);
+            }
+        }
+        if (targets.size() > 1 || (!targets.empty() && !c.rets.empty()))
+            return "the body of a Proceed() without a loop has more than one way out";
+        if (!targets.empty()) c.exit = *targets.begin();
+        chain.push_back(c);
+    }
+    for (size_t k = 0; k + 1 < chain.size(); ++k) {
+        const auto& c = chain[k];
+        const std::string nb = chain[k + 1].block->label;
+        std::vector<std::string> todo;
+        if (c.entry.empty()) {
+            if (c.block->label == nb) continue;
+            todo = succ[c.block->label];
+        } else if (c.exit.empty()) {
+            continue;
+        } else {
+            todo.push_back(c.exit);
+        }
+        std::set<std::string> seen;
+        while (!todo.empty()) {
+            const std::string l = todo.back();
+            todo.pop_back();
+            if (l == nb || seen.count(l)) continue;
+            seen.insert(l);
+            const llm::Instr* t = fn.FindBlock(l)->Terminator();
+            if (t) {
+                std::string tb = t->body;
+                while (!tb.empty() && (tb.back() == ' ' || tb.back() == '\t')) tb.pop_back();
+                if (tb == "ret void")
+                    return "a Proceed() without a loop that is not always followed by the next one";
+            }
+            for (const auto& s2 : succ[l]) todo.push_back(s2);
+        }
+    }
+    std::set<std::string> body;
+    for (size_t k = 0; k < chain.size(); ++k)
+        for (const auto& l : chain[k].region) { body.insert(l); q.chainRegion[l] = (int)k; }
+    for (const auto* list : { &q.commits, &q.procCommits, &q.aborts, &q.candidateOps })
+        for (const auto& c : *list) {
+            if (c.second->DxOp() == kRayFlags) continue;
+            if (!body.count(c.first->label))
+                return "the candidate is used at \"" + c.second->body.substr(0, 60) +
+                       "\", where no Proceed() result guards it";
+        }
+    q.chain = chain;
+    q.hasLoop = true;
+    q.loop.header = "%rq.pd" + std::to_string(q.qid);
+    q.loop.latch = "%rq.pn" + std::to_string(q.qid);
+    q.loop.body = body;
+    return "";
+}
+
+// Code between two Proceed() calls runs once in the raygen, after the
+// search (0.74.0): see _check_chain_between in rayquery.py.
+static std::string CheckChainBetween(const llm::Module& m, const llm::Function& fn,
+                                     const Query& q) {
+    if (q.chain.size() < 2) return "";
+    static const std::regex kAttrLine(R"(^attributes\s+#(\d+)\s*=\s*\{(.*)\}\s*$)");
+    static const std::regex kDeclLine(R"(^declare\s+.*@([\w.$]+)\s*\(.*\)\s*#(\d+)\s*$)");
+    std::map<std::string, std::string> byNum, groups;
+    std::smatch mm;
+    for (const auto& line : m.lines)
+        if (std::regex_match(line, mm, kAttrLine)) byNum[mm[1].str()] = mm[2].str();
+    for (const auto& line : m.lines)
+        if (std::regex_match(line, mm, kDeclLine)) {
+            auto it = byNum.find(mm[2].str());
+            groups[mm[1].str()] = it == byNum.end() ? "" : it->second;
+        }
+    auto touches = [&](const llm::Instr& i, bool write) {
+        if (i.callee.compare(0, 6, "dx.op.") != 0) return false;
+        if (i.callee.compare(0, 15, "dx.op.rayQuery_") == 0 || i.callee == "dx.op.allocateRayQuery")
+            return false;
+        auto g = groups.find(i.callee);
+        const std::string gt = g == groups.end() ? "" : g->second;
+        if (write)
+            return gt.find("readnone") == std::string::npos && gt.find("readonly") == std::string::npos;
+        return gt.find("readnone") == std::string::npos;
+    };
+    bool later = false;
+    for (size_t k = 1; k < q.chain.size(); ++k)
+        for (const auto& l : q.chain[k].region)
+            for (const auto& i : fn.FindBlock(l)->instrs)
+                if (touches(i, false)) later = true;
+    if (!later) return "";
+    const auto dom = fn.Dominators();
+    const auto& first = q.chain[0];
+    const std::string lastb = q.chain.back().block->label;
+    std::map<std::string, std::vector<std::string>> succ;
+    for (const auto& b : fn.blocks) succ[b.label] = b.Successors();
+    auto reaches = [&](const std::string& a, const std::string& target) {
+        std::set<std::string> seen;
+        std::vector<std::string> todo{ a };
+        while (!todo.empty()) {
+            const std::string l = todo.back();
+            todo.pop_back();
+            if (l == target) return true;
+            if (seen.count(l)) continue;
+            seen.insert(l);
+            for (const auto& s2 : succ[l]) todo.push_back(s2);
+        }
+        return false;
+    };
+    for (const auto& b : fn.blocks) {
+        auto d = dom.find(b.label);
+        if (q.loop.body.count(b.label) || d == dom.end() || !d->second.count(first.block->label))
+            continue;
+        if (!reaches(b.label, lastb)) continue;
+        for (const auto& i : b.instrs) {
+            if (b.label == first.block->label && i.index <= first.instr->index) continue;
+            if (b.label == lastb && i.index >= q.chain.back().instr->index) continue;
+            if (touches(i, true))
+                return "code between two Proceed() calls writes memory (" + i.callee +
+                       ") that a later call's body may read; the body runs during the search, "
+                       "before it";
+        }
+    }
+    return "";
+}
+
 std::string FindLoop(const llm::Function& fn, Query& q) {
     std::set<std::string> proceedBlocks;
     for (const auto& p : q.proceeds) proceedBlocks.insert(p.first->label);
@@ -358,9 +539,9 @@ std::string FindLoop(const llm::Function& fn, Query& q) {
         q.loop = found[0];
         return AbsorbExits(fn, q);
     }
-    if (q.proceeds.size() > 1)
-        return std::to_string(q.proceeds.size()) +
-               " Proceed calls but no loop; unrecognised shape";
+    // No loop. One bare Proceed is the FORCE_OPAQUE shape.
+    if (q.proceeds.size() == 1 && (q.RayFlags() & 1)) return "";
+    if (!q.proceeds.empty()) return FindChain(fn, q);
     return "";
 }
 
@@ -393,7 +574,13 @@ std::set<std::string> ReachAs(const llm::Function& fn, const Query& q, int kind)
         }
     }
     std::set<std::string> seen;
-    std::vector<std::string> todo{ q.loop.header };
+    std::vector<std::string> todo;
+    if (!q.chain.empty()) {
+        for (const auto& c : q.chain)
+            if (!c.entry.empty()) todo.push_back(c.entry);
+    } else {
+        todo.push_back(q.loop.header);
+    }
     while (!todo.empty()) {
         const std::string label = todo.back();
         todo.pop_back();
@@ -493,7 +680,7 @@ std::string RejectFunction(const llm::Function& fn, Query& q) {
         }
         // Abort(), exactly (0.67.0): see _reject_function in rayquery.py.
         // A break or return ends the search the same way (0.72.0).
-        if ((!q.aborts.empty() || !q.exits.empty()) && !q.committedOps.empty() &&
+        if ((!q.aborts.empty() || !q.exits.empty() || !q.chain.empty()) && !q.committedOps.empty() &&
             q.procCommits.empty() &&
             !(q.RayFlags() & 1)) {
             q.track = true;
@@ -508,6 +695,9 @@ std::string RejectFunction(const llm::Function& fn, Query& q) {
                 for (const auto& i : blk->instrs)
                     if (IsCommittedOp(i.DxOp())) triCmt = true;
             }
+            if (!q.chain.empty())
+                return "Proceed() without a loop in a query that commits procedural hits or "
+                       "writes where they reach";
             // A break or return ends the search the same way (0.72.0).
             if (!q.aborts.empty() || !q.exits.empty() || triCmt) {
                 if (!q.StaticFlags())
@@ -748,7 +938,11 @@ std::string CheckQueries(const llm::Function& fn, const std::vector<Query>& qs) 
 
 // The pattern, or an error when a shape has no defined lowering.
 std::string Classify(Query& q) {
-    if (q.NeedsBoth()) {
+    if (q.proceeds.empty()) {
+        // Never asked to Proceed(), so never searched (0.74.0).
+        q.patternNum = 1;
+        q.patternDesc = "never searched (no Proceed() call)";
+    } else if (q.NeedsBoth()) {
         q.patternNum = 5;
         q.patternDesc = "both triangle and procedural commits (two hit groups)";
     } else if (q.NeedsIntersection()) {
@@ -827,6 +1021,10 @@ AnalyzeResult Analyze(const llm::Module& m) {
             if (!err.empty()) { r.error = err; return r; }
             err = FindLoop(fn, q);
             if (!err.empty()) { r.error = err; return r; }
+            if (!q.chain.empty()) {
+                err = CheckChainBetween(m, fn, q);
+                if (!err.empty()) { r.error = err; return r; }
+            }
             if (q.traces.size() > 1) {
                 err = MergeTraces(fn, q, traces, outSets);
                 if (!err.empty()) { r.error = err; return r; }

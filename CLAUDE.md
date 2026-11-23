@@ -165,6 +165,16 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.74.0: PLAN STEP 3 g DONE, `Proceed()` WITHOUT A LOOP; AND A FOURTH
+SILENT WRONG RESULT: A QUERY NEVER ASKED TO `Proceed()` WAS TRACED AS IF IT
+HAD SEARCHED** (14450 rays; now no `TraceRay`, nothing committed). The calls
+are a virtual loop: the any-hit counts candidates in the payload, runs the
+k-th call's body for the k-th, and ends the search after the last call's;
+each call in the raygen reads as whether that many candidates came. A bare
+`Proceed()` (not forced opaque, refused until now) is a chain of one with an
+empty body. Escher 845 of 845 byte-identical. NEXT: plan step 3 i
+(`Abort()` outside the loop).
+
 **0.73.0: PLAN STEP 3 f DONE, ONE QUERY TRACED MORE THAN ONCE.** Which
 search an op reads is reaching definitions over the query's traces; each
 search is lowered as a query of its own (0.43.0's machinery), and traces a

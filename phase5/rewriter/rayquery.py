@@ -239,6 +239,10 @@ class Query(object):
         # chooses; and then the ray as the phis at the block where the search
         # starts make it, that block, and the phis.
         self.segment = None
+        # Proceed() without a loop (0.74.0): one entry per call, in order,
+        # with the region its true edge guards (see _find_chain).
+        self.chain = None
+        self.chain_region = {}
         self.traces = []
         self.merged_args = None
         self.route_block = None
@@ -332,6 +336,10 @@ class Query(object):
         return bool(self.proc_commits) or self.proc_effects
 
     def pattern(self):
+        if not self.proceeds:
+            # Never asked to Proceed(), so never searched (0.74.0): nothing is
+            # committed, whatever the flags.
+            return 1, 'never searched (no Proceed() call)'
         if self.needs_both:
             return 5, 'both triangle and procedural commits (two hit groups)'
         if self.needs_intersection:
@@ -407,6 +415,7 @@ def reach_as(fn, q, kind):
     dead edge. Followed from the loop header; anything this cannot decide
     counts as reachable."""
     header, _, body = q.loop
+    starts = [c['entry'] for c in q.chain if c['entry']] if q.chain else [header]
     types = set()
     for label in body:
         for i in fn.block(label).instrs:
@@ -426,7 +435,7 @@ def reach_as(fn, q, kind):
             else:
                 continue
             known[i.result] = (k == kind) == (m.group(1) == 'eq')
-    seen, todo = set(), [header]
+    seen, todo = set(), list(starts)
     while todo:
         label = todo.pop()
         if label in seen or label not in body:
@@ -481,6 +490,8 @@ def analyze(module, fn_name=None):
                 q.segment = (t, owner)
             _collect(fn, q, [h for h in handles if h != q.handle])
             _find_loop(fn, q)
+            if q.chain:
+                _check_chain_between(module, fn, q)
             if len(q.traces) > 1:
                 _merge_traces(fn, q, owner)
             _mark_procedural_effects(module, fn, q)
@@ -794,9 +805,154 @@ def _find_loop(fn, q):
 
     # No loop. One bare Proceed is the FORCE_OPAQUE shape, where traversal is
     # entirely fixed function and Proceed never yields.
-    if len(q.proceeds) > 1:
-        raise Unsupported('%d Proceed calls but no loop; unrecognised shape'
-                          % len(q.proceeds))
+    if len(q.proceeds) == 1 and q.ray_flags & 1:
+        return
+    if q.proceeds:
+        _find_chain(fn, q)
+
+
+def _find_chain(fn, q):
+    """Proceed() called without a loop, once or more (0.74.0).
+
+    Each call yields the next candidate, and the code its true edge guards is
+    that candidate's body; after the last call the shader never asks again,
+    so the search stops there. So the calls are one virtual loop: the any-hit
+    counts candidates in the payload and runs the k-th call's body for the
+    k-th, ending the search after the last; the raygen reads each call's
+    result as whether that many candidates came. Lowered with the loop
+    machinery, over a header and latch of its own."""
+    labels = [b.label for b in fn.blocks]
+    dom = fn.dominators()
+    preds = fn.preds()
+    succ = dict((b.label, b.successors()) for b in fn.blocks)
+    calls = sorted(q.proceeds, key=lambda bi: bi[1].index)
+
+    def before(a, b):
+        (ba, ia), (bb, ib) = a, b
+        if ba.label == bb.label:
+            return ia.index < ib.index
+        return ba.label in dom.get(bb.label, ())
+
+    for k in range(len(calls) - 1):
+        if not before(calls[k], calls[k + 1]):
+            raise Unsupported('Proceed() calls without a loop that are not one after '
+                              'another on every path')
+    chain = []
+    for k, (b, p) in enumerate(calls):
+        term = b.terminator
+        m = re.match(r'^br i1 (\S+), label (\S+), label (\S+)$', term.body) if term else None
+        entry = None
+        if m and m.group(1) == p.result and m.group(2) != m.group(3) and \
+                preds.get(m.group(2)) == [b.label]:
+            entry = m.group(2)
+        region = set()
+        if entry:
+            region = set(l for l in labels if entry in dom.get(l, ()))
+            if k + 1 < len(calls) and calls[k + 1][0].label in region:
+                raise Unsupported('a Proceed() inside the body of the Proceed() before '
+                                  'it, without a loop')
+        exits = [(l, s) for l in sorted(region, key=labels.index) for s in succ[l]
+                 if s not in region]
+        rets = [l for l in sorted(region, key=labels.index)
+                if fn.block(l).terminator and fn.block(l).terminator.body.strip() == 'ret void']
+        targets = sorted(set(s for _, s in exits), key=labels.index)
+        if len(targets) > 1 or (targets and rets):
+            raise Unsupported('the body of a Proceed() without a loop has more than one '
+                              'way out')
+        chain.append({'block': b, 'instr': p, 'entry': entry, 'region': region,
+                      'exit': targets[0] if targets else None, 'exits': exits,
+                      'rets': rets})
+    # After a call's body, the next call is made on every path, or the search
+    # would stop there on some.
+    for k in range(len(chain) - 1):
+        c, nb = chain[k], chain[k + 1]['block'].label
+        start = c['exit'] if c['entry'] else None
+        if c['entry'] is None:
+            if c['block'].label == nb:
+                continue
+            todo = [s for s in succ[c['block'].label]]
+        elif start is None:
+            continue           # the body returns: the search ends with it
+        else:
+            todo = [start]
+        seen = set()
+        while todo:
+            l = todo.pop()
+            if l == nb or l in seen:
+                continue
+            seen.add(l)
+            t = fn.block(l).terminator
+            if t is not None and t.body.strip() == 'ret void':
+                raise Unsupported('a Proceed() without a loop that is not always followed '
+                                  'by the next one')
+            todo.extend(succ[l])
+    body = set()
+    for k, c in enumerate(chain):
+        body |= c['region']
+        for l in c['region']:
+            q.chain_region[l] = k
+    for b, i in q.commits + q.proc_commits + q.aborts + q.candidate_ops:
+        if i.dxop == RAY_FLAGS:
+            continue
+        if b.label not in body:
+            raise Unsupported(
+                'the candidate is used at "%s", where no Proceed() result guards it'
+                % i.body[:60])
+    q.chain = chain
+    q.loop = ('%%rq.pd%d' % q.qid, '%%rq.pn%d' % q.qid, body)
+
+
+def _check_chain_between(module, fn, q):
+    """Code between two Proceed() calls runs once in the raygen, after the
+    search; the later calls' bodies run during it. So a write there before a
+    body that touches memory would change order (0.74.0)."""
+    if len(q.chain) < 2:
+        return
+    groups = attr_groups(module)
+
+    def touches(i, write):
+        if not i.callee or not i.callee.startswith('dx.op.') or \
+                i.callee.startswith('dx.op.rayQuery_') or i.callee == 'dx.op.allocateRayQuery':
+            return False
+        g = groups.get(i.callee, '')
+        if write:
+            return 'readnone' not in g and 'readonly' not in g
+        return 'readnone' not in g
+    later = [i for c in q.chain[1:] for l in c['region'] for i in fn.block(l).instrs
+             if touches(i, False)]
+    if not later:
+        return
+    dom = fn.dominators()
+    first = q.chain[0]
+    lastb = q.chain[-1]['block'].label
+    succ = dict((b.label, b.successors()) for b in fn.blocks)
+
+    def reaches(a, target):
+        seen, todo = set(), [a]
+        while todo:
+            l = todo.pop()
+            if l == target:
+                return True
+            if l in seen:
+                continue
+            seen.add(l)
+            todo.extend(succ[l])
+        return False
+    for b in fn.blocks:
+        if b.label in q.loop[2] or first['block'].label not in dom.get(b.label, ()):
+            continue
+        if not reaches(b.label, lastb):
+            continue
+        for i in b.instrs:
+            if b.label == first['block'].label and i.index <= first['instr'].index:
+                continue
+            if b.label == lastb and i.index >= q.chain[-1]['instr'].index:
+                continue
+            if touches(i, True):
+                raise Unsupported(
+                    'code between two Proceed() calls writes memory (%s) that a later '
+                    'call\'s body may read; the body runs during the search, before it'
+                    % i.callee)
 
 
 def _absorb_exits(fn, q):
@@ -922,8 +1078,8 @@ def _reject_function(fn, q):
         # any-hit, which rejects them all once aborted. Where it is not read,
         # the any-hit ends the search instead (lower.py).
         # A break or return ends the search the same way (0.72.0).
-        if ((q.aborts or q.exits) and q.committed_ops and not q.needs_intersection
-                and not (q.ray_flags & 1)):
+        if ((q.aborts or q.exits or q.chain) and q.committed_ops
+                and not q.needs_intersection and not (q.ray_flags & 1)):
             q.track = True
             q.needs_record_constants = True
         # Tracked procedural, 0.71.0: Abort() anywhere in a procedural query's
@@ -941,6 +1097,9 @@ def _reject_function(fn, q):
             tri_cmt = any(instr.dxop in COMMITTED_OPS
                           for label in reach_as(fn, q, 0)
                           for instr in fn.block(label).instrs)
+            if q.chain:
+                raise Unsupported('Proceed() without a loop in a query that commits '
+                                  'procedural hits or writes where they reach')
             # A break or return ends the search the same way (0.72.0).
             if q.aborts or q.exits or tri_cmt:
                 if q.dyn_flags is None:

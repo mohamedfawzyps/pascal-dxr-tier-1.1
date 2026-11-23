@@ -437,7 +437,17 @@ $cases = @(
     @{ name = 'retracebranch'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_retracebranch.hlsl', '--geom'); desc = 'one query traced on either arm of a branch' },
     @{ name = 'retracebranch1'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_retracebranch.hlsl'); desc = 'the same, one triangle' },
     @{ name = 'retraceloop'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_retraceloop.hlsl', '--geom'); desc = 'one TraceRayInline run in a loop' },
-    @{ name = 'retraceloopm'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_retraceloop.hlsl', '--multi'); desc = 'the same, two instances' }
+    @{ name = 'retraceloopm'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_retraceloop.hlsl', '--multi'); desc = 'the same, two instances' },
+    # Proceed() without a loop (0.74.0, plan step 3 g): the k-th candidate
+    # runs the k-th call's body, the last call ends the search; and a query
+    # never asked to Proceed() is never searched (0.73.0 drew 14450 hits).
+    @{ name = 'proceed1'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proceed1.hlsl', '--geom'); desc = 'Proceed() once, without a loop' },
+    @{ name = 'proceed1s'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proceed1.hlsl', '--geom', '--stack'); desc = 'the same, two candidates: the body runs once' },
+    @{ name = 'proceed2'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proceed2.hlsl', '--geom'); desc = 'Proceed() twice, one candidate' },
+    @{ name = 'proceed2s'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proceed2.hlsl', '--geom', '--stack'); desc = 'the same, two candidates: a body each' },
+    @{ name = 'proceedbare'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proceedbare.hlsl', '--geom', '--opaquemix'); desc = 'a bare Proceed(), opaque quadrants committed, the others not' },
+    @{ name = 'proceedbares'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proceedbare.hlsl', '--geom', '--opaquemix', '--stack'); desc = 'the same, two layers' },
+    @{ name = 'noproceed'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_noproceed.hlsl'); desc = 'never asked to Proceed(), never searched' }
 )
 
 $failed = 0
@@ -811,7 +821,11 @@ $xg = @(
     # One query traced more than once (0.73.0): every search running the
     # first one's loop body, and a branch's ray always the first arm's.
     @{ n = 'retrace'; v = 'DXR_TIER11_RETRACE_POISON'; x = @('--cs', 'phase5\cases\rayquery_retrace.hlsl', '--geom') },
-    @{ n = 'retracebranch'; v = 'DXR_TIER11_MERGE_POISON'; x = @('--cs', 'phase5\cases\rayquery_retracebranch.hlsl', '--geom') }
+    @{ n = 'retracebranch'; v = 'DXR_TIER11_MERGE_POISON'; x = @('--cs', 'phase5\cases\rayquery_retracebranch.hlsl', '--geom') },
+    # Proceed() without a loop (0.74.0): every candidate running the first
+    # call's body, nothing ending the search.
+    @{ n = 'proceed1s'; v = 'DXR_TIER11_CHAIN_POISON'; x = @('--cs', 'phase5\cases\rayquery_proceed1.hlsl', '--geom', '--stack') },
+    @{ n = 'proceed2s'; v = 'DXR_TIER11_CHAIN_POISON'; x = @('--cs', 'phase5\cases\rayquery_proceed2.hlsl', '--geom', '--stack') }
 )
 foreach ($g in $xg) {
     $x = $g.x

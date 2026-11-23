@@ -168,6 +168,18 @@ struct Query {
     // indices), the search of every op on the handle, the traces that start
     // this one (more than one where a branch chooses), and then the ray as
     // the phis where the search starts make it, that block, and the phis.
+    // Proceed() without a loop (0.74.0): one entry per call, in order, with
+    // the region its true edge guards; see _find_chain in rayquery.py.
+    struct ChainCall {
+        const llm::Block* block = nullptr;
+        const llm::Instr* instr = nullptr;
+        std::string entry, exit;
+        std::set<std::string> region;
+        std::vector<std::pair<std::string, std::string>> exits;
+        std::vector<std::string> rets;
+    };
+    std::vector<ChainCall> chain;
+    std::map<std::string, int> chainRegion;
     bool segmented = false;
     std::set<int> search;
     std::map<const llm::Instr*, std::set<int>> owner;

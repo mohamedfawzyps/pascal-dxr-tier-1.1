@@ -24,6 +24,49 @@ not.
 
 ---
 
+## 0.74.0
+
+**Plan step 3 g: `Proceed()` called without a loop, once or more. And a
+fourth silent wrong result, fixed: a query never asked to `Proceed()` was
+lowered as if it had searched.**
+
+- **Never asked, never searched.** A query traced and then read without any
+  `Proceed()` call has committed nothing, whatever its flags. The lowering
+  traced it anyway: `rayquery_noproceed.hlsl` (forced opaque) gave 14450
+  hits where WARP commits none, nothing logged. Now no `TraceRay` is emitted
+  for it; the payload keeps its start values, nothing committed and
+  `CommittedRayT()` the ray's TMax.
+- **A chain of calls.** Each `Proceed()` yields the next non-opaque
+  candidate, the code its true edge guards is that candidate's body, and
+  after the last call the shader never asks again, so the search stops there.
+  So the calls are one virtual loop: the any-hit counts candidates in the
+  payload and runs the k-th call's body for the k-th, ending the search
+  after the last call's (the 0.67.0 abort machinery, tracked where committed
+  state is read, so opaque candidates met later are not committed); the
+  raygen reads each call as whether that many candidates came, and each
+  body's way out goes on from a block of its own. A bare `Proceed()` (result
+  unused, not forced opaque), refused until now, is a chain of one with an
+  empty body: opaque candidates are committed, the first non-opaque one
+  stops the search.
+- **Refused by name:** a `Proceed()` inside the body of the one before it
+  (`rayquery_refuse_proceednest.hlsl`); code between two calls that writes
+  memory a later body may read, since that body now runs during the search
+  (`rayquery_refuse_proceedwrite.hlsl`); a body with more than one way out,
+  or one not always followed by the next call; the candidate used where no
+  call's result guards it; and a chain in a query that serves procedural
+  primitives.
+- **Tests.** `rayquery_proceed1.hlsl` (one call, a body that counts and
+  commits), `rayquery_proceed2.hlsl` (two calls, the first body's value used
+  after, the second commits), `rayquery_proceedbare.hlsl` (on `--opaquemix`):
+  all refused on 0.73.0, all match WARP with one candidate per ray and with
+  two (`--stack`). `DXR_TIER11_CHAIN_POISON=1` (every candidate runs the first
+  call's body, nothing ends the search) diverges in 9423 and 18496 rays. The
+  "no loop, not FORCE_OPAQUE" refusal test is flipped to an acceptance.
+  Byte-identical in both rewriters on 71 cases; rewriter refusal checks 68 of
+  68; dispatch suite 123 of 123.
+- **Escher unchanged:** all 845 dumped Unreal shader inputs lower
+  byte-identically to 0.73.0.
+
 ## 0.73.0
 
 **Plan step 3 f: one query traced more than once.** A second
