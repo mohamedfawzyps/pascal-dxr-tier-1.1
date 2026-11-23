@@ -824,16 +824,22 @@ static Scene BuildSceneProc(Gpu& g, bool opaque) {
     inst.Transform[0][0] = inst.Transform[1][1] = inst.Transform[2][2] = 1.0f;
     inst.InstanceMask = 0xFF;
     inst.AccelerationStructure = s.blas->GetGPUVirtualAddress();
-    auto instBuf = CreateBuffer(g.device.Get(), sizeof(inst), D3D12_HEAP_TYPE_UPLOAD,
+    // --stack (0.68.0): the same box 0.5 nearer the camera, so a ray through
+    // it meets TWO procedural candidates (for Abort() in an intersection
+    // shader). Same record: one procedural hit group serves both.
+    D3D12_RAYTRACING_INSTANCE_DESC insts[2] = { inst, inst };
+    insts[1].Transform[2][3] = 0.5f;
+    const UINT n = g_stack ? 2 : 1;
+    auto instBuf = CreateBuffer(g.device.Get(), sizeof(insts), D3D12_HEAP_TYPE_UPLOAD,
         D3D12_RESOURCE_STATE_GENERIC_READ);
-    HR(instBuf->Map(0, &none, &p), "map inst"); std::memcpy(p, &inst, sizeof(inst));
+    HR(instBuf->Map(0, &none, &p), "map inst"); std::memcpy(p, insts, sizeof(inst) * n);
     instBuf->Unmap(0, nullptr);
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS ti{};
     ti.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
     ti.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
     ti.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
-    ti.NumDescs = 1; ti.InstanceDescs = instBuf->GetGPUVirtualAddress();
+    ti.NumDescs = n; ti.InstanceDescs = instBuf->GetGPUVirtualAddress();
     s.tlas = BuildAS(g, ti);
     return s;
 }

@@ -8,6 +8,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <string>
@@ -360,6 +361,12 @@ const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* NoDuplicateAnyHit(
         return in;
     const bool ptrs = in->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS;
     if (ptrs ? !in->ppGeometryDescs : !in->pGeometryDescs) return in;
+    // DXR_TIER11_NODUP_POISON=1 (0.68.0): leave the application's flags, so
+    // the driver may invoke an any-hit or intersection shader redundantly.
+    // A test of writes in a transplanted loop body should then diverge
+    // wherever this driver actually does so.
+    static const bool poison = std::getenv("DXR_TIER11_NODUP_POISON") != nullptr;
+    if (poison) return in;
     auto at = [&](UINT i) -> const D3D12_RAYTRACING_GEOMETRY_DESC& {
         return ptrs ? *in->ppGeometryDescs[i] : in->pGeometryDescs[i];
     };

@@ -468,16 +468,21 @@ def main():
             ok.append(False)
         ok.append(cpp_agrees(name, t, None, r'rayQuery_\w+[.\w]*\(i32 \d+'))
 
-    # Around an append, an intersection shader stays refused: it may run more
-    # than once per primitive whatever the flags say.
     # 0.67.0: with Abort() the any-hit ends the search (or rejects every later
     # candidate), so an append after an abort no longer happens: it lowers.
+    # 0.68.0: an append in a body that becomes an intersection shader lowers
+    # too (the spec: no redundant intersection invocations with the
+    # NO_DUPLICATE_ANYHIT_INVOCATION flag the proxy sets). Beside an Abort()
+    # it stays refused: an intersection shader cannot stop traversal.
+    PROC = os.path.join('phase5', 'cases', 'rayquery_proc.ll')
+    COMMIT_PROC = r'^.*rayQuery_CommitProceduralPrimitiveHit\(i32 183.*$'
     for path, anchor, why in (
             (os.path.join('phase5', 'cases', 'rayquery_abort.ll'),
              r'^.*rayQuery_Abort\(i32 181.*$', None),
-            (os.path.join('phase5', 'cases', 'rayquery_proc.ll'),
-             r'^.*rayQuery_CommitProceduralPrimitiveHit\(i32 183.*$',
-             'intersection shader')):
+            (PROC, COMMIT_PROC, None),
+            (PROC + '+abort', COMMIT_PROC, 'calls Abort() and becomes an intersection')):
+        abort = path.endswith('+abort')
+        path = path[:-len('+abort')] if abort else path
         if not os.path.isfile(path):
             continue
         t = load(path)
@@ -493,7 +498,17 @@ def main():
             t = t.replace(g.group(0),
                           'declare i32 @dx.op.bufferUpdateCounter(i32, %%dx.types.Handle, i8) #%s'
                           '\n\n%s' % (g.group(1), g.group(0)))
-        name = 'append with ' + ('Abort()' if 'abort' in path else 'an intersection')
+        if abort:
+            # An Abort() right after the procedural commit, on the same query.
+            hq = re.search(r'^\s*(%\w+) = call i32 @dx\.op\.allocateRayQuery\(', t, re.M)
+            assert hq, 'cannot find the query in ' + path
+            t = t.replace(at.group(0), '%s\n  call void @dx.op.rayQuery_Abort(i32 181, i32 %s)'
+                          % (at.group(0), hq.group(1)))
+            t = t.replace(g.group(0),
+                          'declare void @dx.op.rayQuery_Abort(i32, i32) #%s\n\n%s'
+                          % (g.group(1), g.group(0)))
+        name = 'append with ' + ('Abort()' if 'abort' in path else
+                                 'an intersection and Abort()' if abort else 'an intersection')
         ok.append(expect_lower_ok(name, t) if why is None else expect_lower_reject(name, t, why))
         ok.append(cpp_agrees(name, t, why))
 

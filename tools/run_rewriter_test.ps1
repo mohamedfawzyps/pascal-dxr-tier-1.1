@@ -117,7 +117,11 @@ $cases = @(
     @{ name = 'abortcmt'; src = 'phase5\cases\rayquery_abortcommit.ll'; pat = 'alpha'; flags = @('--geom');
        norender = $true; desc = 'commit then Abort(), and a bare Abort()' },
     @{ name = 'abortstack'; src = 'phase5\cases\rayquery_abortstack.ll'; pat = 'alpha'; flags = @('--geom');
-       norender = $true; desc = 'committed state saved at Abort()' }
+       norender = $true; desc = 'committed state saved at Abort()' },
+    # Writes in a body that becomes an intersection shader (0.68.0).
+    @{ name = 'procwrites'; src = 'phase5\cases\rayquery_proc_writes.ll'; pat = 'alpha'; flags = @('--proc');
+       gt = @('--cs', 'phase5\cases\rayquery_proc_writes.hlsl', '--proc');
+       desc = 'a store and an atomic in a procedural body' }
 )
 
 if (-not (Test-Path 'phase5\dxil\rayquery_opaque.ll')) {

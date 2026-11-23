@@ -1140,11 +1140,6 @@ def _attr_groups(module):
     return out
 
 
-BUFFER_UPDATE_COUNTER = 70
-# Stores whose index operand, argument 2, can be a counter's result.
-APPEND_STORES = (69, 140)   # bufferStore, rawBufferStore
-
-
 def _check_loop_side_effects(module, fn, q, body):
     """A Proceed loop body that WRITES is not transplantable, with one
     exception: an APPEND.
@@ -1186,7 +1181,7 @@ def _check_loop_side_effects(module, fn, q, body):
     reaches only an alloca or groupshared in practice, and groupshared around a
     query is already refused."""
     groups = _attr_groups(module)
-    writes, counters = [], set()
+    writes = []
     for label in body:
         for i in fn.block(label).instrs:
             if not i.callee or not i.callee.startswith('dx.op.'):
@@ -1201,31 +1196,25 @@ def _check_loop_side_effects(module, fn, q, body):
             if attr is not None and ('readnone' in attr or 'readonly' in attr):
                 continue
             writes.append(i)
-            if i.dxop == BUFFER_UPDATE_COUNTER and i.result:
-                counters.add(i.result)
     # Any write, 0.67.0. An any-hit runs once per candidate RayQuery would
     # yield (NO_DUPLICATE_ANYHIT_INVOCATION on every geometry, set by the
     # proxy), not at all after an Abort() (its flag is checked first), and in
     # an order that is implementation-defined for RayQuery too: the same
-    # writes. An intersection shader the spec lets run more than once per
-    # primitive, so there a write could happen twice.
-    for i in writes:
-        if i.dxop == BUFFER_UPDATE_COUNTER:
-            continue
-        if (i.dxop in APPEND_STORES and len(i.args) > 2
-                and i.args[2].split()[-1] in counters):
-            continue
-        if q.needs_intersection:
-            raise rq.Unsupported(
-                'Proceed loop body has a side effect (%s, opcode %s) and becomes '
-                'an intersection shader, which the spec lets run more than once '
-                'per primitive, so the write could happen more than once'
-                % (i.callee, i.dxop if i.dxop is not None else '?'))
-    if writes and q.needs_intersection:
+    # writes.
+    #
+    # An intersection shader too, 0.68.0. The spec (Raytracing.md v1.49,
+    # "Minor intersection shader details"): with that flag "the implementation
+    # must not redundantly invoke the intersection shader for the same ray and
+    # procedural primitive instance", and the flag "applies to all geometry
+    # types". The proxy sets it on AABB geometry as on triangles. What stays
+    # refused is a write beside an Abort(): an intersection shader cannot
+    # stop traversal, so it would write for AABBs RayQuery never yields.
+    if writes and q.needs_intersection and q.aborts:
         raise rq.Unsupported(
-            'Proceed loop body appends to a buffer and becomes an intersection '
-            'shader, which may run more than once per primitive whatever the '
-            'geometry flags say')
+            'Proceed loop body writes (%s) and calls Abort() and becomes an '
+            'intersection shader, which cannot stop traversal, so the write '
+            'would happen for procedural candidates met after the abort'
+            % writes[0].callee)
 
 
 def _check_loop_isolated(fn, q, header, latch, body, types):
@@ -1946,8 +1935,15 @@ def _intersection(module, q, exports, table, globals_, binds=None):
                            % (i.index, ATTRS[1:], t, ATTRS))
                 continue
             if i.dxop == rq.ABORT:
-                # Nothing to set: an intersection shader that returns has
-                # reported nothing, and there is no later invocation to gate.
+                # NOT EXACT, stated (0.68.0): an intersection shader cannot stop
+                # traversal, so the AABBs met after the abort are still
+                # evaluated. Legal wherever the body commits only a hit nearer
+                # than the committed one, independently of earlier commits
+                # (some traversal order then gives the same result); a body
+                # whose commit depends on an earlier one can end differently.
+                # rayquery_proc_abort.hlsl is that case; the 1070 meets the
+                # near box first, so it is not observed there. A write beside
+                # the abort is refused (_check_loop_side_effects).
                 continue
             if i.dxop == rq.COMMITTED_RAY_T:
                 # In an intersection shader RayTCurrent() IS the committed t:

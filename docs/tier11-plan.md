@@ -101,9 +101,13 @@ code (`rq_analyze.cpp`, `rq_lower.cpp`) on 2026-09-26, not from memory:
   count, which `NO_DUPLICATE_ANYHIT_INVOCATION` already fixes. DONE 0.67.0
   for any-hit bodies, with `Abort()` made exact (it ends the search, or with
   committed state read, rejects every later candidate, opaque ones too).
-  LEFT: a write in a body that becomes an intersection shader, which the
-  spec lets run more than once per primitive. Found doing it: 124 and 128
-  byte payloads break the 1070's driver; the lowering pads both to 132.
+  Found doing it: 124 and 128 byte payloads break the 1070's driver; the
+  lowering pads both to 132. A write in a body that becomes an intersection
+  shader: DONE 0.68.0 (the spec, read again: with the no-duplicate flag the
+  proxy sets, no redundant intersection invocations). LEFT: `Abort()` in a
+  procedural body, where traversal continues (legal where a commit uses the
+  committed t only as "nearer than it", not in general:
+  `rayquery_proc_abort.hlsl`), and a write beside it, refused by name.
 - i. `Abort()` outside the loop.
 - j. More than 16 carried values, and carried values of other types.
 - k. Several queries where one needs an intersection shader: give each

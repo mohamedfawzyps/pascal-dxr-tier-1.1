@@ -24,6 +24,47 @@ not.
 
 ---
 
+## 0.68.0
+
+**Plan step 3 (spec item 3), gap h, the procedural half: writes in a Proceed
+loop body that becomes an intersection shader.** Refused until now, on the
+premise that the spec lets an intersection shader run more than once per
+primitive "whatever the flags say".
+
+- **The spec says otherwise, read again (Raytracing.md v1.49, dated
+  2026-10-19, "Minor intersection shader details"; whether that text was
+  there at 0.41.0 is not known):** an implementation may invoke an
+  intersection shader redundantly unless the geometry carries
+  `D3D12_RAYTRACING_GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT_INVOCATION`, and with it
+  "must not redundantly invoke the intersection shader for the same ray and
+  procedural primitive instance"; the flag "applies to all geometry types".
+  The proxy has set it on every bottom-level geometry, AABBs included, since
+  0.41.0. So a body's writes run once per procedural candidate, as in
+  `Proceed()`: both rewriters accept them, the dead append bookkeeping went.
+- **Still refused, by name:** a write beside an `Abort()` in such a body. An
+  intersection shader cannot stop traversal, so the write would happen for
+  AABBs RayQuery never yields.
+- **Found reading it, and stated, not fixed:** `Abort()` in a procedural body
+  was dropped with the comment "there is no later invocation to gate", which
+  is wrong; traversal continues. The result is still one some traversal order
+  gives wherever the body commits only a nearer hit independently of earlier
+  commits, as the spec requires of procedural commits; a body whose commit
+  depends on an earlier one can end differently. `rayquery_proc_abort.hlsl`
+  is that case: the near box can be committed only after something else, and
+  the body aborts on its first candidate. 0 of 65536 rays committed the near
+  box on the 1070 and on WARP; the 1070 meets the near box first, so the gap
+  is not observed here. It stays on step 3 h's list.
+- **Measured, against WARP on the 1070:** `rayquery_proc_writes.hlsl` (a store
+  and an atomic counting the body's runs per ray) on one box, on two stacked
+  boxes (`raytest --proc --stack`, new: 7396 rays meet two candidates, the
+  count identical on both sides), and on a mixed scene: all match.
+  `DXR_TIER11_WRITE_POISON=1` (the stores dropped from the intersection
+  shader) diverges in 7396 rays. `DXR_TIER11_NODUP_POISON=1` (the geometry
+  flag left off) changes nothing on the 1070 in these scenes, so it is an
+  instrument, not a gate: this driver did not repeat an intersection
+  invocation even without the flag. Rewriter suite 51 of 51, Python and C++
+  byte-identical on the new case. Dispatch suite 89 of 89.
+
 ## 0.67.0
 
 **Plan step 3 (spec item 3), gap h: writes in the Proceed loop body, and

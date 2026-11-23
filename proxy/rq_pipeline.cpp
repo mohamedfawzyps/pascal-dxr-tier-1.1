@@ -754,7 +754,7 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
              x.needsBoth ? ", with a generated any-hit AND intersection shader"
                  : x.hasIntersection ? ", with a generated intersection shader"
                  : (x.hasAnyHit ? ", with a generated any-hit shader" : ""),
-             x.appends ? ", which appends to a buffer per candidate" : "",
+             x.appends ? ", which writes to memory per candidate" : "",
              x.carried ? ", carrying values read before the loop in the payload" : "");
     // The object the application holds is a REAL pipeline state: its own root
     // signature, and a compute shader that does nothing. It is never executed,

@@ -181,11 +181,6 @@ const CandMap* FindCand(int op) {
 const int kBindHandle = 217;
 const int kAnnotateHandle = 216;
 const int kHeapHandle = 218;
-// The append a transplanted loop body may keep: a counter update, and stores
-// whose index operand, argument 2, is its result.
-const int kBufferUpdateCounter = 70;
-const int kBufferStore = 69;
-const int kRawBufferStore = 140;
 // The library form's global is a HANDLE, not the resource type, and the
 // overload is named after the handle type too. That is the part that cannot be
 // guessed from the 6.5 path, where both are the resource type.
@@ -1499,7 +1494,6 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             // proxy makes the COUNT equal by setting NO_DUPLICATE_ANYHIT_
             // INVOCATION on every bottom-level geometry. See the Python.
             std::vector<const llm::Instr*> writes;
-            std::set<std::string> counters;
             for (const auto& b : fn.blocks) {
                 if (!x.loop.body.count(b.label)) continue;
                 for (const auto& i : b.instrs) {
@@ -1517,33 +1511,19 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                          g->second.find("readonly") != std::string::npos))
                         continue;
                     writes.push_back(&i);
-                    if (i.DxOp() == kBufferUpdateCounter && !i.result.empty())
-                        counters.insert(i.result);
                 }
             }
-            for (const llm::Instr* w : writes) {
-                const int op = w->DxOp();
-                if (op == kBufferUpdateCounter) continue;
-                if ((op == kBufferStore || op == kRawBufferStore) && w->args.size() > 2) {
-                    const std::string& a = w->args[2];
-                    const size_t sp = a.find_last_of(" \t");
-                    const std::string name = sp == std::string::npos ? a : a.substr(sp + 1);
-                    if (counters.count(name)) continue;
-                }
-                // Any write, 0.67.0: see _check_loop_side_effects in lower.py.
-                if (x.NeedsIntersection()) {
-                    r.error = "Proceed loop body has a side effect (" + w->callee +
-                              ", opcode " + (op >= 0 ? std::to_string(op) : "?") +
-                              ") and becomes an intersection shader, which the spec lets "
-                              "run more than once per primitive, so the write could happen "
-                              "more than once";
-                    return false;
-                }
-            }
-            if (!writes.empty() && x.NeedsIntersection()) {
-                r.error = "Proceed loop body appends to a buffer and becomes an "
-                          "intersection shader, which may run more than once per "
-                          "primitive whatever the geometry flags say";
+            // Any write, 0.67.0, and in an intersection shader too, 0.68.0
+            // (the spec: no redundant intersection invocations with the
+            // NO_DUPLICATE_ANYHIT_INVOCATION flag the proxy sets on every
+            // geometry). See _check_loop_side_effects in lower.py. Refused:
+            // a write beside an Abort(), which an intersection shader cannot
+            // act on.
+            if (!writes.empty() && x.NeedsIntersection() && !x.aborts.empty()) {
+                r.error = "Proceed loop body writes (" + writes[0]->callee +
+                          ") and calls Abort() and becomes an intersection shader, which "
+                          "cannot stop traversal, so the write would happen for procedural "
+                          "candidates met after the abort";
                 return false;
             }
             r.appends = !writes.empty();
@@ -2143,9 +2123,16 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                                      "  ; ReportHit(THit,HitKind,Attributes)");
                         continue;
                     }
-                    // Nothing to do for Abort: returning has reported nothing,
-                    // and there is no later invocation to gate.
+                    // Abort: NOT EXACT here, traversal continues (0.68.0). See
+                    // _intersection in lower.py for when that is still legal.
                     if (op == kAbort) continue;
+                    // DXR_TIER11_WRITE_POISON=1 (0.68.0): the stores of a
+                    // procedural body are dropped from the intersection
+                    // shader. The writes case must diverge.
+                    static const bool writePoison = std::getenv("DXR_TIER11_WRITE_POISON") != nullptr;
+                    if (writePoison && i.result.empty() &&
+                        (op == 67 || op == 69 || op == 140))   // textureStore, bufferStore, rawBufferStore
+                        continue;
                     if (op == kCommittedRayT) {
                         // In an intersection shader RayTCurrent() IS the
                         // committed t: the closest hit so far, or TMax (0.66.0).

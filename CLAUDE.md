@@ -165,6 +165,22 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.68.0: PLAN STEP 3 h, THE PROCEDURAL HALF.** Writes in a Proceed body
+that becomes an intersection shader lower. The refusal rested on "the spec
+lets an intersection shader run more than once per primitive whatever the
+flags say"; the spec (Raytracing.md v1.49) says the no-duplicate flag the
+proxy sets on every geometry forbids exactly that. Still refused: a write
+beside `Abort()` there. **`Abort()` in a procedural body is NOT exact**
+(traversal continues; legal where a commit uses the committed t only as
+"nearer than it"; `rayquery_proc_abort.hlsl` is a body where it is not, not
+observed on the 1070). The 1070 repeated no intersection invocation even
+without the flag. `raytest --proc --stack` gives two boxes per ray. NEXT:
+exact `Abort()` in a procedural body, then e, f, g, i, j, k, l. Dispatch suite
+89 of 89, rewriter 51 of 51.
+**When a refusal cites the spec, quote it with its version: this one
+paraphrased it, and v1.49 (dated 2026-10-19) says the opposite. Whether the
+text changed after 0.41.0 or was misread then is not known.**
+
 **0.67.0 IN THE GAME (2026-11-23, 11 min 42 s): CLEAN, NOTHING REFUSED.**
 The first game run since 0.53.1, so the first of 0.54.0 to 0.67.0. Start
 line 0.67.0, DXC 1.10.2605.37, clean end marker, no device removal. 162

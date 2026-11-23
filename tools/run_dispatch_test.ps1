@@ -388,6 +388,12 @@ $cases = @(
     @{ name = 'abortcmtc'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_abortcommit.hlsl', '--geom', '--opaquemix', '--contrib'); desc = 'the same, contribution 2' },
     @{ name = 'abortstack'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_abortstack.hlsl', '--geom', '--opaquemix', '--stack'); desc = 'nothing commits after Abort(), order-free' },
     @{ name = 'abortmix'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_abortstack.hlsl', '--geom', '--stackmix'); desc = 'the same, an opaque candidate behind a non-opaque one' },
+    # Writes in a body that becomes an INTERSECTION shader (0.68.0): one box,
+    # two stacked boxes (the atomic counts the body's runs per ray), a mixed
+    # scene.
+    @{ name = 'procwrites'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_writes.hlsl', '--proc'); desc = 'a store and an atomic in a procedural body' },
+    @{ name = 'procwrites2'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_writes.hlsl', '--proc', '--stack'); desc = 'the same, two boxes per ray' },
+    @{ name = 'procwritesmix'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_proc_writes.hlsl', '--mixed', '--contrib'); desc = 'the same, a mixed scene' },
     # A 128 byte payload removes the 1070's device when dispatched; the
     # lowering pads it to 132 (0.67.0).
     @{ name = 'carry128'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_carry128.hlsl', '--geom', '--opaquemix'); desc = 'a payload that would be 128 bytes' },
@@ -715,6 +721,23 @@ $env:DXR_TIER11_ABORT_POISON = $null
 if ((& .\raytest.exe diff dp_ab_a.bin dp_ab_b.bin 2>&1) -match 'RESULT: DIVERGE') { Write-Host '  abortstack: diverges with traversal committing after the abort' }
 else { Write-Host '  NOT SENSITIVE: abortstack matched with the abort poisoned'; $failed++ }
 foreach ($f in 'dp_ab_a.bin', 'dp_ab_b.bin') { if (Test-Path $f) { [IO.File]::Delete((Join-Path $PWD $f)) } }
+$env:DXR_TIER11 = ''
+
+# Writes in an intersection shader (0.68.0): with DXR_TIER11_WRITE_POISON=1
+# the stores of a procedural body are dropped, and procwrites2 must DIVERGE.
+# (DXR_TIER11_NODUP_POISON, the geometry flag left off, is NOT a gate: on the
+# 1070 it changed nothing in these scenes, measured.)
+Write-Host ''
+Write-Host '=== writes in an intersection shader ==='
+$env:DXR_TIER11 = '1'
+$x = @('--cs', 'phase5\cases\rayquery_proc_writes.hlsl', '--proc', '--stack')
+& .\raytest.exe warp rayquery alpha dp_pw_a.bin @x | Out-Null
+$env:DXR_TIER11_WRITE_POISON = '1'
+& .\raytest.exe hw rayquery alpha dp_pw_b.bin @x | Out-Null
+$env:DXR_TIER11_WRITE_POISON = $null
+if ((& .\raytest.exe diff dp_pw_a.bin dp_pw_b.bin 2>&1) -match 'RESULT: DIVERGE') { Write-Host '  procwrites2: diverges with the stores dropped' }
+else { Write-Host '  NOT SENSITIVE: procwrites2 matched with the stores dropped'; $failed++ }
+foreach ($f in 'dp_pw_a.bin', 'dp_pw_b.bin') { if (Test-Path $f) { [IO.File]::Delete((Join-Path $PWD $f)) } }
 $env:DXR_TIER11 = ''
 
 # Spec Tier 1.1 item 6: PIPELINE_CONFIG1 flags (0.64.0). The GTX 1070
