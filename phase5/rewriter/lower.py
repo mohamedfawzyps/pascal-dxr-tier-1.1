@@ -1018,7 +1018,8 @@ def _chain_dispatch(q):
 
 
 def _trace_block(q, ra, exit_label, multi=False):
-    # RayContributionToHitGroupIndex stays 0 and MissShaderIndex stays 0, so
+    # RayContributionToHitGroupIndex stays 0 (the query id with records per
+    # query, 0.77.0) and MissShaderIndex stays 0, so
     # the record a hit lands on is the instance contribution plus the geometry
     # multiplier times the geometry index.
     #
@@ -1113,9 +1114,12 @@ def _trace_block(q, ra, exit_label, multi=False):
     # Never asked to Proceed(), so never searched: no TraceRay (0.74.0).
     lines += [] if not q.proceeds else [
         '  call void @dx.op.traceRay.%s(i32 157, %%dx.types.Handle %s, %s, '
-        '%s, i32 0, i32 %d, i32 0, %s, %s, %s, %s, %s, %s, %s, %s, %s* nonnull %%%s.pl)'
+        '%s, i32 %d, i32 %d, i32 0, %s, %s, %s, %s, %s, %s, %s, %s, %s* nonnull %%%s.pl)'
         '  ; TraceRay(...)' % (
-            PAYLOAD[1:], q.as_handle, flag_text, mask, geom_mult,
+            PAYLOAD[1:], q.as_handle, flag_text, mask,
+            # Records of its own per query (0.77.0): query k's are the k-th
+            # of each (instance, geometry) in the shim's own layout.
+            q.qid if q.per_query else 0, geom_mult,
             ra['origin'][0], ra['origin'][1], ra['origin'][2], ra['tmin'],
             ra['direction'][0], ra['direction'][1], ra['direction'][2], ra['tmax'],
             PAYLOAD, q.pfx),
@@ -2092,7 +2096,10 @@ def _swap_declarations(text, q, globals_, binding=False):
             new += ['', '; Function Attrs: nounwind readonly',
                     'declare %s @dx.op.rawBufferLoad.i32'
                     '(i32, %%dx.types.Handle, i32, i32, i8, i32) #RQRO' % RESRET]
-    if q.needs_intersection or (q.track_proc and (q.aborts or q.exits)):
+    # Each set of hit shaders' needs (one set, or one per query, 0.77.0).
+    sets = [(x, [x] if x.loop else []) for x in [q] + q.others] if q.per_query \
+        else [(q, _loops(q))]
+    if any(x.needs_intersection or (x.track_proc and (x.aborts or x.exits)) for x, _l in sets):
         new += ['', '; Function Attrs: nounwind',
                 'declare i1 @dx.op.reportHit.%s(i32, float, i32, %s*) #RQNW'
                 % (ATTRS[1:], ATTRS)]
@@ -2100,9 +2107,9 @@ def _swap_declarations(text, q, globals_, binding=False):
     # AnyHitNull always does and it is nothing but an IgnoreHit.
     new += ['', '; Function Attrs: noreturn nounwind',
             'declare void @dx.op.ignoreHit(i32) #RQNR']
-    if (any(x.aborts or x.exits or x.chain for x in _loops(q))
-            and (not q.needs_intersection or q.needs_both)
-            or q.track_proc):
+    if any(any(y.aborts or y.exits or y.chain for y in loops)
+           and (not x.needs_intersection or x.needs_both)
+           or x.track_proc for x, loops in sets):
         new += ['', '; Function Attrs: noreturn nounwind',
                 'declare void @dx.op.acceptHitAndEndSearch(i32) #RQNR']
     if binding:
@@ -2197,9 +2204,56 @@ def _closesthit(name, status, q):
     return '\n'.join(ch)
 
 
+PER_QUERY_EXPORTS = ('anyhit', 'closesthit', 'intersection', 'closesthitproc', 'anyhitproc')
+
+
+def _shader_sets(q, exports):
+    """(query, its exports) per set of hit shaders: one for the module, or
+    with records per query (0.77.0) one per query, query k's names ending in
+    _q<k> (query 0's unchanged)."""
+    if not q.per_query:
+        return [(q, exports)]
+    sets = []
+    for x in [q] + q.others:
+        ex = dict(exports)
+        for k in PER_QUERY_EXPORTS:
+            ex[k] = exports[k] + ('_q%d' % x.qid if x.qid else '')
+        sets.append((x, ex))
+    return sets
+
+
+class _Solo(object):
+    """Query x seen as the module's only query, for its own hit shaders
+    (0.77.0): no query id dispatch, its own loop only."""
+    def __init__(self, q, x):
+        self.q, self.x, self.saved = q, x, None
+
+    def __enter__(self):
+        if self.q.per_query:
+            self.saved = self.x.others
+            self.x.others = []
+            self.x.carry_fields = self.q.carry_fields
+        return self.x
+
+    def __exit__(self, *a):
+        if self.q.per_query:
+            self.x.others = self.saved
+        return False
+
+
 def _append_shaders(text, module, q, exports, table, globals_, binds=None):
     # q is used below to decide whether the closest-hit fetches the matrix.
     """Emit the generated shader set after the raygen."""
+    fns = []
+    for x, ex in _shader_sets(q, exports):
+        with _Solo(q, x):
+            fns += _hit_shaders(module, x, ex, table, globals_, binds)
+    return _append_common(text, fns, exports)
+
+
+def _hit_shaders(module, q, exports, table, globals_, binds=None):
+    """One set of hit shaders: the any-hit and intersection made from the
+    loop body, the closest-hits, the procedural any-hit."""
     fns = []
     if q.needs_both:
         # ONE loop body, TWO shaders. The substitution of CandidateType is what
@@ -2224,6 +2278,13 @@ def _append_shaders(text, module, q, exports, table, globals_, binds=None):
     else:
         fns.append(_closesthit(exports['closesthit'],
                                2 if q.needs_intersection else 1, q))
+    return fns
+
+
+def _append_common(text, fns, exports):
+    """The miss and the two never-commit stubs, which every set shares, then
+    every function after the raygen."""
+    fns = list(fns)
     fns.append('''define void @{ms}({pl}* noalias nocapture %p) #RQNW {{
   %ph = getelementptr inbounds {pl}, {pl}* %p, i32 0, i32 2
   store i32 0, i32* %ph, align 4
@@ -3058,7 +3119,22 @@ def _rewrite_metadata(text, md, table, globals_, q, exports, binding=False):
     ann_miss = node('!%d, !%d' % (ret, par_payload))
 
     ann = ['i32 1', 'void ()* @%s' % exports['raygen'], '!%d' % ann_raygen]
-    if q.needs_both:
+    if q.per_query:
+        # Records per query (0.77.0): each query's set, then the shared ones.
+        for x, ex in _shader_sets(q, exports):
+            with _Solo(q, x):
+                if x.needs_both or x.needs_intersection:
+                    ann += ['void ()* @%s' % ex['intersection'], '!%d' % ann_raygen]
+                if _loops(x):
+                    ann += ['void %s* @%s' % (sig_h, ex['anyhit']), '!%d' % ann_hit]
+                ann += ['void %s* @%s' % (sig_h, ex['closesthit']), '!%d' % ann_hit]
+                if x.needs_both:
+                    ann += ['void %s* @%s' % (sig_h, ex['closesthitproc']), '!%d' % ann_hit]
+                if x.track_proc:
+                    ann += ['void %s* @%s' % (sig_h, ex['anyhitproc']), '!%d' % ann_hit]
+        ann += ['void %s* @%s' % (sig_p, exports['miss']), '!%d' % ann_miss]
+        ann += ['void %s* @%s' % (sig_h, exports['anyhitnull']), '!%d' % ann_hit]
+    elif q.needs_both:
         # An intersection shader is void(), so it annotates like the raygen.
         ann += ['void ()* @%s' % exports['intersection'], '!%d' % ann_raygen]
         ann += ['void %s* @%s' % (sig_h, exports['anyhit']), '!%d' % ann_hit]
@@ -3067,14 +3143,15 @@ def _rewrite_metadata(text, md, table, globals_, q, exports, binding=False):
         ann += ['void ()* @%s' % exports['intersection'], '!%d' % ann_raygen]
     elif _loops(q):
         ann += ['void %s* @%s' % (sig_h, exports['anyhit']), '!%d' % ann_hit]
-    ann += ['void %s* @%s' % (sig_h, exports['closesthit']), '!%d' % ann_hit]
-    if q.needs_both:
-        ann += ['void %s* @%s' % (sig_h, exports['closesthitproc']),
-                '!%d' % ann_hit]
-    ann += ['void %s* @%s' % (sig_p, exports['miss']), '!%d' % ann_miss]
-    ann += ['void %s* @%s' % (sig_h, exports['anyhitnull']), '!%d' % ann_hit]
-    if q.track_proc:
-        ann += ['void %s* @%s' % (sig_h, exports['anyhitproc']), '!%d' % ann_hit]
+    if not q.per_query:
+        ann += ['void %s* @%s' % (sig_h, exports['closesthit']), '!%d' % ann_hit]
+        if q.needs_both:
+            ann += ['void %s* @%s' % (sig_h, exports['closesthitproc']),
+                    '!%d' % ann_hit]
+        ann += ['void %s* @%s' % (sig_p, exports['miss']), '!%d' % ann_miss]
+        ann += ['void %s* @%s' % (sig_h, exports['anyhitnull']), '!%d' % ann_hit]
+        if q.track_proc:
+            ann += ['void %s* @%s' % (sig_h, exports['anyhitproc']), '!%d' % ann_hit]
     # An intersection shader is void(), so it annotates like the raygen.
     ann += ['void ()* @%s' % exports['isectnull'], '!%d' % ann_raygen]
     ann_id = node(', '.join(ann))
@@ -3087,13 +3164,16 @@ def _rewrite_metadata(text, md, table, globals_, q, exports, binding=False):
                     | (RAW_BUFFER_FLAG if q.needs_record_constants else 0)))
     eps = [node('null, !"", null, !%s, !%d' % (res, flags))]
 
+    # Taken once: a query seen alone (_Solo) has no others, so no query id.
+    pbytes = _payload_bytes(q)
+
     def entry(name, sig, kind, payload, attrs):
         # Which property tags appear depends on the shader kind, exactly as
         # DXC emits them: a raygen carries neither size, a miss carries the
         # payload size only, and hit shaders carry both.
         props = ['i32 8', 'i32 %d' % kind]
         if payload:
-            props += ['i32 6', 'i32 %d' % _payload_bytes(q)]
+            props += ['i32 6', 'i32 %d' % pbytes]
         if attrs:
             props += ['i32 7', 'i32 8']
         props += ['i32 5', '!%d' % zero]
@@ -3101,7 +3181,21 @@ def _rewrite_metadata(text, md, table, globals_, q, exports, binding=False):
         return node('void %s* @%s, !"%s", null, null, !%d'
                     % (sig, name, name, pid))
 
-    if q.needs_both:
+    if q.per_query:
+        for x, ex in _shader_sets(q, exports):
+            with _Solo(q, x):
+                if x.needs_both or x.needs_intersection:
+                    eps.append(entry(ex['intersection'], '()', 8, False, False))
+                if _loops(x):
+                    eps.append(entry(ex['anyhit'], sig_h, 9, True, True))
+                eps.append(entry(ex['closesthit'], sig_h, 10, True, True))
+                if x.needs_both:
+                    eps.append(entry(ex['closesthitproc'], sig_h, 10, True, True))
+                if x.track_proc:
+                    eps.append(entry(ex['anyhitproc'], sig_h, 9, True, True))
+        eps.append(entry(exports['miss'], sig_p, 11, True, False))
+        eps.append(entry(exports['anyhitnull'], sig_h, 9, True, True))
+    elif q.needs_both:
         eps.append(entry(exports['intersection'], '()', 8, False, False))
         eps.append(entry(exports['anyhit'], sig_h, 9, True, True))
     elif q.needs_intersection:
@@ -3110,13 +3204,14 @@ def _rewrite_metadata(text, md, table, globals_, q, exports, binding=False):
         eps.append(entry(exports['intersection'], '()', 8, False, False))
     elif _loops(q):
         eps.append(entry(exports['anyhit'], sig_h, 9, True, True))
-    eps.append(entry(exports['closesthit'], sig_h, 10, True, True))
-    if q.needs_both:
-        eps.append(entry(exports['closesthitproc'], sig_h, 10, True, True))
-    eps.append(entry(exports['miss'], sig_p, 11, True, False))
-    eps.append(entry(exports['anyhitnull'], sig_h, 9, True, True))
-    if q.track_proc:
-        eps.append(entry(exports['anyhitproc'], sig_h, 9, True, True))
+    if not q.per_query:
+        eps.append(entry(exports['closesthit'], sig_h, 10, True, True))
+        if q.needs_both:
+            eps.append(entry(exports['closesthitproc'], sig_h, 10, True, True))
+        eps.append(entry(exports['miss'], sig_p, 11, True, False))
+        eps.append(entry(exports['anyhitnull'], sig_h, 9, True, True))
+        if q.track_proc:
+            eps.append(entry(exports['anyhitproc'], sig_h, 9, True, True))
     eps.append(entry(exports['isectnull'], '()', 8, False, False))
     eps.append(entry(exports['raygen'], '()', 7, False, False))
 

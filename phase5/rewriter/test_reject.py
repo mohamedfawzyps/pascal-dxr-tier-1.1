@@ -367,14 +367,40 @@ def main():
             print('  FAILED   %-34s refused: %s' % (name, e))
             ok.append(False)
         ok.append(cpp_agrees(name, t, None))
-    for f, why in (('refuse_nested_query.ll', 'cannot call TraceRay'),
-                   ('refuse_twoq_isect.ll', 'which query it serves')):
+    for f, why in (('refuse_nested_query.ll', 'cannot call TraceRay'),):
         path = os.path.join('phase5', 'cases', f)
         if os.path.isfile(path):
             t = load(path)
-            name = 'query nested in a loop' if 'nested' in f else 'two queries, one intersection'
+            name = 'query nested in a loop'
             ok.append(expect_reject(name, t, why))
             ok.append(cpp_agrees(name, t, why))
+
+    # Several queries where one needs an intersection shader (0.77.0; until
+    # then refused, the intersection shader having no payload to read a query
+    # id from): records per query, each TraceRay passing its query id as the
+    # ray contribution, each query its own hit shaders, none reading the id.
+    for f in ('refuse_twoq_isect.ll', 'rayquery_twoqproc.ll', 'rayquery_twoqmix.ll'):
+        path = os.path.join('phase5', 'cases', f)
+        if not os.path.isfile(path):
+            continue
+        t = load(path)
+        name = 'two queries, records per query (%s)' % f.split('_', 1)[1][:-3]
+        try:
+            m = Module(t)
+            out = lower.lower(m, rayquery.analyze(m))
+            rcs = re.findall(r'call void @dx\.op\.traceRay\.[^(]+\(i32 157, %dx\.types\.Handle '
+                             r'[^,]+, i32 [^,]+, i32 [^,]+, i32 (\d+),', out)
+            isects = re.findall(r'^define void @(Isect(?:_q\d+)?)\(\)', out, re.M)
+            good = (rcs == ['0', '1'] and 'Isect_q1' in isects and '%rq.qid = load' not in out
+                    and 'define void @AnyHit_q1(' in out and 'define void @ClosestHit_q1(' in out)
+            print('  %s %-34s %s' % ('ok      ' if good else 'FAILED  ', name,
+                                     'contributions 0 and 1, %s' % ', '.join(isects) if good
+                                     else 'contributions=%s isects=%s' % (rcs, isects)))
+            ok.append(good)
+        except rayquery.Unsupported as e:
+            print('  FAILED   %-34s refused: %s' % (name, e))
+            ok.append(False)
+        ok.append(cpp_agrees(name, t, None))
 
     # Where the payload cannot carry it, refused by name: a loop body that
     # becomes an INTERSECTION shader has no payload in DXR 1.0, and a value

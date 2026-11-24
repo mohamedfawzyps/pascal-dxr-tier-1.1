@@ -906,7 +906,8 @@ std::vector<std::string> IsectOpacity(const Query& q, const std::string& t, bool
     return out;
 }
 
-std::vector<std::string> RecordCommit(const Query& q, bool sm66, int status = 1) {
+std::vector<std::string> RecordCommit(const Query& q, bool sm66, int status = 1,
+                                      bool withOthers = true) {
     const std::string pl = kPayload;
     auto gep = [&](int idx) {
         return "  %rq.cp" + std::to_string(idx) + " = getelementptr inbounds " + pl + ", " + pl +
@@ -938,7 +939,7 @@ std::vector<std::string> RecordCommit(const Query& q, bool sm66, int status = 1)
             if (c.second->DxOp() == kCommittedWorldToObject) w2o = true;
     };
     scan(q);
-    for (const auto& o : q.others) scan(o);
+    if (withOthers) for (const auto& o : q.others) scan(o);
     if (w2o) {
         out.push_back(gep(8));
         for (int r = 0; r < 3; ++r)
@@ -991,6 +992,20 @@ std::vector<std::string> CommittedRead(const llm::Instr& i) {
                       std::to_string(f->align));
     }
     return out;
+}
+
+// Query k's hit shaders with records per query (0.77.0): names ending in
+// _q<k>, query 0's unchanged. See _shader_sets in lower.py.
+Exports PerQueryExports(const Exports& e, int qid) {
+    Exports x = e;
+    if (!qid) return x;
+    const std::string s = "_q" + std::to_string(qid);
+    x.anyhit += s;
+    x.closesthit += s;
+    x.intersection += s;
+    x.closesthitproc += s;
+    x.anyhitproc += s;
+    return x;
 }
 
 LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
@@ -1910,7 +1925,9 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         std::ostringstream tr;
         tr << "  call void @dx.op.traceRay." << std::string(kPayload).substr(1)
            << "(i32 157, %dx.types.Handle " << x.AsHandle() << ", " << flags.second
-           << ", " << mask << ", i32 0, i32 "
+           // Records of its own per query (0.77.0): query k's are the k-th of
+           // each (instance, geometry) in the shim's own layout.
+           << ", " << mask << ", i32 " << (x.perQuery ? x.qid : 0) << ", i32 "
            << (x.needsRecordConstants ? 1 : 0)
            << ", i32 0, " << ra[1] << ", " << ra[2]
            << ", " << ra[3] << ", " << ra[4] << ", " << ra[5] << ", " << ra[6]
@@ -2415,7 +2432,22 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                               "(i32, %dx.types.Handle, i32, i32, i8, i32) #RQRO");
             }
         }
-        if (q.NeedsIntersection() || (q.trackProc && (!q.aborts.empty() || !q.exits.empty()))) {
+        // Each set of hit shaders' needs (one set, or one per query, 0.77.0).
+        std::vector<std::pair<const Query*, std::vector<const Query*>>> sets;
+        if (q.perQuery) {
+            for (const Query* qp : queries)
+                sets.push_back({ qp, qp->hasLoop ? std::vector<const Query*>{ qp }
+                                                 : std::vector<const Query*>{} });
+        } else {
+            std::vector<const Query*> loops;
+            for (const Query* qp : queries) if (qp->hasLoop) loops.push_back(qp);
+            sets.push_back({ &q, loops });
+        }
+        bool reportHit = false;
+        for (const auto& s : sets)
+            reportHit = reportHit || s.first->NeedsIntersection() ||
+                        (s.first->trackProc && (!s.first->aborts.empty() || !s.first->exits.empty()));
+        if (reportHit) {
             add.push_back("");
             add.push_back("; Function Attrs: nounwind");
             add.push_back("declare i1 @dx.op.reportHit." +
@@ -2428,11 +2460,16 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         add.push_back("; Function Attrs: noreturn nounwind");
         add.push_back("declare void @dx.op.ignoreHit(i32) #RQNR");
         {
-            bool anyAbort = false;
-            for (const Query* qp : queries)
-                anyAbort = anyAbort ||
-                           (qp->hasLoop && (!qp->aborts.empty() || !qp->exits.empty() || !qp->chain.empty()));
-            if ((anyAbort && (!q.NeedsIntersection() || q.NeedsBoth())) || q.trackProc) {
+            bool endSearch = false;
+            for (const auto& s : sets) {
+                bool anyAbort = false;
+                for (const Query* qp : s.second)
+                    anyAbort = anyAbort || !qp->aborts.empty() || !qp->exits.empty() || !qp->chain.empty();
+                endSearch = endSearch ||
+                            (anyAbort && (!s.first->NeedsIntersection() || s.first->NeedsBoth())) ||
+                            s.first->trackProc;
+            }
+            if (endSearch) {
                 add.push_back("");
                 add.push_back("; Function Attrs: noreturn nounwind");
                 add.push_back("declare void @dx.op.acceptHitAndEndSearch(i32) #RQNR");
@@ -2469,6 +2506,12 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
     // --- generated shaders ---------------------------------------------------
     {
         std::vector<std::string> fns;
+        // One set of hit shaders (0.77.0): the module's, or with records per
+        // query one per query, seen alone (`solo`). False with r.error set.
+#pragma warning(push)
+#pragma warning(disable : 4456 4457)
+        auto hitShaders = [&](const Query& q, const std::vector<const Query*>& queries,
+                              const Exports& e, bool anyLoop, bool multi, bool solo) -> bool {
         // ONE loop body, TWO shaders when the query commits both kinds. The
         // substitution of CandidateType is what separates them: folded to
         // CANDIDATE_PROCEDURAL_PRIMITIVE the triangle arm dies and this is an
@@ -2556,12 +2599,12 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 const llm::Instr& i = *pi;
                 if (i.DxOp() == kCreateHandle || i.DxOp() == kBindHandle) {
                     const std::string ht = handleText(i);
-                    if (!handleErr.empty()) { r.error = handleErr; return r; }
+                    if (!handleErr.empty()) { r.error = handleErr; return false; }
                     is.push_back(ht);
                 } else if (IsThreadOp(i.DxOp())) {
                     std::string terr;
                     const std::string t = ThreadIndexText(i, m, &terr);
-                    if (!terr.empty()) { r.error = terr; return r; }
+                    if (!terr.empty()) { r.error = terr; return false; }
                     is.push_back(t);
                 } else {
                     is.push_back(i.line);
@@ -2592,7 +2635,13 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     // onto, so it simply goes.
                     if (op == kCommitNonOpaque) continue;
                     if (op == kCommitProcedural) {
-                        const std::string tv = llm::OperandName(i.args[2]);
+                        // A constant t has no name: its text, as rq_operand
+                        // in lower.py (found in 0.77.0; was emitted empty).
+                        std::string tv = llm::OperandName(i.args[2]);
+                        if (tv.empty()) {
+                            const std::string a = Trim(i.args[2]);
+                            tv = a.substr(a.find_last_of(' ') + 1);
+                        }
                         is.push_back("  %rq.rh" + std::to_string(i.index) +
                                      " = call i1 @dx.op.reportHit." +
                                      std::string(kAttrs).substr(1) +
@@ -2668,7 +2717,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                             r.error = "Proceed loop body branches to " + s2 +
                                       ", outside the loop; no lowering is defined "
                                       "for that";
-                            return r;
+                            return false;
                         }
                     is.push_back(line);
                 }
@@ -2818,12 +2867,12 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 const llm::Instr& i = *pi;
                 if (i.DxOp() == kCreateHandle || i.DxOp() == kBindHandle) {
                     const std::string ht = handleText(i);
-                    if (!handleErr.empty()) { r.error = handleErr; return r; }
+                    if (!handleErr.empty()) { r.error = handleErr; return false; }
                     ah.push_back(ht);
                 } else if (IsThreadOp(i.DxOp())) {
                     std::string terr;
                     const std::string t = ThreadIndexText(i, m, &terr);
-                    if (!terr.empty()) { r.error = terr; return r; }
+                    if (!terr.empty()) { r.error = terr; return false; }
                     ah.push_back(t);
                 } else {
                     ah.push_back(i.line);
@@ -3081,7 +3130,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                                 r.error = "Proceed loop body branches to " + s2 +
                                           ", outside the loop; no lowering is defined "
                                           "for that";
-                                return r;
+                                return false;
                             }
                         ah.push_back(line);
                     }
@@ -3205,7 +3254,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             }
             ah.push_back("");
             ah.push_back("rq.accept:");
-            if (track) for (const auto& l : RecordCommit(q, sm66)) ah.push_back(l);
+            if (track) for (const auto& l : RecordCommit(q, sm66, 1, !solo)) ah.push_back(l);
             if (aborts) {
                 // Committed, then Abort(): this hit, and the search ends (0.67.0).
                 ah.push_back("  %rq.aa = load i32, i32* %rq.pab, align 4");
@@ -3375,7 +3424,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 for (const char* l : { "  call void @dx.op.acceptHitAndEndSearch(i32 156)  ; AcceptHitAndEndSearch()",
                                        "  unreachable", "", "rq.prec:" })
                     ap.push_back(l);
-                for (const auto& l : RecordCommit(q, sm66, 2)) ap.push_back(l);
+                for (const auto& l : RecordCommit(q, sm66, 2, !solo)) ap.push_back(l);
                 ap.push_back("  ret void");
                 ap.push_back("}");
                 std::string joinedAp;
@@ -3387,6 +3436,19 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             }
         } else {
             closestHit(e.closesthit, q.NeedsIntersection() ? "2" : "1");
+        }
+
+            return true;
+        };
+#pragma warning(pop)
+        if (q.perQuery) {
+            for (const Query* xp : queries) {
+                const std::vector<const Query*> one{ xp };
+                if (!hitShaders(*xp, one, PerQueryExports(e, xp->qid), xp->hasLoop, false, true))
+                    return r;
+            }
+        } else if (!hitShaders(q, queries, e, anyLoop, multi, false)) {
+            return r;
         }
 
         // Miss
@@ -3543,7 +3605,24 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
 
         std::vector<std::string> ann{ "i32 1", "void ()* @" + e.raygen,
                                       "!" + std::to_string(annRaygen) };
-        if (q.NeedsBoth()) {
+        auto annPush = [&](const std::string& t, int id) {
+            ann.push_back(t);
+            ann.push_back("!" + std::to_string(id));
+        };
+        if (q.perQuery) {
+            // Records per query (0.77.0): each query's set, then the shared ones.
+            for (const Query* xp : queries) {
+                const Exports ex = PerQueryExports(e, xp->qid);
+                if (xp->NeedsBoth() || xp->NeedsIntersection())
+                    annPush("void ()* @" + ex.intersection, annRaygen);
+                if (xp->hasLoop) annPush("void " + sigH + "* @" + ex.anyhit, annHit);
+                annPush("void " + sigH + "* @" + ex.closesthit, annHit);
+                if (xp->NeedsBoth()) annPush("void " + sigH + "* @" + ex.closesthitproc, annHit);
+                if (xp->trackProc) annPush("void " + sigH + "* @" + ex.anyhitproc, annHit);
+            }
+            annPush("void " + sigP + "* @" + e.miss, annMiss);
+            annPush("void " + sigH + "* @" + e.anyhitnull, annHit);
+        } else if (q.NeedsBoth()) {
             // An intersection shader is void(), so it annotates like a raygen.
             ann.push_back("void ()* @" + e.intersection);
             ann.push_back("!" + std::to_string(annRaygen));
@@ -3557,19 +3636,21 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             ann.push_back("void " + sigH + "* @" + e.anyhit);
             ann.push_back("!" + std::to_string(annHit));
         }
-        ann.push_back("void " + sigH + "* @" + e.closesthit);
-        ann.push_back("!" + std::to_string(annHit));
-        if (q.NeedsBoth()) {
-            ann.push_back("void " + sigH + "* @" + e.closesthitproc);
+        if (!q.perQuery) {
+            ann.push_back("void " + sigH + "* @" + e.closesthit);
             ann.push_back("!" + std::to_string(annHit));
-        }
-        ann.push_back("void " + sigP + "* @" + e.miss);
-        ann.push_back("!" + std::to_string(annMiss));
-        ann.push_back("void " + sigH + "* @" + e.anyhitnull);
-        ann.push_back("!" + std::to_string(annHit));
-        if (q.trackProc) {
-            ann.push_back("void " + sigH + "* @" + e.anyhitproc);
+            if (q.NeedsBoth()) {
+                ann.push_back("void " + sigH + "* @" + e.closesthitproc);
+                ann.push_back("!" + std::to_string(annHit));
+            }
+            ann.push_back("void " + sigP + "* @" + e.miss);
+            ann.push_back("!" + std::to_string(annMiss));
+            ann.push_back("void " + sigH + "* @" + e.anyhitnull);
             ann.push_back("!" + std::to_string(annHit));
+            if (q.trackProc) {
+                ann.push_back("void " + sigH + "* @" + e.anyhitproc);
+                ann.push_back("!" + std::to_string(annHit));
+            }
         }
         // An intersection shader is void(), so it annotates like the raygen.
         ann.push_back("void ()* @" + e.isectnull);
@@ -3612,18 +3693,32 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
 
         // Shader kind 8. An intersection shader carries neither a payload
         // size nor an attribute size, exactly as DXC emits it.
-        if (q.NeedsBoth()) {
+        if (q.perQuery) {
+            for (const Query* xp : queries) {
+                const Exports ex = PerQueryExports(e, xp->qid);
+                if (xp->NeedsBoth() || xp->NeedsIntersection())
+                    eps.push_back(entry(ex.intersection, "()", 8, false, false));
+                if (xp->hasLoop) eps.push_back(entry(ex.anyhit, sigH, 9, true, true));
+                eps.push_back(entry(ex.closesthit, sigH, 10, true, true));
+                if (xp->NeedsBoth()) eps.push_back(entry(ex.closesthitproc, sigH, 10, true, true));
+                if (xp->trackProc) eps.push_back(entry(ex.anyhitproc, sigH, 9, true, true));
+            }
+            eps.push_back(entry(e.miss, sigP, 11, true, false));
+            eps.push_back(entry(e.anyhitnull, sigH, 9, true, true));
+        } else if (q.NeedsBoth()) {
             eps.push_back(entry(e.intersection, "()", 8, false, false));
             eps.push_back(entry(e.anyhit, sigH, 9, true, true));
         } else if (q.NeedsIntersection())
             eps.push_back(entry(e.intersection, "()", 8, false, false));
         else if (anyLoop) eps.push_back(entry(e.anyhit, sigH, 9, true, true));
-        eps.push_back(entry(e.closesthit, sigH, 10, true, true));
-        if (q.NeedsBoth())
-            eps.push_back(entry(e.closesthitproc, sigH, 10, true, true));
-        eps.push_back(entry(e.miss, sigP, 11, true, false));
-        eps.push_back(entry(e.anyhitnull, sigH, 9, true, true));
-        if (q.trackProc) eps.push_back(entry(e.anyhitproc, sigH, 9, true, true));
+        if (!q.perQuery) {
+            eps.push_back(entry(e.closesthit, sigH, 10, true, true));
+            if (q.NeedsBoth())
+                eps.push_back(entry(e.closesthitproc, sigH, 10, true, true));
+            eps.push_back(entry(e.miss, sigP, 11, true, false));
+            eps.push_back(entry(e.anyhitnull, sigH, 9, true, true));
+            if (q.trackProc) eps.push_back(entry(e.anyhitproc, sigH, 9, true, true));
+        }
         eps.push_back(entry(e.isectnull, "()", 8, false, false));
         eps.push_back(entry(e.raygen, "()", 7, false, false));
 

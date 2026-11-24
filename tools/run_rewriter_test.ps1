@@ -174,7 +174,13 @@ $cases = @(
     @{ name = 'carrytypes'; src = 'phase5\cases\rayquery_carrytypes.ll'; pat = 'alpha'; flags = @('--geom');
        norender = $true; desc = 'double, i64 and half carried' },
     @{ name = 'toploopstate'; src = 'phase5\cases\rayquery_toploopstate.ll'; pat = 'alpha'; flags = @('--geom');
-       norender = $true; desc = 'a top-tested loop whose state leaves it' }
+       norender = $true; desc = 'a top-tested loop whose state leaves it' },
+    # Several queries, one needing an intersection shader (0.77.0): records
+    # per query, drawn only in the shim's own layout, so not through --lib.
+    @{ name = 'twoqproc'; src = 'phase5\cases\rayquery_twoqproc.ll'; pat = 'alpha'; flags = @('--mixed');
+       norender = $true; desc = 'two procedural queries, records per query' },
+    @{ name = 'twoqmix'; src = 'phase5\cases\rayquery_twoqmix.ll'; pat = 'alpha'; flags = @('--mixed');
+       norender = $true; desc = 'a triangle query and a procedural one' }
 )
 
 if (-not (Test-Path 'phase5\dxil\rayquery_opaque.ll')) {

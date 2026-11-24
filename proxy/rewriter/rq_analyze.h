@@ -163,6 +163,9 @@ struct Query {
     std::vector<Query> others;
     std::string pfx = "rq";
     int qid = 0;
+    // Several queries where one needs an intersection shader (0.77.0): each
+    // query gets hit shaders and records of its own; see rayquery.py.
+    bool perQuery = false;
     // One query traced more than once (0.73.0): each search is a query of its
     // own, owning the ops it reaches; see rayquery.py. The search (trace
     // indices), the search of every op on the handle, the traces that start

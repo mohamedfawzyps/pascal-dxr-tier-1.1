@@ -463,7 +463,18 @@ $cases = @(
     @{ name = 'carrytypess'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_carrytypes.hlsl', '--geom', '--stack'); desc = 'the same, two candidates' },
     @{ name = 'carrytypesm'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_carrytypes.hlsl', '--multi'); desc = 'the same, two instances' },
     @{ name = 'toploopstate'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_toploopstate.hlsl', '--geom'); desc = 'a top-tested loop whose state leaves it' },
-    @{ name = 'toploopstatem'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_toploopstate.hlsl', '--multi'); desc = 'the same, two instances' }
+    @{ name = 'toploopstatem'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_toploopstate.hlsl', '--multi'); desc = 'the same, two instances' },
+    # Several queries, one needing an intersection shader (0.77.0, plan step
+    # 3 k): each query its own hit shaders and records, in the own layout.
+    @{ name = 'twoqproc'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_twoqproc.hlsl', '--mixed'); desc = 'two procedural queries with different bodies' },
+    @{ name = 'twoqprocc'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_twoqproc.hlsl', '--mixed', '--contrib'); desc = 'the same, the kinds on their own records' },
+    @{ name = 'twoqprocp'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_twoqproc.hlsl', '--proc'); desc = 'the same, boxes only' },
+    @{ name = 'twoqmix'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_twoqmix.hlsl', '--mixed'); desc = 'a triangle query and a procedural one' },
+    @{ name = 'twoqmixc'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_twoqmix.hlsl', '--mixed', '--contrib'); desc = 'the same, the kinds on their own records' },
+    # Tracked procedural queries in the own layout (0.77.0): until then its
+    # state object had no AnyHitProc and failed to build (E_INVALIDARG).
+    @{ name = 'ownprocabort'; pat = 'alpha'; envv = 'DXR_TIER11_RQOWN'; extra = @('--cs', 'phase5\cases\rayquery_proc_abortmix.hlsl', '--mixed', '--contrib'); desc = 'Abort() in a procedural query, the own layout forced' },
+    @{ name = 'ownprocbreak'; pat = 'alpha'; envv = 'DXR_TIER11_RQOWN'; extra = @('--cs', 'phase5\cases\rayquery_proc_break.hlsl', '--proc', '--stack'); desc = 'a break out of a procedural body, the own layout forced' }
 )
 
 $failed = 0
@@ -476,8 +487,12 @@ foreach ($c in $cases) {
 
     # WARP runs RayQuery natively; the 1070 runs it only because of the shim.
     & .\raytest.exe warp rayquery $c.pat $a @($c.extra) | Out-Null
+    # A case may set one variable for the hardware run (0.77.0).
+    if ($c.envv) { Set-Item "env:$($c.envv)" '1' }
     & .\raytest.exe hw   rayquery $c.pat $b @($c.extra) | Out-Null
-    if ($LASTEXITCODE -ne 0) {
+    $hwExit = $LASTEXITCODE
+    if ($c.envv) { Remove-Item "env:$($c.envv)" }
+    if ($hwExit -ne 0) {
         Write-Host '  the hardware run FAILED; the dispatch path did not take over'
         $failed++
         Remove-Item $a, $b -ErrorAction SilentlyContinue
@@ -827,7 +842,7 @@ $env:DXR_TIER11 = ''
 # twoexits (the code after the loop that the original skipped) must DIVERGE;
 # with the procedural abort poison, procbreakstack must too.
 Write-Host ''
-Write-Host '=== exits, retraces, Proceed() chains, aborts outside the loop, carried values ==='
+Write-Host '=== exits, retraces, chains, aborts outside the loop, carried values, records per query ==='
 $env:DXR_TIER11 = '1'
 $xg = @(
     @{ n = 'breakstack'; v = 'DXR_TIER11_EXIT_POISON'; x = @('--cs', 'phase5\cases\rayquery_break.hlsl', '--geom', '--stack') },
@@ -848,7 +863,10 @@ $xg = @(
     # Carried values (0.76.0): the high word of an i64 or double dropped, and
     # no iteration storing its state.
     @{ n = 'carrytypes'; v = 'DXR_TIER11_CARRY_POISON'; x = @('--cs', 'phase5\cases\rayquery_carrytypes.hlsl', '--geom') },
-    @{ n = 'carrymany'; v = 'DXR_TIER11_STATE_POISON'; x = @('--cs', 'phase5\cases\rayquery_carrymany.hlsl', '--geom', '--stack') }
+    @{ n = 'carrymany'; v = 'DXR_TIER11_STATE_POISON'; x = @('--cs', 'phase5\cases\rayquery_carrymany.hlsl', '--geom', '--stack') },
+    # Records per query (0.77.0): every query's boxes served by query 0's
+    # intersection shader.
+    @{ n = 'twoqproc'; v = 'DXR_TIER11_PERQUERY_POISON'; x = @('--cs', 'phase5\cases\rayquery_twoqproc.hlsl', '--mixed') }
 )
 foreach ($g in $xg) {
     $x = $g.x

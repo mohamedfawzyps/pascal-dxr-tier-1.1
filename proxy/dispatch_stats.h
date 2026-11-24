@@ -32,6 +32,7 @@ enum Counter {
     kRefusedUnread,       // resolved to a structure whose instances are not read yet
     kRefusedUnknownBlas,  // an instance on a bottom-level structure of unknown geometry
     kOwnLayout,           // of those drawn, in the shim's own record layout (0.61.0)
+    kRefusedPerQuery,     // records per query (0.77.0) and the own layout cannot serve it
     kCount
 };
 

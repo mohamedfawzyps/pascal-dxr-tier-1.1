@@ -20,12 +20,12 @@ uint64_t g_printed[kCount] = {};
 
 void Line(const uint64_t* c, const char* when, const std::string& live) {
     const uint64_t refused = c[kRefusedCrossLive] + c[kRefusedOneTlas] + c[kRefusedProcedural] +
-                             c[kRefusedUnread] + c[kRefusedUnknownBlas];
+                             c[kRefusedUnread] + c[kRefusedUnknownBlas] + c[kRefusedPerQuery];
     ProxyLog("[dxr-tier-11-proxy-log] stats%s: lowered dispatches DRAWN %llu (%llu indirect, "
              "%llu in the shim's own record layout), "
              "REFUSED %llu (two live structures disagree %llu, one structure disagrees %llu, "
              "procedural collapse %llu, scene not read yet %llu, unknown bottom-level "
-             "structure %llu), scene resolved %llu, not "
+             "structure %llu, records per query %llu), scene resolved %llu, not "
              "resolved %llu, table unbuildable %llu, held back %llu, indirect "
              "with zero groups %llu; tables built %llu (into a spare %llu), reused %llu, "
              "buffers freed %llu; top-level reads: new "
@@ -36,6 +36,7 @@ void Line(const uint64_t* c, const char* when, const std::string& live) {
              (unsigned long long)refused, (unsigned long long)c[kRefusedCrossLive],
              (unsigned long long)c[kRefusedOneTlas], (unsigned long long)c[kRefusedProcedural],
              (unsigned long long)c[kRefusedUnread], (unsigned long long)c[kRefusedUnknownBlas],
+             (unsigned long long)c[kRefusedPerQuery],
              (unsigned long long)c[kSceneResolved],
              (unsigned long long)c[kSceneUnresolved],
              (unsigned long long)c[kSkippedTable], (unsigned long long)c[kHeldBack],

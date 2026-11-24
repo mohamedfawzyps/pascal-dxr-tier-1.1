@@ -112,6 +112,18 @@ public:
     bool Tracks() const { return m_track; }
     bool CommitsProcedural() const { return m_servesProc; }
 
+    // Several queries where one needs an intersection shader (0.77.0): each
+    // query has hit shaders and records of its own, its TraceRay passing its
+    // query id as the ray contribution, so it is drawn only in the shim's own
+    // record layout, where every (instance, geometry) has one record per
+    // query. One per query, in query order; empty otherwise.
+    struct QueryShape {
+        bool anyHit = false;      // its triangle hit group has its any-hit
+        bool needsBoth = false;   // it has a procedural hit group too
+        bool trackProc = false;   // which has the procedural any-hit
+    };
+    bool NeedsOwn() const { return !m_perQuery.empty(); }
+
     // Where the lowered library's TraceRay calls take their scene from, read
     // off the lowered text, so a dispatch can be judged against the ONE scene
     // it traces (gidx::ResolveScenes) instead of every live one.
@@ -217,7 +229,9 @@ private:
         ID3D12RootSignature* raygenRs = nullptr;   // the copies' root SRVs, and the key table
         ID3D12RootSignature* localRs = nullptr;    // the hit groups' pair, as m_localRs
         uint8_t idRay[32]{}, idMiss[32]{}, idNullTri[32]{}, idNullProc[32]{};
-        std::array<uint8_t, 32> idHit{}, idHitProc{};
+        // The real hit groups: one, or one per query with records per query
+        // (0.77.0), the procedural one the rejecting one where a query has none.
+        std::vector<std::array<uint8_t, 32>> idHit, idHitProc;
         std::vector<UINT> caps;                    // scenes per slot
         // 0: a root SRV per scene copy. 1: past the local root signature
         // size the GTX 1070 takes, the copies in one descriptor table, in the
@@ -255,6 +269,10 @@ private:
     bool m_recordConstants = false;
     // The lowered query reads committed state inside its loop (0.66.0).
     bool m_track = false;
+    // Tracked procedural (0.71.0): the procedural hit group has AnyHitProc.
+    // Kept for the shim's own layout, which until 0.77.0 built without it.
+    bool m_trackProc = false;
+    std::vector<QueryShape> m_perQuery;   // see NeedsOwn
     gidx::Scenes m_scenes;
     ID3D12RootSignature* m_localRs = nullptr;   // owned; null without record data
     // What the current table's records point at, one pair per record.

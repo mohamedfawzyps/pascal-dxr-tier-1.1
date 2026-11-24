@@ -1,8 +1,8 @@
-// A REFUSAL case: two queries in one entry point, one of which commits
-// PROCEDURAL hits and so becomes an intersection shader. Several queries share
-// one generated hit group and pick their loop body from the payload; an
-// intersection shader has no payload in DXR 1.0, so it cannot tell which query
-// it serves. Refused by name until that has another route.
+// Two queries in one entry point, one of which commits PROCEDURAL hits and so
+// becomes an intersection shader. Refused until 0.77.0: several queries
+// shared one generated hit group and picked their loop body from the payload,
+// and an intersection shader has no payload. Since 0.77.0 each query has hit
+// shaders and records of its own (test_reject.py checks it lowers so).
 //
 // Named refuse_* so the render suite does not pick it up as a case.
 cbuffer CB : register(b0) {

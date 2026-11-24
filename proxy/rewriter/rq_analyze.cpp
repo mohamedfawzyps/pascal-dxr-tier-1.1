@@ -1000,18 +1000,12 @@ static std::string MergeTraces(const llm::Function& fn, Query& q,
     return "";
 }
 
+// Queries with records of their own (0.77.0): one scene copy holds 15 ray
+// contributions (shimscene::PairsPerStructure).
+const size_t kMaxPerQuery = 15;
+
 std::string CheckQueries(const llm::Function& fn, const std::vector<Query>& qs) {
-    std::string names;
-    for (size_t k = 0; k < qs.size(); ++k) {
-        if (k) names += ", ";
-        names += qs[k].handle;
-    }
     for (const auto& q : qs) {
-        if (q.NeedsBoth())
-            return std::to_string(qs.size()) + " RayQuery objects in " + fn.name + " (" +
-                   names + "), and query " + q.handle + " becomes an intersection "
-                   "shader, which cannot read the payload field that says which query "
-                   "it serves";
         if (!q.hasLoop) continue;
         for (const auto& label : q.loop.body) {
             const llm::Block* blk = fn.FindBlock(label);
@@ -1146,6 +1140,19 @@ AnalyzeResult Analyze(const llm::Module& m) {
     if (qs.size() > 1) {
         const std::string err = CheckQueries(fn, qs);
         if (!err.empty()) { r.error = err; return r; }
+        bool any = false;
+        for (const auto& q : qs) any = any || q.NeedsBoth();
+        if (any) {
+            // Its own records per query (0.77.0): the shim's own layout keeps
+            // up to 15 ray contributions per scene copy.
+            if (qs.size() > kMaxPerQuery) {
+                r.error = std::to_string(qs.size()) + " RayQuery objects in " + fn.name +
+                          ", one needing an intersection shader; records of their own are "
+                          "made for at most " + std::to_string(kMaxPerQuery);
+                return r;
+            }
+            for (auto& q : qs) q.perQuery = true;
+        }
     }
     for (auto& q : qs) {
         std::string err = RejectFunction(fn, q);

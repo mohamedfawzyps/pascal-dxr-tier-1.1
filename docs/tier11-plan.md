@@ -148,6 +148,12 @@ code (`rq_analyze.cpp`, `rq_lower.cpp`) on 2026-09-26, not from memory:
   state leaves it was not lowered (a GEP defined twice).
 - k. Several queries where one needs an intersection shader: give each
   query its own hit group offset, so no query id has to travel in a payload.
+  DONE 0.77.0: each query its own hit shaders, its TraceRay passing its
+  query id as the ray contribution, drawn in the shim's own record layout.
+  Found doing it, fixed: the own layout of a tracked procedural query never
+  built, and own-layout records assumed one contribution per instance. Left
+  of it on the limits list: more than 15 such queries, and such a shader
+  whose scene is not resolved.
 - l. A query used inside another query's loop (nested), and a dynamically
   indexed resource inside the loop.
 
@@ -203,7 +209,11 @@ Three-form matrix, dispatch suite, an Escher run. Then the limits list:
 - `Proceed()` without a loop: a call nested in the body of the one before, a
   write between two calls that a later body may read, a body with more than
   one way out, a chain in a query serving procedural primitives (0.74.0);
-- an `Abort()` between two `Proceed()` calls without a loop (0.75.0).
+- an `Abort()` between two `Proceed()` calls without a loop (0.75.0);
+- several queries where one needs an intersection shader: more than 15 of
+  them (one scene copy holds 15 ray contributions), or a scene not resolved
+  through the root signature (the application's record layout has no room
+  for records per query) (0.77.0).
 
 ## Size
 

@@ -24,6 +24,55 @@ not.
 
 ---
 
+## 0.77.0
+
+**Plan step 3 k: several queries where one needs an intersection shader.**
+Several queries in one entry point (0.43.0) shared one set of hit shaders,
+the any-hit choosing the loop body by a query id the raygen stores in the
+payload. An intersection shader has no payload, so a shader with several
+queries where one serves procedural primitives was refused.
+
+- **Records per query.** In such a shader every query now gets hit shaders of
+  its own, generated exactly as for a shader with that query alone
+  (`AnyHit_q1`, `Isect_q1`, `ClosestHit_q1`, `ClosestHitProc_q1`,
+  `AnyHitProc_q1`; query 0's names unchanged), and its TraceRay passes its
+  query id as the ray contribution. No query id is read by any of them.
+- **Drawn in the shim's own record layout** (0.61.0), where the shim sets
+  every instance's contribution: with Q queries the scene copy keeps Q ray
+  contributions per (instance, geometry), the retraced calls pass multiplier
+  Q, and record (i, g, k) holds query k's hit group of the kind instance i's
+  geometry is, the rejecting procedural one where query k serves no boxes.
+  Refused by name: a scene not resolved (the application's layout has no
+  room for records per query), and more than 15 queries (one scene copy
+  holds 15 ray contributions).
+- **Found doing it, fixed:**
+  - The shim's own layout of a tracked procedural query (0.71.0) never had
+    its procedural any-hit: the state object was built without it and
+    `CreateStateObject` failed (E_INVALIDARG), so such a query, wherever its
+    scene needed the own layout, was refused ("could not draw it either").
+    Measured: 8 of 8 procedural abort and break cases with the own layout
+    forced fell back on 0.76.0; on 0.77.0 all 8 draw in it and match WARP.
+  - The own layout wrote record (i, g) at `base + i * gmax + g`, right only
+    while the scene copy holds one ray contribution per instance; a
+    `GeometryIndex()` variant asking for more in the same process makes the
+    copy hold more, and the records then sat where no ray looked. Now
+    `base + i * kc * gmax + g * Q + k`, the copy's own stride.
+  - The C++ rewriter emitted an empty operand for a procedural commit at a
+    constant t (`ReportHit(float , ...)`); the Python wrote the constant.
+    Reached by the old refusal case once it lowered.
+- **Tests.** `rayquery_twoqproc.hlsl` (two procedural queries committing
+  boxes at different planes, triangles under different rules) and
+  `rayquery_twoqmix.hlsl` (a triangle query and a procedural one) match WARP
+  on mixed scenes, with and without the kinds on their own records, and on
+  boxes only. `DXR_TIER11_PERQUERY_POISON=1` (every query's boxes served by
+  query 0's intersection shader) diverges in 7396 rays. Every dispatch case
+  with the own layout forced: 133 of 133 match. Byte-identical in both
+  rewriters on 76 lowered cases; rewriter checks 74 of 74 (the old refusal is
+  an acceptance now); dispatch suite 142 of 142.
+- **Escher unchanged:** all 845 dumped Unreal shader inputs lower
+  byte-identically to 0.76.0. None of them has a query needing an
+  intersection shader.
+
 ## 0.76.0
 
 **Plan step 3 j: more than 16 carried values, and carried values of other

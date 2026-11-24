@@ -233,6 +233,11 @@ class Query(object):
         self.others = []
         self.pfx = 'rq'
         self.qid = 0
+        # Several queries where one needs an intersection shader (0.77.0):
+        # each query gets hit shaders and records of its own, its TraceRay
+        # passing its query id as the ray contribution, because an
+        # intersection shader has no payload to read a query id from.
+        self.per_query = False
         # One query traced more than once (0.73.0): each search is a query of
         # its own here, owning the ops it reaches. (its traces, owner
         # function); the traces that start it, more than one where a branch
@@ -504,6 +509,16 @@ def analyze(module, fn_name=None):
     # refused for THAT, not for whatever it happens to read there.
     if len(queries) > 1:
         _check_queries(fn, queries)
+        if any(x.needs_both for x in queries):
+            # Its own records per query (0.77.0): the shim's own layout keeps
+            # up to 15 ray contributions per scene copy.
+            if len(queries) > MAX_PER_QUERY:
+                raise Unsupported(
+                    '%d RayQuery objects in %s, one needing an intersection shader; '
+                    'records of their own are made for at most %d'
+                    % (len(queries), fn.name, MAX_PER_QUERY))
+            for x in queries:
+                x.per_query = True
     for q in queries:
         _reject_function(fn, q)
         # Classify here rather than on demand, so that a shape with no defined
@@ -645,6 +660,11 @@ def _merge_traces(fn, q, owner):
     q.route_block = p
 
 
+# Queries with records of their own (0.77.0): one scene copy holds 15 ray
+# contributions (shimscene::PairsPerStructure).
+MAX_PER_QUERY = 15
+
+
 def _check_queries(fn, queries):
     """Several queries in one entry point, 0.43.0.
 
@@ -653,13 +673,7 @@ def _check_queries(fn, queries):
     each trace. 33 of Unreal's Lumen and Niagara shaders are this shape, two
     queries one after the other. The check this replaces counted
     ALLOCATIONS and called them concurrent; what actually matters is below."""
-    names = ', '.join(q.handle for q in queries)
     for q in queries:
-        if q.needs_both:
-            raise Unsupported(
-                '%d RayQuery objects in %s (%s), and query %s becomes an '
-                'intersection shader, which cannot read the payload field that '
-                'says which query it serves' % (len(queries), fn.name, names, q.handle))
         if not q.loop:
             continue
         others = [x.handle for x in queries if x is not q and x.handle != q.handle]

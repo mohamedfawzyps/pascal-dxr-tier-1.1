@@ -283,6 +283,15 @@ static bool RayQueryOwnForced() {
     return f;
 }
 
+// Records per query (0.77.0): drawn only in the shim's own layout, so its
+// reason there, and its refusal when the scene is not resolved.
+static const char kPerQueryWhy[] =
+    "its queries have records of their own (several queries, one needing an intersection "
+    "shader), which only the shim's own record layout has";
+static const char kPerQueryUnresolved[] =
+    "its scene is not resolved, and its queries have records of their own, which only the "
+    "shim's own record layout has";
+
 // A lowered RayQuery dispatch in the shim's own record layout (0.61.0), for
 // a scene whose layout the ordinary table cannot serve (`layout`, the
 // refusal counter TableWouldBeWrong handed back, `conflict` its reason), or
@@ -374,19 +383,23 @@ void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) {
                                                       exact ? &layout : nullptr, m_rqPso->Tracks());
         // A layout the table cannot serve: the shim's own, where every
         // (instance, geometry) has a record (0.61.0; until then refused).
-        if (exact && (wrong ? layout >= 0 : RayQueryOwnForced())) {
+        const bool perQuery = m_rqPso->NeedsOwn();
+        if (exact && (perQuery || (wrong ? layout >= 0 : RayQueryOwnForced()))) {
             gidx::SceneSel sel;
             ScenesSel(m_rqPso->Scenes(), m_bindings, &sel);
+            const bool own = wrong && layout >= 0;
             if (RayQueryOwn(m_rqPso, m_real, x, y, z, sel, nullptr, this,
                             [this] { RestoreComputeAfterCapture(); }, m_bindings.heaps,
-                            wrong ? layout : -1, why) ||
-                wrong)
+                            own ? layout : perQuery ? (int)dstats::kRefusedPerQuery : -1,
+                            own || !perQuery ? why : std::string(kPerQueryWhy)) ||
+                wrong || perQuery)
                 return;
-        } else if (wrong) {
+        } else if (wrong || perQuery) {
+            if (!wrong) dstats::Add(dstats::kRefusedPerQuery);
             static LONG once = 0;
             if (InterlockedCompareExchange(&once, 1, 0) == 0)
                 ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch REFUSED: %s. "
-                         "Nothing is drawn for it.\n", why.c_str());
+                         "Nothing is drawn for it.\n", wrong ? why.c_str() : kPerQueryUnresolved);
             return;
         }
         // What geometry reaches each hit group record index, read from the
@@ -1682,15 +1695,18 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
                 const bool wrong = astrack::TableWouldBeWrong(pend.rq->CommitsProcedural(), &why,
                                                               only, only ? &layout : nullptr,
                                                               pend.rq->Tracks());
-                if (only && (wrong ? layout >= 0 : RayQueryOwnForced())) {
+                const bool perQuery = pend.rq->NeedsOwn();
+                if (only && (perQuery || (wrong ? layout >= 0 : RayQueryOwnForced()))) {
+                    const bool own = wrong && layout >= 0;
                     rqOwn = true;
-                    rqLayout = wrong ? layout : -1;
-                    rqConflict = why;
-                } else if (wrong) {
+                    rqLayout = own ? layout : perQuery ? (int)dstats::kRefusedPerQuery : -1;
+                    rqConflict = own || !perQuery ? why : std::string(kPerQueryWhy);
+                } else if (wrong || perQuery) {
+                    if (!wrong) dstats::Add(dstats::kRefusedPerQuery);
                     static LONG onceWrong = 0;
                     if (InterlockedCompareExchange(&onceWrong, 1, 0) == 0)
                         ProxyLog("[dxr-tier-11-proxy-log] lowered RayQuery dispatch REFUSED: %s. "
-                                 "Nothing is drawn for it.\n", why.c_str());
+                                 "Nothing is drawn for it.\n", wrong ? why.c_str() : kPerQueryUnresolved);
                     continue;
                 }
             } else if (pend.giDirect) {

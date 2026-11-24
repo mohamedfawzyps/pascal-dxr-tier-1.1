@@ -165,6 +165,17 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.77.0: PLAN STEP 3 k DONE, SEVERAL QUERIES WHERE ONE NEEDS AN
+INTERSECTION SHADER.** Each query gets hit shaders of its own and passes its
+query id as the ray contribution, so no shader reads a query id; drawn in
+the shim's own record layout, Q contributions per (instance, geometry).
+Fixed on the way: the own layout of a tracked procedural query never built
+(no AnyHitProc, E_INVALIDARG, so refused), and own-layout records assumed a
+copy with one contribution per instance. Forced own layout: 133 of 133
+dispatch cases match. Escher 845 of 845 byte-identical. NEXT: plan step 3 l
+(a query nested in another's loop, a dynamically indexed resource inside the
+loop).
+
 **0.76.0: PLAN STEP 3 j DONE, CARRIED VALUES PAST 16 AND OF OTHER TYPES.**
 DXR sets no payload limit, so the 1070 was swept against WARP: every 4 bytes
 from 132 to 1032, and 1500 to 8192 bytes, all right (16384: the compiler's

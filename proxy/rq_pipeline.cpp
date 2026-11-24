@@ -63,6 +63,8 @@ struct Xform {
     int carried = 0;
     int threads[3] = { 1, 1, 1 };
     gidx::Scenes scenes;   // where the lowered TraceRay calls take their scene
+    // Records per query (0.77.0): one set of hit groups per query.
+    std::vector<Dxr11RayQueryPso::QueryShape> perQuery;
 };
 
 // What the shim decided about this shader, in one line, so sotest can rebuild
@@ -101,6 +103,18 @@ bool DoLower(const std::string& in, std::string* out, std::string* why, void* ct
     x->track = a.query.track;
     x->trackProc = a.query.trackProc;
     for (const auto& o : a.query.others) x->track = x->track || o.track;
+    x->perQuery.clear();
+    if (a.query.perQuery) {
+        auto shape = [](const rq::Query& q) {
+            Dxr11RayQueryPso::QueryShape s;
+            s.anyHit = q.hasLoop;
+            s.needsBoth = q.NeedsBoth();
+            s.trackProc = q.trackProc;
+            return s;
+        };
+        x->perQuery.push_back(shape(a.query));
+        for (const auto& o : a.query.others) x->perQuery.push_back(shape(o));
+    }
     x->appends = l.appends;
     x->payloadBytes = (UINT)l.payloadBytes;
     x->carried = l.carried;
@@ -136,8 +150,19 @@ struct Built {
 bool BuildStateObject(ID3D12Device5* dev, const std::vector<uint8_t>& lib,
                       const Xform& x, ID3D12RootSignature* globalRs,
                       Built* out, std::string* why, UINT raygenSrvs = 0, UINT raygenTable = 0) {
-    const size_t copies = 1;
-    auto Name = [&](const wchar_t* base, size_t) { return std::wstring(base); };
+    // One set of hit groups, or with records per query one per query
+    // (0.77.0), query k's names ending in _q<k> as the lowering names its
+    // shaders (query 0's unchanged).
+    struct Set { bool anyHit, both, isect, trackProc; };
+    std::vector<Set> sets;
+    if (x.perQuery.empty())
+        sets.push_back({ x.hasAnyHit, x.needsBoth, x.hasIntersection, x.trackProc });
+    else
+        for (const auto& s : x.perQuery) sets.push_back({ s.anyHit, s.needsBoth, s.needsBoth, s.trackProc });
+    const size_t copies = sets.size();
+    auto Name = [&](const wchar_t* base, size_t k) {
+        return k ? std::wstring(base) + L"_q" + std::to_wstring(k) : std::wstring(base);
+    };
 
     D3D12_DXIL_LIBRARY_DESC libDesc{};
     libDesc.DXILLibrary.pShaderBytecode = lib.data();
@@ -152,7 +177,7 @@ bool BuildStateObject(ID3D12Device5* dev, const std::vector<uint8_t>& lib,
     // points into them, so nothing reallocates under a pointer.
     std::vector<std::wstring> names;
     names.reserve(copies * 6);
-    std::vector<D3D12_HIT_GROUP_DESC> hgs(copies), hgProcs(x.needsBoth ? copies : 0);
+    std::vector<D3D12_HIT_GROUP_DESC> hgs(copies), hgProcs(copies);
     std::vector<std::wstring> procAnyHitNames;
     for (size_t k = 0; k < copies; ++k) procAnyHitNames.push_back(Name(L"AnyHitProc", k));
     for (size_t k = 0; k < copies; ++k) {
@@ -165,10 +190,11 @@ bool BuildStateObject(ID3D12Device5* dev, const std::vector<uint8_t>& lib,
     }
     for (size_t k = 0; k < copies; ++k) {
         const std::wstring* n = &names[k * 6];
+        const Set& st = sets[k];
         D3D12_HIT_GROUP_DESC& hg = hgs[k];
         hg.HitGroupExport = n[0].c_str();
         hg.ClosestHitShaderImport = n[1].c_str();
-        if (x.needsBoth) {
+        if (st.both) {
             hg.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
             hg.AnyHitShaderImport = n[2].c_str();
             D3D12_HIT_GROUP_DESC& hp = hgProcs[k];
@@ -178,13 +204,13 @@ bool BuildStateObject(ID3D12Device5* dev, const std::vector<uint8_t>& lib,
             hp.ClosestHitShaderImport = n[5].c_str();
             // Every procedural hit, traced forced non-opaque, reaches it: it
             // records commits and ends the search for an abort (0.71.0).
-            if (x.trackProc) hp.AnyHitShaderImport = procAnyHitNames[k].c_str();
-        } else if (x.hasIntersection) {
+            if (st.trackProc) hp.AnyHitShaderImport = procAnyHitNames[k].c_str();
+        } else if (st.isect) {
             hg.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
             hg.IntersectionShaderImport = n[3].c_str();
         } else {
             hg.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
-            if (x.hasAnyHit) hg.AnyHitShaderImport = n[2].c_str();
+            if (st.anyHit) hg.AnyHitShaderImport = n[2].c_str();
         }
     }
 
@@ -223,8 +249,7 @@ bool BuildStateObject(ID3D12Device5* dev, const std::vector<uint8_t>& lib,
     ID3D12RootSignature* localRs = nullptr;
     D3D12_LOCAL_ROOT_SIGNATURE lrs{};
     D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION assoc{};
-    const wchar_t* hitExports[4] = {};
-    UINT hitExportCount = 0;
+    std::vector<const wchar_t*> hitExports;
     if (x.needsRecordConstants) {
         D3D12_ROOT_PARAMETER rp{};
         rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -251,12 +276,14 @@ bool BuildStateObject(ID3D12Device5* dev, const std::vector<uint8_t>& lib,
             return false;
         }
         lrs.pLocalRootSignature = localRs;
-        hitExports[hitExportCount++] = names[0].c_str();          // HitGroup
-        if (x.needsBoth) hitExports[hitExportCount++] = names[4].c_str();
-        hitExports[hitExportCount++] = L"HitGroupNullTri";
-        hitExports[hitExportCount++] = L"HitGroupNullProc";
-        assoc.NumExports = hitExportCount;
-        assoc.pExports = hitExports;
+        for (size_t k = 0; k < copies; ++k) {
+            hitExports.push_back(names[k * 6].c_str());          // HitGroup
+            if (sets[k].both) hitExports.push_back(names[k * 6 + 4].c_str());
+        }
+        hitExports.push_back(L"HitGroupNullTri");
+        hitExports.push_back(L"HitGroupNullProc");
+        assoc.NumExports = (UINT)hitExports.size();
+        assoc.pExports = hitExports.data();
     }
 
     // The raygen's, in the shim's own layout.
@@ -313,7 +340,7 @@ bool BuildStateObject(ID3D12Device5* dev, const std::vector<uint8_t>& lib,
     subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &libDesc });
     for (size_t k = 0; k < copies; ++k) {
         subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgs[k] });
-        if (x.needsBoth)
+        if (sets[k].both)
             subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgProcs[k] });
     }
     subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hgNullTri });
@@ -381,10 +408,15 @@ bool BuildStateObject(ID3D12Device5* dev, const std::vector<uint8_t>& lib,
         std::array<uint8_t, 32> a{};
         std::memcpy(a.data(), h, kIdSize);
         out->idHit.push_back(a);
-        if (x.needsBoth) {
+        if (sets[k].both) {
             const void* p = props->GetShaderIdentifier(names[k * 6 + 4].c_str());
             if (!p) { ok = false; break; }
             std::memcpy(a.data(), p, kIdSize);
+            out->idHitProc.push_back(a);
+        } else if (!x.perQuery.empty()) {
+            // Records per query: aligned with the queries, a query with no
+            // procedural hit group taking the one that reports nothing.
+            std::memcpy(a.data(), idNullProc, kIdSize);
             out->idHitProc.push_back(a);
         }
     }
@@ -717,6 +749,8 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
     self->m_needsBoth = x.needsBoth;
     self->m_recordConstants = x.needsRecordConstants;
     self->m_track = x.track;
+    self->m_trackProc = x.trackProc;
+    self->m_perQuery = x.perQuery;
     self->m_scenes = x.scenes;
     self->m_localRs = b.localRs;   // owned now, released in the destructor
     self->m_lib = lib;             // for the shim's own layout, built on need
@@ -1106,6 +1140,7 @@ struct RetraceCtx {
     std::vector<gidx::Scenes> slots;
     std::vector<unsigned> caps;
     unsigned m = 0;   // the lowered calls' multiplier: 1 with record data
+    unsigned queries = 1;   // ray contributions 0 .. queries-1 (0.77.0)
 };
 
 bool RetraceLowered(const std::string& in, std::string* out, std::string* why, void* p) {
@@ -1122,7 +1157,10 @@ bool RetraceLowered(const std::string& in, std::string* out, std::string* why, v
         slotOf.push_back((unsigned)j);
     }
     int calls = 0;
-    const std::vector<std::pair<unsigned, unsigned>> pairs{ { 0u, c->m } };
+    // Query k's TraceRay passes ray contribution k with records per query
+    // (0.77.0); every other lowered call passes 0.
+    std::vector<std::pair<unsigned, unsigned>> pairs;
+    for (unsigned k = 0; k < c->queries; ++k) pairs.push_back({ k, c->m });
     if (!rq::RetraceToShimScene(llm::Normalize(in), pairs, 0, slotOf, (unsigned)c->slots.size(),
                                 c->caps, out, &calls, why))
         return false;
@@ -1160,6 +1198,7 @@ bool Dxr11RayQueryPso::BuildOwn(const std::vector<UINT>& caps, std::shared_ptr<O
     ctx.slots = gidx::SceneSlots(m_scenes);
     ctx.caps.assign(caps.begin(), caps.end());
     ctx.m = m_recordConstants ? 1u : 0u;
+    ctx.queries = m_perQuery.empty() ? 1u : (unsigned)m_perQuery.size();
     std::vector<uint8_t> lib;
     std::string err;
     if (!dxch::RewriteContainer(m_lib.data(), m_lib.size(), RetraceLowered, &ctx, &lib, &err)) {
@@ -1183,6 +1222,10 @@ bool Dxr11RayQueryPso::BuildOwn(const std::vector<UINT>& caps, std::shared_ptr<O
     x.needsBoth = m_needsBoth;
     x.needsRecordConstants = m_recordConstants;
     x.payloadBytes = m_payloadBytes;
+    // Until 0.77.0 left out, so a tracked procedural query's own layout had
+    // no AnyHitProc.
+    x.trackProc = m_trackProc;
+    x.perQuery = m_perQuery;
     Built b;
     if (!BuildStateObject(m_dev, lib, x, m_rootSig, &b, why, srvs, own->form ? own->Subs() : 0u)) return false;
     own->so = b.so;
@@ -1192,8 +1235,8 @@ bool Dxr11RayQueryPso::BuildOwn(const std::vector<UINT>& caps, std::shared_ptr<O
     std::memcpy(own->idMiss, b.idMiss, kIdSize);
     std::memcpy(own->idNullTri, b.idNullTri, kIdSize);
     std::memcpy(own->idNullProc, b.idNullProc, kIdSize);
-    if (!b.idHit.empty()) own->idHit = b.idHit[0];
-    if (!b.idHitProc.empty()) own->idHitProc = b.idHitProc[0];
+    own->idHit = b.idHit;
+    own->idHitProc = b.idHitProc;
     std::string held;
     if (own->Keyed()) {
         held = ", scenes per slot";
@@ -1292,12 +1335,20 @@ bool Dxr11RayQueryPso::DispatchOwn(ID3D12GraphicsCommandList4* cl, ID3D12Device5
         }
     }
 
+    // Ray contributions per (instance, geometry): one, or one per query
+    // (0.77.0), all in one structure of each copy.
+    const UINT Q = m_perQuery.empty() ? 1u : (UINT)m_perQuery.size();
+    if (Q > shimscene::PairsPerStructure()) {
+        *why = "records per query for " + std::to_string(Q) + " queries, more than the " +
+               std::to_string(shimscene::PairsPerStructure()) + " a scene copy holds";
+        return false;
+    }
     std::shared_ptr<Own> own;
     {
         std::lock_guard<std::mutex> guard(m_lock);
         if (!EnsureOwn(sel.need, &own, why)) return false;
     }
-    shimscene::Activate(1);   // later builds get their copy as they are built
+    shimscene::Activate(Q);   // later builds get their copy as they are built
 
     // A copy of every scene, one after another in the hit group table: scene
     // x's records start at base[x], instance i's at base[x] + i * gmax. An
@@ -1317,8 +1368,8 @@ bool Dxr11RayQueryPso::DispatchOwn(ID3D12GraphicsCommandList4* cl, ID3D12Device5
             continue;
         }
         const bool ok = latest[x] || descs[x].empty()
-            ? shimscene::Ensure(cl, dev, sel.scenes[x], 1, base[x], owner, &cps[x], &cw)
-            : shimscene::EnsureFrom(cl, dev, sel.scenes[x], buildOf[x], descs[x], 1, base[x], owner,
+            ? shimscene::Ensure(cl, dev, sel.scenes[x], Q, base[x], owner, &cps[x], &cw)
+            : shimscene::EnsureFrom(cl, dev, sel.scenes[x], buildOf[x], descs[x], Q, base[x], owner,
                                     &cps[x], &cw);
         if (!ok) {
             restore();
@@ -1418,6 +1469,7 @@ bool Dxr11RayQueryPso::DispatchOwn(ID3D12GraphicsCommandList4* cl, ID3D12Device5
     for (uint32_t v : kt) key.push_back(v);
     for (UINT x = 0; x < D; ++x) {
         key.push_back(((uint64_t)cps[x].gmax << 32) | base[x]);
+        key.push_back(((uint64_t)cps[x].kc << 32) | Q);
         for (const auto& r : rows[x])
             key.push_back(r.active ? (1ull << 63) | ((uint64_t)r.contribution << 24) |
                                          ((uint64_t)r.geometries << 8) | r.reach
@@ -1499,30 +1551,49 @@ bool Dxr11RayQueryPso::DispatchOwn(ID3D12GraphicsCommandList4* cl, ID3D12Device5
         // that kind that never commits for the other; nothing reaches the
         // rest, which get the rejecting triangle record.
         const int poison = OwnPoison();
-        auto idFor = [&](uint8_t reach) -> const void* {
-            if (poison == 2) return own->idHit.data();
+        // DXR_TIER11_PERQUERY_POISON=1: every query's procedural records take
+        // query 0's hit group, the check for records per query (0.77.0).
+        static const bool pqPoison = GetEnvironmentVariableA("DXR_TIER11_PERQUERY_POISON", nullptr, 0) != 0;
+        auto idFor = [&](uint8_t reach, UINT k) -> const void* {
+            if (!m_perQuery.empty()) {
+                // Records per query: query k's own groups; its procedural one
+                // is the rejecting one where it has none.
+                if (reach & astrack::kReachProcedural)
+                    return own->idHitProc[pqPoison ? 0 : k].data();
+                if (reach & astrack::kReachTriangles) return own->idHit[k].data();
+                return own->idNullTri;
+            }
+            if (poison == 2) return own->idHit[0].data();
             if (reach & astrack::kReachProcedural)
-                return m_servesProc ? (m_servesTri ? own->idHitProc.data() : own->idHit.data())
+                return m_servesProc ? (m_servesTri ? own->idHitProc[0].data() : own->idHit[0].data())
                                     : own->idNullProc;
             if (reach & astrack::kReachTriangles)
-                return m_servesTri ? own->idHit.data() : own->idNullTri;
+                return m_servesTri ? own->idHit[0].data() : own->idNullTri;
             return own->idNullTri;
         };
         for (UINT r = 0; r < records; ++r) std::memcpy(p + hitOff + r * stride, own->idNullTri, kIdSize);
+        // Instance i of scene x sits at contribution base + i * kc * gmax
+        // (proxy/shim_scene.h); the retraced calls pass multiplier Q and
+        // query k contribution k, so record (i, g, k) is that plus g * Q + k.
+        // Until 0.77.0 written at base + i * gmax + g, which is the same only
+        // while the copy's kc is 1: a GeometryIndex() variant asking for more
+        // pairs in the same process put it off.
         for (UINT x = 0; x < D; ++x) {
             const UINT gmax = cps[x].gmax;
+            const UINT per = cps[x].kc * gmax;
             const UINT first = rows[x].empty() ? 0u : rows[x][0].contribution;
             for (UINT i = 0; i < (UINT)rows[x].size(); ++i) {
                 const auto& row = rows[x][i];
                 if (!row.active) continue;
-                for (UINT g = 0; g < row.geometries; ++g) {
-                    const UINT r = base[x] + i * gmax + g;
-                    std::memcpy(p + hitOff + r * stride, idFor(row.reach), kIdSize);
-                    if (!m_recordConstants) continue;
-                    const uint32_t pair[3] = { g, poison == 1 ? first : row.contribution,
-                                               g < row.opaque.size() && !GetEnvironmentVariableA("DXR_TIER11_OPACITY_POISON", nullptr, 0) ? row.opaque[g] : 0u };
-                    std::memcpy(p + pairsOff + r * 12u, pair, sizeof(pair));
-                }
+                for (UINT g = 0; g < row.geometries; ++g)
+                    for (UINT k = 0; k < Q; ++k) {
+                        const UINT r = base[x] + i * per + g * Q + k;
+                        std::memcpy(p + hitOff + r * stride, idFor(row.reach, k), kIdSize);
+                        if (!m_recordConstants) continue;
+                        const uint32_t pair[3] = { g, poison == 1 ? first : row.contribution,
+                                                   g < row.opaque.size() && !GetEnvironmentVariableA("DXR_TIER11_OPACITY_POISON", nullptr, 0) ? row.opaque[g] : 0u };
+                        std::memcpy(p + pairsOff + r * 12u, pair, sizeof(pair));
+                    }
             }
         }
         // Each record's pointer to its pair; records nothing reaches point
