@@ -870,7 +870,9 @@ def main():
     # split at the query, both rewriters byte for byte, every part valid.
     print('\n-- the split at a query --')
     # 0.85.0: a path around the query that joins it at its exit.
-    for f in ('gs_orig', 'gs_orig_sm66', 'gs_save', 'gs_save_sm66', 'gs_around', 'gs_around_sm66'):
+    # 0.86.0: groupshared of other element types, local arrays carried.
+    for f in ('gs_orig', 'gs_orig_sm66', 'gs_save', 'gs_save_sm66', 'gs_around', 'gs_around_sm66',
+              'gs_shapes', 'gs_shapes_sm66'):
         path = os.path.join('phase5', 'cases', 'split', f + '.ll')
         if not os.path.isfile(path):
             print('  FAILED   %-34s input missing (build_phase5.bat)' % f)
@@ -885,8 +887,15 @@ def main():
             'a compute shader with more than one function'))
         bad = '\n'.join(l.replace('global [64 x float]', 'global [64 x double]')
                         if 'addrspace(3) global' in l else l for l in t.split('\n'))
-        ok.append(split_refuses('split, a groupshared double array', bad,
+        ok.append(split_refuses('split, a groupshared handle array', bad.replace(
+            'global [64 x double]', 'global [64 x %dx.types.Handle]'),
                                 'a groupshared variable of a shape the split does not save'))
+    shapes = os.path.join('phase5', 'cases', 'split', 'gs_shapes.ll')
+    if os.path.isfile(shapes):
+        t = load(shapes)
+        ok.append(split_refuses('split, a local array of handles', t.replace(
+            '= alloca [8 x float], align 4', '= alloca [8 x %dx.types.Handle], align 4', 1),
+                                'a local variable of a shape the split does not carry'))
 
     print('\n%d of %d checks behaved as intended\n' % (sum(ok), len(ok)))
     return 0 if all(ok) else 1

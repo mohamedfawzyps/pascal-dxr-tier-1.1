@@ -245,9 +245,12 @@ shader by hand, check against WARP.
   issued at submit once the group counts are read back. A path around the
   query that joins it at P (`if (c) { query }`): DONE 0.85.0, through a
   block of A storing alive 2 and P's phi values for that edge.
-- c. Next: a query inside a loop, a path around the query joining past P,
-  a local array or a groupshared variable of another shape crossing the
-  split, a barrier or wave op inside the query region (the Proceed body).
+- c. Other shapes crossing: DONE 0.86.0. DXC leaves groupshared and local
+  arrays one-dimensional arrays of scalars (measured,
+  `split_shapes_ref.hlsl`); every scalar element type is saved, local
+  arrays carried per thread (made again, filled, copied out by A and by Q).
+- d. Next: a path around the query joining past P, a query inside a loop,
+  a barrier or wave op inside the query region (the Proceed body).
 
 ### 6. Spec item 3, pixel, vertex, mesh, amplification (4 or more versions)
 

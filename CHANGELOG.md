@@ -24,6 +24,42 @@ not.
 
 ---
 
+## 0.86.0
+
+**Plan step 5 c, first item: values of other shapes cross the split.**
+Measured first (`phase5/cases/reference/split_shapes_ref.hlsl`): DXC leaves
+every groupshared variable a scalar or a one-dimensional array of scalars
+(vectors and nested arrays flattened, `.v.1dim`; a struct one array a
+field; a bool an i32), and a local array indexed dynamically an alloca of
+`[N x scalar]`. So the gaps were element types and local arrays.
+
+- **Groupshared of any scalar element type** (half, i16, double, i64 beside
+  i32 and float) is saved per group, two dwords an element for double and
+  i64.
+- **Local arrays are carried per thread.** An alloca a later part uses is
+  made again in that part's entry block and filled from the scratch
+  buffer; A copies it out at its tail and in a path-around block, and Q
+  copies one out again when B reads it too (Q may write it). Addresses in
+  it (GEPs, and the bitcasts `llvm.lifetime` markers take at 6.6) are
+  rebuilt. Both rewriters, byte-identical; one copier serves groupshared
+  and local arrays.
+- **Found doing it:** every block header Q copies loses its `; preds =`
+  comment, which can name the entry block (the normaliser took it for a
+  reference and labelled an empty entry). And the first test could not
+  see the copy-out: DXC forwarded the element Q wrote to B as a phi, so B
+  read it from the array only once it read an element that may alias it.
+- **Tests.** `gs_shapes` (groupshared double and uint64_t arrays across the
+  query; a local float array read for the ray, inside the query region and
+  after it; a local uint64_t array written inside the region and read
+  after), at 6.5 and 6.6. Dispatch suite: `splitshapes`, `splitshapessm66`
+  (four geometries), `splitshapesind`, all match WARP;
+  `DXR_TIER11_SPLITPOISON=4` (Q does not copy its arrays out) diverges.
+  Rewriter checks: both inputs split, and a groupshared and a local array
+  of handles refused by name by both. Rewriter checks 119 of 119; dispatch
+  suite 174 of 174 plus every gate.
+- Escher: all 845 dumped Unreal shader inputs lower byte-identically to
+  0.85.0.
+
 ## 0.85.0
 
 **Plan step 5 b, first two items: an indirect dispatch of a split pipeline,

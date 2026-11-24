@@ -165,6 +165,16 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.86.0: PLAN STEP 5 c, OTHER SHAPES CROSS THE SPLIT.** DXC leaves
+groupshared and local arrays one-dimensional arrays of scalars (measured);
+every scalar element type is saved per group, and a local array (alloca) is
+carried per thread: made again in the later part, filled from the scratch
+buffer, copied out by A and by Q when B reads it too. **A test of a memory
+copy has to read memory the compiler cannot forward: DXC passed the element
+Q wrote to B as a phi, and the first test could not see the copy.** NEXT:
+step 5 d (a path joining past P, a query inside a loop, ops in the Proceed
+body).
+
 **0.85.0: PLAN STEP 5 b, AN INDIRECT SPLIT AND A PATH AROUND THE QUERY.**
 An indirect split is issued whole at submit (A, Q, B on the dispatch list,
 the counts read back). `if (c) { query }`: the edge around goes through a

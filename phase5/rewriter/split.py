@@ -88,6 +88,21 @@ def _type_of(instr):
 
 
 _DWORDS = {'i1': 1, 'i16': 1, 'i32': 1, 'half': 1, 'float': 1, 'i64': 2, 'double': 2}
+_ALIGN = {'i16': 2, 'half': 2, 'i64': 8, 'double': 8}
+
+
+def _alloca_shape(instr):
+    """(type, elements, element type) of a local variable's alloca: a scalar
+    (elements 0) or a one-dimensional array of scalars, as DXC leaves them;
+    None for any other."""
+    m = re.match(r'^alloca\s+(\[(\d+) x (\w+)\]|(\w+))\s*(?:,|$)', instr.body.strip())
+    if not m:
+        return None
+    if m.group(1).startswith('['):
+        n, el = int(m.group(2)), m.group(3)
+    else:
+        n, el = 0, m.group(4)
+    return (m.group(1), n, el) if el in _DWORDS else None
 
 
 def _postdominators(fn):
@@ -214,6 +229,7 @@ def split(text):
     rebuild = {'Q': set(), 'B': set()}
     store = {'A': [], 'Q': []}
     loads = {'Q': [], 'B': []}
+    carry = {'Q': [], 'B': []}   # local arrays, by their alloca
 
     def need(u, Y):
         d = defs.get(u)
@@ -222,13 +238,23 @@ def split(text):
         X = where[id(d)]
         if X == Y:
             return
-        if u in rebuild[Y] or u in loads[Y]:
+        if u in rebuild[Y] or u in loads[Y] or u in carry[Y]:
+            return
+        # A local array (0.86.0): the later part makes it again in its entry
+        # block and fills it from the scratch buffer, A having copied it out.
+        if d.body.startswith('alloca '):
+            if _alloca_shape(d) is None:
+                raise Unsupported('a local variable of a shape the split does not carry: %s' % d.body[:60])
+            carry[Y].append(u)
             return
         # A groupshared address is rebuilt (B holds the same arrays, given
-        # back from the group area when B reads one A wrote).
+        # back from the group area when B reads one A wrote), and so is an
+        # address in a local array.
         if d.dxop in _REBUILD_OPS or (d.body.startswith('extractvalue ') and
                                       defs.get(_operands(d, types)[0], d).dxop in _REBUILD_OPS) or \
-                (d.body.startswith('getelementptr ') and 'addrspace(3)' in d.body):
+                (d.body.startswith('getelementptr ') and 'addrspace(3)' in d.body) or \
+                (d.body.startswith(('getelementptr ', 'bitcast ')) and
+                 any(o in defs and defs[o].body.startswith('alloca ') for o in _operands(d, types))):
             rebuild[Y].add(u)
             for o in _operands(d, types):
                 if o in defs:
@@ -267,11 +293,25 @@ def split(text):
     for u in store['A'] + store['Q']:
         field[u] = K
         K += _DWORDS[_type_of(defs[u])]
+    # Local arrays after the scalars, each element its dwords. Q copies one
+    # out again when B reads it too.
+    carried = []
+    for u in carry['Q'] + carry['B']:
+        if u not in carried:
+            carried.append(u)
+            ty, n, el = _alloca_shape(defs[u])
+            field[u] = K
+            K += max(n, 1) * _DWORDS[el]
+    qout = [u for u in carry['Q'] if u in carry['B']]
 
     # Groupshared arrays part B reads that part A wrote: saved per group.
+    # DXC leaves every one a scalar or a one-dimensional array of scalars
+    # (vectors and nested arrays flattened, structs one array a field;
+    # phase5/cases/reference/split_shapes_ref.hlsl).
     gs = []
     for line in text.split('\n'):
-        gm = re.match(r'^(@"[^"]+"|@[\w.$-]+) = (?:external )?addrspace\(3\) global (\[(\d+) x (i32|float)\]|i32|float)', line)
+        gm = re.match(r'^(@"[^"]+"|@[\w.$-]+) = (?:external )?addrspace\(3\) global '
+                      r'(\[(\d+) x (i32|float|half|i16|double|i64)\]|i32|float|half|i16|double|i64)', line)
         if gm:
             gs.append((gm.group(1), gm.group(2), int(gm.group(3)) if gm.group(3) else 0, gm.group(4) or gm.group(2)))
         elif re.match(r'^@\S+ = .*addrspace\(3\) global', line):
@@ -287,7 +327,7 @@ def split(text):
     for g, ty, n, el in gs:
         if any(g in l for l in texts['A']) and any(g in l for l in texts['B']):
             saved.append((g, ty, n, el, G))
-            G += max(n, 1)
+            G += max(n, 1) * _DWORDS[el]
 
     tmp = [0]
 
@@ -403,51 +443,78 @@ def split(text):
                 ws.append(w)
             from_words(o, u, t, ws)
 
-    def gs_copy(o, out, pred):
-        """Copies each saved array between groupshared memory and the scratch
-        buffer: A every element (any thread may be the one left), B strided."""
-        for g, ty, n, el, off in saved:
-            lab = fresh('c')[1:]
-            if not n:
-                p = '%s' % g
-                if out:
-                    v = fresh('x'); o.append('  %s = load %s, %s addrspace(3)* %s, align 4' % (v, el, el, p))
-                    w = to_words(o, v, el)[0]
-                    a = fresh('a'); o.append('  %s = add i32 %%sp.gb, %d' % (a, 4 * off))
-                    raw_store(o, a, w)
-                else:
-                    a = fresh('a'); o.append('  %s = add i32 %%sp.gb, %d' % (a, 4 * off))
-                    w = fresh('l'); raw_load(o, a, w)
-                    v = fresh('x'); from_words(o, v, el, [w])
-                    o.append('  store %s %s, %s addrspace(3)* %s, align 4' % (el, v, el, p))
-                continue
-            start = '0' if out else '%sp.fi'
-            step = 1 if out else NT
-            if not out:
-                c0 = fresh('k'); o.append('  %s = icmp ult i32 %%sp.fi, %d' % (c0, n))
-                o.append('  br i1 %s, label %%%s, label %%%s.done' % (c0, lab, lab))
-            else:
-                o.append('  br label %%%s' % lab)
-            o += ['', '%s:' % lab]
-            i, inx = fresh('i'), fresh('i')
-            o.append('  %s = phi i32 [ %s, %%%s ], [ %s, %%%s ]' % (i, start, pred, inx, lab))
-            p = fresh('p')
-            o.append('  %s = getelementptr %s, %s addrspace(3)* %s, i32 0, i32 %s' % (p, ty, ty, g, i))
-            q = fresh('a'); o.append('  %s = add i32 %s, %d' % (q, i, off))
-            q2 = fresh('a'); o.append('  %s = shl i32 %s, 2' % (q2, q))
-            a = fresh('a'); o.append('  %s = add i32 %%sp.gb, %s' % (a, q2))
+    def copy_array(o, out, pred, base, g, ty, n, el, off, strided, asp):
+        """Copies one array (or scalar, n 0) between memory and the scratch
+        buffer at base + 4 * off, each element its dwords: out from memory,
+        else in. `strided`: thread fi takes elements fi, fi + NT, ... (a
+        group's copy in); otherwise every element. Returns the block it
+        leaves the code in."""
+        dw = _DWORDS[el]
+        al = _ALIGN.get(el, 4)
+        pty = '%s%s*' % (el, ' addrspace(3)' if asp else '')
+
+        def words_at(a):
+            ats = [a]
+            for k in range(1, dw):
+                ak = fresh('a'); o.append('  %s = add i32 %s, %d' % (ak, a, 4 * k)); ats.append(ak)
+            return ats
+
+        def move(p, a):
             if out:
-                v = fresh('x'); o.append('  %s = load %s, %s addrspace(3)* %s, align 4' % (v, el, el, p))
-                raw_store(o, a, to_words(o, v, el)[0])
+                v = fresh('x'); o.append('  %s = load %s, %s %s, align %d' % (v, el, pty, p, al))
+                for at, w in zip(words_at(a), to_words(o, v, el)):
+                    raw_store(o, at, w)
             else:
-                w = fresh('l'); raw_load(o, a, w)
-                v = fresh('x'); from_words(o, v, el, [w])
-                o.append('  store %s %s, %s addrspace(3)* %s, align 4' % (el, v, el, p))
-            o.append('  %s = add i32 %s, %d' % (inx, i, step))
-            c = fresh('k'); o.append('  %s = icmp ult i32 %s, %d' % (c, inx, n))
-            o.append('  br i1 %s, label %%%s, label %%%s.done' % (c, lab, lab))
-            o += ['', '%s.done:' % lab]
-            pred = lab + '.done'
+                ws = []
+                for at in words_at(a):
+                    w = fresh('l'); raw_load(o, at, w); ws.append(w)
+                v = fresh('x'); from_words(o, v, el, ws)
+                o.append('  store %s %s, %s %s, align %d' % (el, v, pty, p, al))
+        if not n:
+            a = fresh('a'); o.append('  %s = add i32 %s, %d' % (a, base, 4 * off))
+            move(g, a)
+            return pred
+        lab = fresh('c')[1:]
+        start = '%sp.fi' if strided else '0'
+        step = NT if strided else 1
+        if strided:
+            c0 = fresh('k'); o.append('  %s = icmp ult i32 %%sp.fi, %d' % (c0, n))
+            o.append('  br i1 %s, label %%%s, label %%%s.done' % (c0, lab, lab))
+        else:
+            o.append('  br label %%%s' % lab)
+        o += ['', '%s:' % lab]
+        i, inx = fresh('i'), fresh('i')
+        o.append('  %s = phi i32 [ %s, %%%s ], [ %s, %%%s ]' % (i, start, pred, inx, lab))
+        p = fresh('p')
+        o.append('  %s = getelementptr %s, %s%s* %s, i32 0, i32 %s' % (p, ty, ty, ' addrspace(3)' if asp else '', g, i))
+        if dw == 1:
+            q = fresh('a'); o.append('  %s = add i32 %s, %d' % (q, i, off))
+        else:
+            m = fresh('a'); o.append('  %s = mul i32 %s, %d' % (m, i, dw))
+            q = fresh('a'); o.append('  %s = add i32 %s, %d' % (q, m, off))
+        q2 = fresh('a'); o.append('  %s = shl i32 %s, 2' % (q2, q))
+        a = fresh('a'); o.append('  %s = add i32 %s, %s' % (a, base, q2))
+        move(p, a)
+        o.append('  %s = add i32 %s, %d' % (inx, i, step))
+        c = fresh('k'); o.append('  %s = icmp ult i32 %s, %d' % (c, inx, n))
+        o.append('  br i1 %s, label %%%s, label %%%s.done' % (c, lab, lab))
+        o += ['', '%s.done:' % lab]
+        return lab + '.done'
+
+    def gs_copy(o, out, pred):
+        """Copies each saved groupshared array between groupshared memory and
+        the scratch buffer: A every element (any thread may be the one left),
+        B strided."""
+        for g, ty, n, el, off in saved:
+            pred = copy_array(o, out, pred, '%sp.gb', g, ty, n, el, off, not out, True)
+        return pred
+
+    def local_copy(o, out, pred, which):
+        """Copies the thread's local arrays `which` (allocas) between the
+        array and its fields in the scratch buffer."""
+        for u in which:
+            ty, n, el = _alloca_shape(defs[u])
+            pred = copy_array(o, out, pred, '%sp.tb', u, ty, n, el, field[u], False, False)
         return pred
 
     barrier = '  call void @dx.op.barrier(i32 80, i32 9)  ; Barrier(barrierMode)'
@@ -497,6 +564,7 @@ def split(text):
             ws = to_words(o, vals[0].strip(), _type_of(d))
             for k, w in enumerate(ws):
                 raw_store(o, addr(o, field[u] + k), w)
+        local_copy(o, True, 'sp.lv%d' % around.index(b.label), carry['B'])
         o += ['  br label %sp.ajoin', '']
         return o
 
@@ -521,6 +589,7 @@ def split(text):
                 ws = to_words(A, u, _type_of(defs[u]))
                 for d, w in enumerate(ws):
                     raw_store(A, addr(A, field[u] + d), w)
+            local_copy(A, True, 'sp.atail', carried)
             A += ['  br label %sp.ajoin', '', 'sp.ajoin:']
             if saved:
                 A.append(barrier)
@@ -533,12 +602,13 @@ def split(text):
             A += leave_block(b)
 
     # --- Q ---
-    Q = ['sp.qentry:']
+    Q = ['sp.qentry:'] + [defs[u].line for u in carry['Q']]
     prologue(Q)
     raw_load(Q, '%sp.tb', '%sp.al')
     Q += ['  %sp.alc = icmp eq i32 %sp.al, 1', '  br i1 %sp.alc, label %sp.qgo, label %sp.qret', '',
           'sp.qret:', '  ret void', '', 'sp.qgo:']
     load_all(Q, 'Q')
+    local_copy(Q, False, 'sp.qgo', carry['Q'])
     rebuilt(Q, 'Q')
     sl = S.label[1:] if S.label else 'sp.s'
     Q += ['  br label %%%s' % sl, '', '%s:' % sl]
@@ -546,12 +616,13 @@ def split(text):
     Q.append('')
     for b in fn.blocks:
         if b.label in R and b is not S:
-            Q.append(b.header_line)
+            Q.append(b.header_line.split(';')[0].rstrip())
             Q += body_lines(b, lambda k, i: True)
             Q.append('')
-    # Its "; preds =" comment names the blocks around the query too, which
-    # the normaliser would take for a reference.
-    Q.append(Pb.header_line.split(';')[0].rstrip() if around else Pb.header_line)
+    # A block header's "; preds =" comment can name a block Q does not have
+    # (the entry, one around the query), which the normaliser would take for
+    # a reference: Q's headers go without.
+    Q.append(Pb.header_line.split(';')[0].rstrip())
     for i in Pb.instrs:
         if not i.is_phi:
             continue
@@ -565,10 +636,11 @@ def split(text):
         ws = to_words(Q, u, _type_of(defs[u]))
         for d, w in enumerate(ws):
             raw_store(Q, addr(Q, field[u] + d), w)
+    local_copy(Q, True, P[1:], qout)
     Q += ['  ret void', '']
 
     # --- B ---
-    Bt = ['sp.bentry:']
+    Bt = ['sp.bentry:'] + [defs[u].line for u in carry['B']]
     prologue(Bt)
     pred = 'sp.bentry'
     if saved:
@@ -578,6 +650,7 @@ def split(text):
     Bt += ['  %sp.alc = icmp ne i32 %sp.al, 0', '  br i1 %sp.alc, label %sp.bgo, label %sp.bret', '',
            'sp.bret:', '  ret void', '', 'sp.bgo:']
     load_all(Bt, 'B')
+    local_copy(Bt, False, 'sp.bgo', carry['B'])
     rebuilt(Bt, 'B')
     Bt += ['  br label %%%s' % P[1:], '', Pb.header_line]
     Bt += [i.line for i in Pb.instrs if not i.is_phi]

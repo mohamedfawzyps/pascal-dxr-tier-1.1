@@ -514,7 +514,12 @@ $cases = @(
     # A path around the query that joins it after (0.85.0): `if (c) { query }`.
     @{ name = 'splitaround'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_around.hlsl'); desc = 'the query under a divergent if, groupshared and barriers on both sides' },
     @{ name = 'splitaroundsm66'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_around_sm66.hlsl', '--mixed', '--contrib'); desc = 'the same at 6.6 on a mixed scene' },
-    @{ name = 'splitaroundind'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_around.hlsl', '--indirect'); desc = 'the same, dispatched indirectly' }
+    @{ name = 'splitaroundind'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_around.hlsl', '--indirect'); desc = 'the same, dispatched indirectly' },
+    # Other shapes crossing (0.86.0): groupshared double and uint64_t arrays,
+    # local arrays carried into Q and B (Q writes one back).
+    @{ name = 'splitshapes'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_shapes.hlsl'); desc = 'groupshared double and uint64_t, local float and uint64_t arrays' },
+    @{ name = 'splitshapessm66'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_shapes_sm66.hlsl', '--geom', '--contrib'); desc = 'the same at 6.6 on four geometries' },
+    @{ name = 'splitshapesind'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_shapes.hlsl', '--indirect'); desc = 'the same, dispatched indirectly' }
 )
 
 $failed = 0
@@ -748,16 +753,18 @@ foreach ($p in @('1', '2')) {
     }
 }
 # =3: a path around the query stores the alive flag 1, so Q runs for it.
-foreach ($f in @('gs_around', 'gs_around_sm66')) {
+# =4: Q does not copy out the local arrays it may write.
+foreach ($pf in @(@('3', 'gs_around'), @('3', 'gs_around_sm66'), @('4', 'gs_shapes'), @('4', 'gs_shapes_sm66'))) {
+    $p = $pf[0]; $f = $pf[1]
     $x = @('--cs', "phase5\cases\split\$f.hlsl")
     & .\raytest.exe warp rayquery alpha dp_sp_a.bin @x | Out-Null
-    $env:DXR_TIER11_SPLITPOISON = '3'
+    $env:DXR_TIER11_SPLITPOISON = $p
     & .\raytest.exe hw rayquery alpha dp_sp_b.bin @x | Out-Null
     Remove-Item env:DXR_TIER11_SPLITPOISON
     $diff = & .\raytest.exe diff dp_sp_a.bin dp_sp_b.bin 2>&1
     Remove-Item dp_sp_a.bin, dp_sp_b.bin -ErrorAction SilentlyContinue
-    if ($diff -match 'RESULT: DIVERGE') { Write-Host "  $f, DXR_TIER11_SPLITPOISON=3: diverges" }
-    else { Write-Host "  POISON NOT SEEN: $f, DXR_TIER11_SPLITPOISON=3"; $failed++ }
+    if ($diff -match 'RESULT: DIVERGE') { Write-Host "  $f, DXR_TIER11_SPLITPOISON=${p}: diverges" }
+    else { Write-Host "  POISON NOT SEEN: $f, DXR_TIER11_SPLITPOISON=$p"; $failed++ }
 }
 $env:DXR_TIER11 = ''
 

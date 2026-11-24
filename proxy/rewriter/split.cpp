@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -85,6 +86,34 @@ int Dwords(const std::string& t) {
     if (t == "i1" || t == "i16" || t == "i32" || t == "half" || t == "float") return 1;
     if (t == "i64" || t == "double") return 2;
     return 0;
+}
+
+int Align(const std::string& el) {
+    if (el == "i16" || el == "half") return 2;
+    if (el == "i64" || el == "double") return 8;
+    return 4;
+}
+
+// A local variable's alloca: a scalar (n 0) or a one-dimensional array of
+// scalars, as DXC leaves them; ok false for any other.
+struct AllocaShapeT {
+    bool ok = false;
+    std::string ty, el;
+    unsigned n = 0;
+};
+AllocaShapeT AllocaShape(const llm::Instr& i) {
+    static const std::regex kA(R"(^alloca\s+(\[(\d+) x (\w+)\]|(\w+))\s*(?:,|$))");
+    AllocaShapeT s;
+    std::string b = i.body;
+    while (!b.empty() && (b.front() == ' ' || b.front() == '\t')) b.erase(b.begin());
+    while (!b.empty() && (b.back() == ' ' || b.back() == '\t' || b.back() == '\r')) b.pop_back();
+    std::smatch m;
+    if (!std::regex_search(b, m, kA)) return s;
+    s.ty = m[1].str();
+    if (s.ty[0] == '[') { s.n = (unsigned)std::stoul(m[2].str()); s.el = m[3].str(); }
+    else s.el = m[4].str();
+    s.ok = Dwords(s.el) != 0;
+    return s;
 }
 
 std::map<std::string, std::set<std::string>> PostDominators(const llm::Function& fn) {
@@ -491,6 +520,7 @@ SplitResult SplitAtQuery(const std::string& text) {
 
     std::map<char, std::set<std::string>> rebuild;
     std::map<char, std::vector<std::string>> store, loads;
+    std::map<char, std::vector<std::string>> carry;   // local arrays, by their alloca
     std::string err;
     std::function<bool(const std::string&, char)> need = [&](const std::string& u, char Y) -> bool {
         auto it = defs.find(u);
@@ -498,7 +528,19 @@ SplitResult SplitAtQuery(const std::string& text) {
         const llm::Instr* d = it->second;
         const char X = where[d];
         if (X == Y) return true;
-        if (rebuild[Y].count(u) || std::find(loads[Y].begin(), loads[Y].end(), u) != loads[Y].end()) return true;
+        if (rebuild[Y].count(u) || std::find(loads[Y].begin(), loads[Y].end(), u) != loads[Y].end() ||
+            std::find(carry[Y].begin(), carry[Y].end(), u) != carry[Y].end())
+            return true;
+        // A local array (0.86.0): the later part makes it again in its entry
+        // block and fills it from the scratch buffer, A having copied it out.
+        if (StartsWith(d->body, "alloca ")) {
+            if (!AllocaShape(*d).ok) {
+                err = "a local variable of a shape the split does not carry: " + d->body.substr(0, 60);
+                return false;
+            }
+            carry[Y].push_back(u);
+            return true;
+        }
         bool rb = RebuildOp(d->DxOp());
         if (!rb && StartsWith(d->body, "extractvalue ")) {
             const auto ops = SplitOperands(*d, types);
@@ -509,6 +551,12 @@ SplitResult SplitAtQuery(const std::string& text) {
         // back from the group area when B reads one A wrote).
         if (!rb && StartsWith(d->body, "getelementptr ") && d->body.find("addrspace(3)") != std::string::npos)
             rb = true;
+        // And an address in a local array.
+        if (!rb && (StartsWith(d->body, "getelementptr ") || StartsWith(d->body, "bitcast ")))
+            for (const auto& o : SplitOperands(*d, types)) {
+                auto jt = defs.find(o);
+                if (jt != defs.end() && StartsWith(jt->second->body, "alloca ")) rb = true;
+            }
         if (rb) {
             rebuild[Y].insert(u);
             for (const auto& o : SplitOperands(*d, types))
@@ -558,12 +606,29 @@ SplitResult SplitAtQuery(const std::string& text) {
     unsigned K = 1;
     for (char X : { 'A', 'Q' })
         for (const auto& u : store[X]) { field[u] = K; K += (unsigned)Dwords(TypeOf(*defs[u])); }
+    // Local arrays after the scalars, each element its dwords. Q copies one
+    // out again when B reads it too.
+    std::vector<std::string> carried, qout;
+    for (char Y : { 'Q', 'B' })
+        for (const auto& u : carry[Y]) {
+            if (std::find(carried.begin(), carried.end(), u) != carried.end()) continue;
+            carried.push_back(u);
+            const AllocaShapeT s = AllocaShape(*defs[u]);
+            field[u] = K;
+            K += (std::max)(s.n, 1u) * (unsigned)Dwords(s.el);
+        }
+    for (const auto& u : carry['Q'])
+        if (std::find(carry['B'].begin(), carry['B'].end(), u) != carry['B'].end()) qout.push_back(u);
+    // DXR_TIER11_SPLITPOISON=4, for the suite: Q does not copy out the local
+    // arrays it may write, so B reads them as A left them.
+    if (const char* p = std::getenv("DXR_TIER11_SPLITPOISON"))
+        if (std::atoi(p) == 4) qout.clear();
 
     // Groupshared arrays B reads that A wrote.
     struct Gs { std::string g, ty; unsigned n; std::string el; unsigned off; };
     std::vector<Gs> gs, saved;
     {
-        static const std::regex kG(R"RX(^(@"[^"]+"|@[\w.$-]+) = (?:external )?addrspace\(3\) global (\[(\d+) x (i32|float)\]|i32|float))RX");
+        static const std::regex kG(R"RX(^(@"[^"]+"|@[\w.$-]+) = (?:external )?addrspace\(3\) global (\[(\d+) x (i32|float|half|i16|double|i64)\]|i32|float|half|i16|double|i64))RX");
         static const std::regex kAny(R"RX(^@\S+ = .*addrspace\(3\) global)RX");
         std::smatch gm;
         for (const auto& line : llm::SplitLines(text)) {
@@ -590,7 +655,7 @@ SplitResult SplitAtQuery(const std::string& text) {
                 if (where[&i] == 'A') inA = true;
                 if (where[&i] == 'B' || rebuild['B'].count(i.result)) inB = true;
             }
-        if (inA && inB) { x.off = G; saved.push_back(x); G += (std::max)(x.n, 1u); }
+        if (inA && inB) { x.off = G; saved.push_back(x); G += (std::max)(x.n, 1u) * (unsigned)Dwords(x.el); }
     }
 
     int tmp = 0;
@@ -699,55 +764,91 @@ SplitResult SplitAtQuery(const std::string& text) {
             fromWords(o, u, t, ws);
         }
     };
-    auto gsCopy = [&](std::vector<std::string>& o, bool out, std::string pred) {
-        for (const auto& x : saved) {
-            const std::string lab = fresh("c").substr(1);
-            if (!x.n) {
-                const std::string p = x.g;
-                if (out) {
-                    auto v = fresh("x"); o.push_back("  " + v + " = load " + x.el + ", " + x.el + " addrspace(3)* " + p + ", align 4");
-                    auto w = toWords(o, v, x.el)[0];
-                    auto a = fresh("a"); o.push_back("  " + a + " = add i32 %sp.gb, " + std::to_string(4 * x.off));
-                    rawStore(o, a, w);
-                } else {
-                    auto a = fresh("a"); o.push_back("  " + a + " = add i32 %sp.gb, " + std::to_string(4 * x.off));
-                    auto w = fresh("l"); rawLoad(o, a, w);
-                    auto v = fresh("x"); fromWords(o, v, x.el, { w });
-                    o.push_back("  store " + x.el + " " + v + ", " + x.el + " addrspace(3)* " + p + ", align 4");
-                }
-                continue;
+    // One array (or scalar, n 0) between memory and the scratch buffer at
+    // base + 4 * off, each element its dwords: out from memory, else in.
+    // `strided`: thread fi takes elements fi, fi + NT, ... (a group's copy
+    // in); otherwise every element. Returns the block it leaves the code in.
+    auto copyArray = [&](std::vector<std::string>& o, bool out, std::string pred, const std::string& base,
+                         const std::string& g, const std::string& ty, unsigned n, const std::string& el,
+                         unsigned off, bool strided, bool asp) {
+        const int dw = Dwords(el);
+        const std::string al = std::to_string(Align(el));
+        const std::string pty = el + (asp ? " addrspace(3)" : "") + "*";
+        auto wordsAt = [&](const std::string& a) {
+            std::vector<std::string> ats = { a };
+            for (int k = 1; k < dw; ++k) {
+                auto ak = fresh("a");
+                o.push_back("  " + ak + " = add i32 " + a + ", " + std::to_string(4 * k));
+                ats.push_back(ak);
             }
-            const std::string start = out ? "0" : "%sp.fi";
-            const unsigned step = out ? 1 : NT;
-            if (!out) {
-                auto c0 = fresh("k"); o.push_back("  " + c0 + " = icmp ult i32 %sp.fi, " + std::to_string(x.n));
-                o.push_back("  br i1 " + c0 + ", label %" + lab + ", label %" + lab + ".done");
-            } else {
-                o.push_back("  br label %" + lab);
-            }
-            o.push_back("");
-            o.push_back(lab + ":");
-            auto i = fresh("i"), inx = fresh("i");
-            o.push_back("  " + i + " = phi i32 [ " + start + ", %" + pred + " ], [ " + inx + ", %" + lab + " ]");
-            auto p = fresh("p");
-            o.push_back("  " + p + " = getelementptr " + x.ty + ", " + x.ty + " addrspace(3)* " + x.g + ", i32 0, i32 " + i);
-            auto q = fresh("a"); o.push_back("  " + q + " = add i32 " + i + ", " + std::to_string(x.off));
-            auto q2 = fresh("a"); o.push_back("  " + q2 + " = shl i32 " + q + ", 2");
-            auto a = fresh("a"); o.push_back("  " + a + " = add i32 %sp.gb, " + q2);
+            return ats;
+        };
+        auto move = [&](const std::string& p, const std::string& a) {
             if (out) {
-                auto v = fresh("x"); o.push_back("  " + v + " = load " + x.el + ", " + x.el + " addrspace(3)* " + p + ", align 4");
-                rawStore(o, a, toWords(o, v, x.el)[0]);
+                auto v = fresh("x");
+                o.push_back("  " + v + " = load " + el + ", " + pty + " " + p + ", align " + al);
+                auto ats = wordsAt(a);
+                auto ws = toWords(o, v, el);
+                for (size_t k = 0; k < ats.size() && k < ws.size(); ++k) rawStore(o, ats[k], ws[k]);
             } else {
-                auto w = fresh("l"); rawLoad(o, a, w);
-                auto v = fresh("x"); fromWords(o, v, x.el, { w });
-                o.push_back("  store " + x.el + " " + v + ", " + x.el + " addrspace(3)* " + p + ", align 4");
+                std::vector<std::string> ws;
+                for (const auto& at : wordsAt(a)) { auto w = fresh("l"); rawLoad(o, at, w); ws.push_back(w); }
+                auto v = fresh("x");
+                fromWords(o, v, el, ws);
+                o.push_back("  store " + el + " " + v + ", " + pty + " " + p + ", align " + al);
             }
-            o.push_back("  " + inx + " = add i32 " + i + ", " + std::to_string(step));
-            auto c = fresh("k"); o.push_back("  " + c + " = icmp ult i32 " + inx + ", " + std::to_string(x.n));
-            o.push_back("  br i1 " + c + ", label %" + lab + ", label %" + lab + ".done");
-            o.push_back("");
-            o.push_back(lab + ".done:");
-            pred = lab + ".done";
+        };
+        if (!n) {
+            auto a = fresh("a");
+            o.push_back("  " + a + " = add i32 " + base + ", " + std::to_string(4 * off));
+            move(g, a);
+            return pred;
+        }
+        const std::string lab = fresh("c").substr(1);
+        const std::string start = strided ? "%sp.fi" : "0";
+        const unsigned step = strided ? NT : 1;
+        if (strided) {
+            auto c0 = fresh("k"); o.push_back("  " + c0 + " = icmp ult i32 %sp.fi, " + std::to_string(n));
+            o.push_back("  br i1 " + c0 + ", label %" + lab + ", label %" + lab + ".done");
+        } else {
+            o.push_back("  br label %" + lab);
+        }
+        o.push_back("");
+        o.push_back(lab + ":");
+        auto i = fresh("i");
+        auto inx = fresh("i");
+        o.push_back("  " + i + " = phi i32 [ " + start + ", %" + pred + " ], [ " + inx + ", %" + lab + " ]");
+        auto p = fresh("p");
+        o.push_back("  " + p + " = getelementptr " + ty + ", " + ty + (asp ? " addrspace(3)" : "") + "* " + g +
+                    ", i32 0, i32 " + i);
+        std::string q;
+        if (dw == 1) {
+            q = fresh("a"); o.push_back("  " + q + " = add i32 " + i + ", " + std::to_string(off));
+        } else {
+            auto m = fresh("a"); o.push_back("  " + m + " = mul i32 " + i + ", " + std::to_string(dw));
+            q = fresh("a"); o.push_back("  " + q + " = add i32 " + m + ", " + std::to_string(off));
+        }
+        auto q2 = fresh("a"); o.push_back("  " + q2 + " = shl i32 " + q + ", 2");
+        auto a = fresh("a"); o.push_back("  " + a + " = add i32 " + base + ", " + q2);
+        move(p, a);
+        o.push_back("  " + inx + " = add i32 " + i + ", " + std::to_string(step));
+        auto c = fresh("k"); o.push_back("  " + c + " = icmp ult i32 " + inx + ", " + std::to_string(n));
+        o.push_back("  br i1 " + c + ", label %" + lab + ", label %" + lab + ".done");
+        o.push_back("");
+        o.push_back(lab + ".done:");
+        return lab + ".done";
+    };
+    auto gsCopy = [&](std::vector<std::string>& o, bool out, std::string pred) {
+        for (const auto& x : saved) pred = copyArray(o, out, pred, "%sp.gb", x.g, x.ty, x.n, x.el, x.off, !out, true);
+        return pred;
+    };
+    // The thread's local arrays `which` (allocas) between the array and its
+    // fields in the scratch buffer.
+    auto localCopy = [&](std::vector<std::string>& o, bool out, std::string pred,
+                         const std::vector<std::string>& which) {
+        for (const auto& u : which) {
+            const AllocaShapeT s = AllocaShape(*defs[u]);
+            pred = copyArray(o, out, pred, "%sp.tb", u, s.ty, s.n, s.el, field[u], false, false);
         }
         return pred;
     };
@@ -818,9 +919,18 @@ SplitResult SplitAtQuery(const std::string& text) {
             auto ws = toWords(o, v, TypeOf(*d));
             for (size_t k = 0; k < ws.size(); ++k) rawStore(o, addr(o, field[u] + (unsigned)k), ws[k]);
         }
+        localCopy(o, true, "sp.lv" + std::to_string(aroundIndex(b.label)), carry['B']);
         o.push_back("  br label %sp.ajoin");
         o.push_back("");
         return true;
+    };
+    // A block header's "; preds =" comment can name a block Q does not have
+    // (the entry, one around the query), which the normaliser would take for
+    // a reference: Q's headers go without.
+    auto bare = [](std::string h) {
+        h = h.substr(0, h.find(';'));
+        while (!h.empty() && (h.back() == ' ' || h.back() == '\t')) h.pop_back();
+        return h;
     };
 
     // --- A ---
@@ -844,6 +954,7 @@ SplitResult SplitAtQuery(const std::string& text) {
                 auto ws = toWords(A, u, TypeOf(*defs[u]));
                 for (size_t d = 0; d < ws.size(); ++d) rawStore(A, addr(A, field[u] + (unsigned)d), ws[d]);
             }
+            localCopy(A, true, "sp.atail", carried);
             for (const char* l : { "  br label %sp.ajoin", "", "sp.ajoin:" }) A.push_back(l);
             if (!saved.empty()) {
                 A.push_back(barrier);
@@ -859,12 +970,14 @@ SplitResult SplitAtQuery(const std::string& text) {
 
     // --- Q ---
     std::vector<std::string> Q = { "sp.qentry:" };
+    for (const auto& u : carry['Q']) Q.push_back(defs[u]->line);
     prologue(Q);
     rawLoad(Q, "%sp.tb", "%sp.al");
     for (const char* l : { "  %sp.alc = icmp eq i32 %sp.al, 1", "  br i1 %sp.alc, label %sp.qgo, label %sp.qret", "",
                            "sp.qret:", "  ret void", "", "sp.qgo:" })
         Q.push_back(l);
     loadAll(Q, 'Q');
+    localCopy(Q, false, "sp.qgo", carry['Q']);
     rebuilt(Q, 'Q');
     const std::string sl = S->label.empty() ? "sp.s" : S->label.substr(1);
     Q.push_back("  br label %" + sl);
@@ -874,20 +987,11 @@ SplitResult SplitAtQuery(const std::string& text) {
     Q.push_back("");
     for (const auto& b : fn.blocks)
         if (R.count(b.label) && &b != S) {
-            Q.push_back(header(b));
+            Q.push_back(bare(header(b)));
             for (const auto& i : b.instrs) Q.push_back(i.line);
             Q.push_back("");
         }
-    // Its "; preds =" comment names the blocks around the query too, which
-    // the normaliser would take for a reference.
-    {
-        std::string h = header(*Pb);
-        if (!around.empty()) {
-            h = h.substr(0, h.find(';'));
-            while (!h.empty() && h.back() == ' ') h.pop_back();
-        }
-        Q.push_back(h);
-    }
+    Q.push_back(bare(header(*Pb)));
     for (const auto& i : Pb->instrs) {
         if (!i.isPhi) continue;
         std::vector<std::pair<std::string, std::string>> keep;
@@ -908,11 +1012,13 @@ SplitResult SplitAtQuery(const std::string& text) {
         auto ws = toWords(Q, u, TypeOf(*defs[u]));
         for (size_t d = 0; d < ws.size(); ++d) rawStore(Q, addr(Q, field[u] + (unsigned)d), ws[d]);
     }
+    localCopy(Q, true, P.substr(1), qout);
     Q.push_back("  ret void");
     Q.push_back("");
 
     // --- B ---
     std::vector<std::string> Bt = { "sp.bentry:" };
+    for (const auto& u : carry['B']) Bt.push_back(defs[u]->line);
     prologue(Bt);
     std::string pred = "sp.bentry";
     if (!saved.empty()) {
@@ -924,6 +1030,7 @@ SplitResult SplitAtQuery(const std::string& text) {
                            "sp.bret:", "  ret void", "", "sp.bgo:" })
         Bt.push_back(l);
     loadAll(Bt, 'B');
+    localCopy(Bt, false, "sp.bgo", carry['B']);
     rebuilt(Bt, 'B');
     Bt.push_back("  br label %" + P.substr(1));
     Bt.push_back("");
