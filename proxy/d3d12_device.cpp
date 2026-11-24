@@ -969,7 +969,16 @@ HRESULT Dxr11Device::CreateStateObjectReal(const D3D12_STATE_OBJECT_DESC* d0, RE
     gidx::Transformed rt;
     std::shared_ptr<rgq::Info> rinfo;
     std::string rwhy;
-    const auto ro = rgq::Transform(m_real, *d, &rt, &rinfo, &rwhy);
+    // A linked collection built with other configs is built again through
+    // this same path (0.83.0), its pipeline flags as they were.
+    const auto ro = rgq::Transform(m_real, *d, &rt, &rinfo, &rwhy,
+        [this](const D3D12_STATE_OBJECT_DESC& cd, const pflags::Mode& m,
+               Microsoft::WRL::ComPtr<ID3D12StateObject>* out) {
+            void* p = nullptr;
+            const HRESULT hr = CreateStateObjectReal(&cd, __uuidof(ID3D12StateObject), &p, m.set ? &m : nullptr);
+            if (SUCCEEDED(hr) && p) out->Attach(static_cast<ID3D12StateObject*>(p));
+            return hr;
+        });
     if (ro == rgq::Outcome::kRefused) {
         static LONG rn = 0;
         if (InterlockedIncrement(&rn) <= 16)
@@ -982,7 +991,7 @@ HRESULT Dxr11Device::CreateStateObjectReal(const D3D12_STATE_OBJECT_DESC* d0, RE
         if (ro == rgq::Outcome::kTransformed)
             ProxyLog("[dxr-tier-11-proxy-log] %s; CreateStateObject hr=0x%08lx\n", rt.summary.c_str(),
                      (unsigned long)hr);
-        if (ro != rgq::Outcome::kTransformed || FAILED(hr) || !pp || !*pp) return hr;
+        if (ro != rgq::Outcome::kTransformed || !rinfo || FAILED(hr) || !pp || !*pp) return hr;
         ID3D12StateObject* so = nullptr;
         if (SUCCEEDED(static_cast<IUnknown*>(*pp)->QueryInterface(IID_PPV_ARGS(&so))) && so) {
             std::string w;

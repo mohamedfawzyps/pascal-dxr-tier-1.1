@@ -357,22 +357,64 @@ std::string ShimMiss(const std::string& in) {
 
 bool PointRaygenQueries(const std::string& in, unsigned queries, unsigned mult,
                         const std::vector<unsigned>& slotOf, unsigned slots,
-                        const std::vector<unsigned>& caps, std::string* out, std::string* why,
-                        unsigned base, unsigned total) {
+                        const std::vector<unsigned>& caps, std::string* out, std::string* why) {
+    if (in.find("@dx.op.geometryIndex.") != std::string::npos) {
+        *why = "GeometryIndex() in a DXR shader that uses RayQuery: the shim reads its own constants "
+               "where GeometryIndex() would be read";
+        return false;
+    }
     std::string gi;
     std::vector<std::string> fns;
     if (!LowerGeometryIndex(ShimMiss(in), &gi, &fns, why)) return false;
     std::vector<std::pair<unsigned, unsigned>> pairs;
-    if (!total) total = queries;
-    for (unsigned j = 0; j < total; ++j) pairs.push_back({ 15u, 2u + j });
-    for (unsigned k = 0; k < queries; ++k) pairs[base + k] = { k, mult };
+    for (unsigned k = 0; k < queries; ++k) pairs.push_back({ k, mult });
     int calls = 0;
-    if (!RetraceToShimScene(gi, pairs, 0, slotOf, slots, caps, out, &calls, why, "struct.Payload"))
+    std::string text;
+    if (!RetraceToShimScene(gi, pairs, 0, slotOf, slots, caps, &text, &calls, why, "struct.Payload"))
         return false;
     if (!calls) {
         *why = "the lowered raygen has no TraceRay of its own to point at the shim's scene";
         return false;
     }
+    // The constants are three dwords now (0.83.0): the miss index, the
+    // shader's first query slot and the pipeline's query slots; then each
+    // call's ray contribution and multiplier from them. point_queries.
+    const std::string rec = "!\"dxr11.gi\", i32 2147418112, i32 0, i32 1, i32 4, null";
+    const size_t at = text.find(rec);
+    if (at == std::string::npos || text.find(rec, at + 1) != std::string::npos) {
+        *why = "the shim's constant record is not where it was looked for";
+        return false;
+    }
+    text.replace(at, rec.size(), "!\"dxr11.gi\", i32 2147418112, i32 0, i32 1, i32 12, null");
+    static const std::regex kArgs(R"RX(, i32 (\d+), i32 (\d+), i32 %rgq\.ms(\d+), )RX");
+    static const std::regex kRead(R"RX(^(\s*)%rgq\.ms(\d+) = extractvalue %dx\.types\.CBufRet\.i32 (%gi\.\d+\.r), 0$)RX");
+    auto lines = llm::SplitLines(text);
+    std::map<std::string, std::string> lit;
+    for (auto& l : lines) {
+        if (l.find("call void @dx.op.traceRay.struct.Payload(") == std::string::npos) continue;
+        std::smatch m;
+        if (!std::regex_search(l, m, kArgs)) continue;
+        const std::string k = m[3].str();
+        auto it = lit.find(k);
+        if (it == lit.end()) lit[k] = m[1].str();
+        else if (it->second != m[1].str()) {
+            *why = "a lowered TraceRay traced with two query slots";
+            return false;
+        }
+        l = m.prefix().str() + ", i32 %rgq.r" + k + ", i32 %rgq.tot" + k + ", i32 %rgq.ms" + k + ", " +
+            m.suffix().str();
+    }
+    std::vector<std::string> res;
+    for (const auto& l : lines) {
+        res.push_back(l);
+        std::smatch m;
+        if (!std::regex_match(l, m, kRead) || !lit.count(m[2].str())) continue;
+        const std::string ind = m[1].str(), k = m[2].str(), r = m[3].str();
+        res.push_back(ind + "%rgq.base" + k + " = extractvalue %dx.types.CBufRet.i32 " + r + ", 1");
+        res.push_back(ind + "%rgq.tot" + k + " = extractvalue %dx.types.CBufRet.i32 " + r + ", 2");
+        res.push_back(ind + "%rgq.r" + k + " = add i32 %rgq.base" + k + ", " + lit[k]);
+    }
+    *out = Join(res);
     return true;
 }
 

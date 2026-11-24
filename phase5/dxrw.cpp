@@ -156,11 +156,8 @@ int main(int argc, char** argv) {
         std::string raw;
         if (!ReadAll(argv[2], raw)) { std::printf("cannot read %s\n", argv[2]); return 1; }
         std::string text, why;
-        // [base total] (0.82.0): the queries' first slot of the pipeline's.
-        const unsigned base = argc >= 8 ? (unsigned)std::atoi(argv[6]) : 0u;
-        const unsigned total = argc >= 8 ? (unsigned)std::atoi(argv[7]) : 0u;
         if (!rq::PointRaygenQueries(llm::Normalize(raw), (unsigned)std::atoi(argv[4]),
-                                    (unsigned)std::atoi(argv[5]), {}, 1, {}, &text, &why, base, total)) {
+                                    (unsigned)std::atoi(argv[5]), {}, 1, {}, &text, &why)) {
             std::fprintf(stderr, "REFUSED: %s\n", why.c_str());
             return 2;
         }

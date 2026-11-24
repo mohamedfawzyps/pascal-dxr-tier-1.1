@@ -49,6 +49,7 @@
 #include <vector>
 
 #include "geom_index_so.h"
+#include "pipe_flags.h"
 
 namespace rgq {
 
@@ -76,6 +77,7 @@ struct Hosted {
     UINT payloadBytes = 0;
     gidx::Scenes scenes;           // where its lowered TraceRay calls take their scene
     UINT slots = 1;                // its scene slots, one structure each
+    UINT srvs = 1;                 // the scene copies its units' records carry (its description's most)
     UINT queryBase = 0;            // its first query slot in the shim's block
     std::vector<Unit> units;
     uint8_t idMiss[32] = {}, idNullTri[32] = {}, idNullProc[32] = {};
@@ -86,15 +88,31 @@ struct Hosted {
 struct Info {
     std::vector<Hosted> hosted;
     UINT queries = 0;              // query slots in all
-    UINT srvs = 1;                 // scene copies every unit's records carry
+    bool collection = false;       // a collection's: no identifiers, the linking pipeline reads them
+    // The shader and pipeline configs it was built with (0.83.0): a pipeline
+    // and every collection it links have to agree on them.
+    bool hasConfig = false;
+    UINT payload = 0, attr = 0, depth = 0;
+    // Collections built again for this pipeline, with its configs.
+    std::vector<Microsoft::WRL::ComPtr<ID3D12StateObject>> keep;
 };
+
+// The configs a pipeline hosting RayQuery shaders imposes on a collection it
+// links (0.83.0): set around building that collection again, on this thread.
+struct Force {
+    UINT payload = 0, attr = 0, depth = 0;
+};
+void SetForce(const Force* f);
 
 enum class Outcome { kNothing, kTransformed, kRefused };
 
 // `dev` is the REAL device. On kTransformed create `out->desc` instead, then
 // Attach the info to what it made.
+// `create` builds a collection again (the device's own path), for one
+// whose configs differ from the pipeline's. A description with nothing to
+// lower is transformed only under a Force, and then *info is null.
 Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, gidx::Transformed* out,
-                  std::shared_ptr<Info>* info, std::string* why);
+                  std::shared_ptr<Info>* info, std::string* why, const pflags::CreateFn& create);
 // Reads the identifiers and keeps the info with the state object.
 bool Attach(ID3D12StateObject* so, const std::shared_ptr<Info>& info, std::string* why);
 std::shared_ptr<Info> Get(ID3D12StateObject* so);

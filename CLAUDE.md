@@ -165,6 +165,17 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.83.0: PLAN STEP 4 DONE; RAYQUERY IN A RAYGEN, CLOSEST-HIT OR MISS DRAWS
+IN COLLECTIONS AND THROUGH EXPORT LISTS.** A shader's query slot and the
+pipeline's slot count are read at run time beside the miss index, so a
+collection is lowered before the pipeline linking it exists. Export lists
+keep what is left, renamed shaders' shim shaders follow the exported name.
+**D3D12 refuses a pipeline whose collections disagree on the configs**, so a
+linked collection built with others is built again from its kept
+description with the pipeline's (`rgq::Force`). `gitest --collections`,
+`--grow`, `--rgsplit` all match. Escher 845 of 845 byte-identical. NEXT: plan
+step 5 (RayQuery beside groupshared, barriers, wave ops).
+
 **0.82.0: PLAN STEP 4 c DONE, RAYQUERY IN AN APPLICATION'S CLOSEST-HIT AND
 MISS IS DRAWN.** Hosted like a raygen, then given its own signature and entry
 back (`restore_function`); one recursion level deeper. `proxy/rg_query` now

@@ -258,6 +258,7 @@ struct Transformed {
     std::deque<D3D12_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION> dxilAssoc;
     std::deque<D3D12_EXISTING_COLLECTION_DESC> colls;
     std::deque<std::vector<LPCWSTR>> exportLists;
+    std::deque<std::vector<D3D12_EXPORT_DESC>> exportDescs;   // libraries' export lists (rg_query)
     std::deque<std::wstring> names;
     std::vector<Microsoft::WRL::ComPtr<ID3D12RootSignature>> sigs;
     std::deque<std::vector<uint8_t>> raw;   // other subobject descs, by value

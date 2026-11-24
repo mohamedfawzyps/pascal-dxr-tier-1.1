@@ -300,6 +300,14 @@ void NoteCollection(ID3D12StateObject* so, const D3D12_STATE_OBJECT_DESC& origin
     h->Release();
 }
 
+bool CollectionOriginal(ID3D12StateObject* so, D3D12_STATE_OBJECT_DESC* desc, Mode* applied) {
+    CollInfo* c = GetColl(so);
+    if (!c) return false;
+    *desc = c->store.Desc(D3D12_STATE_OBJECT_TYPE_COLLECTION);
+    *applied = c->applied;
+    return true;
+}
+
 void KeepWith(ID3D12StateObject* so, const Rewritten& r) {
     if (!so || r.keep.empty()) return;
     auto v = std::make_unique<std::vector<ComPtr<ID3D12StateObject>>>(r.keep);

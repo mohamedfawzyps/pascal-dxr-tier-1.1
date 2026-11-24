@@ -37,6 +37,9 @@ const UINT kRecAlign = D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT;   // 32
 const UINT kTableAlign = D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT;  // 64
 const UINT kAttrBytes = 8;
 const UINT kRaygen = 7, kClosestHit = 10, kMiss = 11;
+// The constants appended after the scene copies: the miss index, the
+// shader's first query slot, the pipeline's query slots (0.83.0).
+const UINT kConstants = 3;
 // {5f1e0a63-2b7d-4c94-9e38-71a0c4d2b816}
 const GUID kInfoGuid = { 0x5f1e0a63, 0x2b7d, 0x4c94, { 0x9e, 0x38, 0x71, 0xa0, 0xc4, 0xd2, 0xb8, 0x16 } };
 
@@ -119,10 +122,14 @@ struct Lowered {
     Hosted h;
     std::string text;
     std::vector<unsigned> slotOf;
+    std::string inner;   // dxr11_rq_<its own name>_: its generated shaders' prefix in the library
 };
 
-bool LowerShader(const std::string& norm, const std::string& name, uint32_t kind, Lowered* out,
-                 std::string* why) {
+// `name` is the function's own name, `as` the one it is exported by (0.83.0:
+// an export list may rename it); the shim's names follow the exported one, so
+// two libraries holding the same function do not clash.
+bool LowerShader(const std::string& norm, const std::string& name, const std::wstring& as, uint32_t kind,
+                 Lowered* out, std::string* why) {
     std::string cs, text;
     if (!rq::RaygenAsCs(norm, name, &cs, why)) return false;
     if (!rq::FoldNvapi(cs, &text, why)) return false;
@@ -133,8 +140,9 @@ bool LowerShader(const std::string& norm, const std::string& name, uint32_t kind
     if (!l.ok) { *why = l.error; return false; }
     if (!rq::RestoreFunction(l.text, cs, norm, name, &out->text, why)) return false;
     Hosted& r = out->h;
-    r.name = Wide(name);
-    r.prefix = Wide("dxr11_rq_" + name + "_");
+    r.name = as;
+    r.prefix = L"dxr11_rq_" + as + L"_";
+    out->inner = "dxr11_rq_" + name + "_";
     r.kind = kind;
     r.hasAnyHit = a.query.AnyNeedsAnyHit();
     r.hasIntersection = a.query.NeedsIntersection();
@@ -258,12 +266,40 @@ bool CopyWithArgs(ID3D12GraphicsCommandList4* cl, ID3D12Device* dev, D3D12_GPU_V
     return true;
 }
 
+thread_local const Force* t_force = nullptr;
+
+// The shader and pipeline configs a description declares at its scope.
+struct Configs {
+    bool shader = false, pipeline = false;
+    UINT payload = 0, attr = 0, depth = 0;
+};
+Configs ConfigsOf(const D3D12_STATE_OBJECT_DESC& d) {
+    Configs c;
+    for (UINT i = 0; i < d.NumSubobjects; ++i) {
+        const auto& so = d.pSubobjects[i];
+        if (!so.pDesc) continue;
+        if (so.Type == D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG) {
+            const auto* x = static_cast<const D3D12_RAYTRACING_SHADER_CONFIG*>(so.pDesc);
+            c.shader = true;
+            c.payload = x->MaxPayloadSizeInBytes;
+            c.attr = x->MaxAttributeSizeInBytes;
+        } else if (so.Type == D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG) {
+            c.pipeline = true;
+            c.depth = static_cast<const D3D12_RAYTRACING_PIPELINE_CONFIG*>(so.pDesc)->MaxTraceRecursionDepth;
+        }
+    }
+    return c;
+}
+
 }  // namespace
 
+void SetForce(const Force* f) { t_force = f; }
+
 Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, gidx::Transformed* out,
-                  std::shared_ptr<Info>* infoOut, std::string* why) {
+                  std::shared_ptr<Info>* infoOut, std::string* why, const pflags::CreateFn& create) {
     const UINT n = in.NumSubobjects;
     const D3D12_STATE_SUBOBJECT* s = in.pSubobjects;
+    const Force* force = t_force;
     std::vector<UINT> queryLibs;
     for (UINT i = 0; i < n; ++i) {
         if (s[i].Type != D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY || !s[i].pDesc) continue;
@@ -271,30 +307,66 @@ Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, gidx::Tr
         if (Dxr11ContainerUsesRayQuery(ld->DXILLibrary.pShaderBytecode, ld->DXILLibrary.BytecodeLength))
             queryLibs.push_back(i);
     }
-    if (queryLibs.empty()) return Outcome::kNothing;
-    if (in.Type != D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE) {
-        *why = "RayQuery in a DXR shader of a collection (plan step 4 d)";
-        return Outcome::kRefused;
-    }
-    for (UINT i = 0; i < n; ++i)
-        if (s[i].Type == D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION) {
-            *why = "RayQuery in a DXR shader of a pipeline that links a collection (plan step 4 d)";
+    // Collections this links whose shaders the shim lowered (0.83.0): their
+    // hosted shaders are the pipeline's too.
+    std::vector<std::shared_ptr<Info>> linked;
+    for (UINT i = 0; i < n; ++i) {
+        if (s[i].Type != D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION || !s[i].pDesc) continue;
+        const auto* ec = static_cast<const D3D12_EXISTING_COLLECTION_DESC*>(s[i].pDesc);
+        std::shared_ptr<Info> ci = Get(ec->pExistingCollection);
+        if (!ci || ci->hosted.empty()) continue;
+        if (ec->NumExports) {
+            *why = "a collection with RayQuery shaders linked through an export list";
             return Outcome::kRefused;
         }
+        linked.push_back(ci);
+    }
+    const bool collection = in.Type == D3D12_STATE_OBJECT_TYPE_COLLECTION;
+    if (queryLibs.empty() && linked.empty()) {
+        if (!force) return Outcome::kNothing;
+        // A collection with nothing to lower, built again for a pipeline
+        // hosting RayQuery shaders: only its configs change.
+        std::vector<UINT> none;
+        if (!gidx::ExtendUnits(dev, in, 1, kConstants, {}, {}, out, &none, why)) return Outcome::kRefused;
+        for (auto& so : out->subs) {
+            if (so.Type == D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG && so.pDesc) {
+                D3D12_RAYTRACING_SHADER_CONFIG c = *static_cast<const D3D12_RAYTRACING_SHADER_CONFIG*>(so.pDesc);
+                c.MaxPayloadSizeInBytes = (std::max)(c.MaxPayloadSizeInBytes, force->payload);
+                c.MaxAttributeSizeInBytes = (std::max)(c.MaxAttributeSizeInBytes, force->attr);
+                out->raw.emplace_back(sizeof(c));
+                std::memcpy(out->raw.back().data(), &c, sizeof(c));
+                so.pDesc = out->raw.back().data();
+            } else if (so.Type == D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG && so.pDesc) {
+                D3D12_RAYTRACING_PIPELINE_CONFIG c = *static_cast<const D3D12_RAYTRACING_PIPELINE_CONFIG*>(so.pDesc);
+                c.MaxTraceRecursionDepth = force->depth;
+                out->raw.emplace_back(sizeof(c));
+                std::memcpy(out->raw.back().data(), &c, sizeof(c));
+                so.pDesc = out->raw.back().data();
+            }
+        }
+        out->desc.Type = in.Type;
+        out->desc.NumSubobjects = (UINT)out->subs.size();
+        out->desc.pSubobjects = out->subs.data();
+        out->summary = "a collection built again with the configs of a pipeline hosting RayQuery shaders";
+        infoOut->reset();
+        return Outcome::kTransformed;
+    }
 
     auto info = std::make_shared<Info>();
-    // Each library with RayQuery: its shaders lowered, the rest kept.
+    info->collection = collection;
+    // Each library with RayQuery: its exported shaders lowered, every shader
+    // with RayQuery removed from it (one it does not export would still make
+    // the driver reject the library), the rest kept under its export list
+    // less the shaders removed.
     std::deque<Lowered> lowered;
     std::deque<std::vector<uint8_t>> stripped;
-    std::vector<std::pair<UINT, bool>> placeOf;   // per library: its index, emptied
+    std::map<UINT, const std::vector<uint8_t>*> code;
+    std::map<UINT, std::vector<D3D12_EXPORT_DESC>> exportsLeft;   // libraries with a list
+    std::set<UINT> removed;                                       // libraries with nothing left
     for (UINT i : queryLibs) {
         const auto* ld = static_cast<const D3D12_DXIL_LIBRARY_DESC*>(s[i].pDesc);
         const void* bytes = ld->DXILLibrary.pShaderBytecode;
         const size_t size = ld->DXILLibrary.BytecodeLength;
-        if (ld->NumExports) {
-            *why = "RayQuery in a DXR shader of a library included through an export list (plan step 4 d)";
-            return Outcome::kRefused;
-        }
         if (gidx::LibraryHasSubobjects(bytes, size)) {
             *why = "RayQuery in a DXR shader of a library that declares subobjects of its own";
             return Outcome::kRefused;
@@ -307,8 +379,20 @@ Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, gidx::Tr
         const std::string norm = llm::Normalize(text);
         std::vector<std::pair<std::string, uint32_t>> fns;
         gidx::LibraryFunctions(bytes, size, &fns);
+        // The name a function is exported by: its own, a rename, or none.
+        auto exportedAs = [&](const std::string& fn, std::wstring* as) {
+            if (!ld->NumExports) { *as = Wide(fn); return true; }
+            for (UINT e = 0; e < ld->NumExports; ++e) {
+                const auto& x = ld->pExports[e];
+                if ((x.ExportToRename ? x.ExportToRename : x.Name) == Wide(fn)) { *as = x.Name; return true; }
+            }
+            return false;
+        };
         std::vector<std::string> names;
         for (const auto& q : QueryFunctions(norm)) {
+            names.push_back(q);
+            std::wstring as;
+            if (!exportedAs(q, &as)) continue;   // removed, nothing to lower
             uint32_t kind = 0;
             for (const auto& f : fns) if (f.first == q) kind = f.second;
             if (kind != kRaygen && kind != kClosestHit && kind != kMiss) {
@@ -317,11 +401,10 @@ Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, gidx::Tr
             }
             lowered.emplace_back();
             std::string w;
-            if (!LowerShader(norm, q, kind, &lowered.back(), &w)) {
+            if (!LowerShader(norm, q, as, kind, &lowered.back(), &w)) {
                 *why = "RayQuery in " + q + ": " + w;
                 return Outcome::kRefused;
             }
-            names.push_back(q);
         }
         if (names.empty()) {
             *why = "a library flagged as using RayQuery with no function that does";
@@ -330,62 +413,62 @@ Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, gidx::Tr
         stripped.emplace_back();
         bool empty = false;
         if (!StripLibrary(norm, names, bytes, size, &stripped.back(), &empty, why)) return Outcome::kRefused;
-        placeOf.push_back({ i, empty });
+        if (ld->NumExports) {
+            std::vector<D3D12_EXPORT_DESC> left;
+            for (UINT e = 0; e < ld->NumExports; ++e) {
+                const auto& x = ld->pExports[e];
+                const std::wstring fn = x.ExportToRename ? x.ExportToRename : x.Name;
+                bool gone = false;
+                for (const auto& q : names) gone = gone || Wide(q) == fn;
+                if (!gone) left.push_back(x);
+            }
+            if (left.empty()) empty = true;
+            else exportsLeft[i] = left;
+        }
+        if (empty) removed.insert(i);
+        else code[i] = &stripped.back();
     }
 
-    // Query slots: each shader's after the one before. A scene copy's
+    // Every hosted shader: this description's, then the linked collections'.
+    for (const auto& L : lowered) info->hosted.push_back(L.h);
+    const size_t own = info->hosted.size();
+    for (const auto& ci : linked)
+        for (const auto& h : ci->hosted) info->hosted.push_back(h);
+    // Query slots: each shader's after the one before, assigned where the
+    // pipeline is made; the shaders read theirs at run time. A scene copy's
     // structure serves 15 ray contributions.
     UINT total = 0;
-    for (auto& L : lowered) {
-        L.h.queryBase = total;
-        total += L.h.Queries();
+    for (auto& h : info->hosted) {
+        h.queryBase = total;
+        total += h.Queries();
     }
-    if (total > shimscene::PairsPerStructure()) {
+    if (!collection && total > shimscene::PairsPerStructure()) {
         *why = std::to_string(total) + " RayQuery query slots in one pipeline, more than the " +
                std::to_string(shimscene::PairsPerStructure()) + " a scene copy holds";
         return Outcome::kRefused;
     }
     info->queries = total;
+    // This description's units carry `srvs` scene copies: its shaders' most.
     UINT srvs = 1;
-    for (const auto& L : lowered) srvs = (std::max)(srvs, L.h.slots);
-    info->srvs = srvs;
+    for (size_t k = 0; k < own; ++k) srvs = (std::max)(srvs, info->hosted[k].slots);
+    for (size_t k = 0; k < own; ++k) info->hosted[k].srvs = srvs;
     std::deque<std::vector<uint8_t>> libs;
     for (auto& L : lowered) {
         std::string pointed, err;
         if (!rq::PointRaygenQueries(llm::Normalize(L.text), L.h.Queries(), L.h.recordConstants ? 1u : 0u,
-                                    L.slotOf, L.h.slots, std::vector<unsigned>(L.h.slots, 1u), &pointed, why,
-                                    L.h.queryBase, total))
+                                    L.slotOf, L.h.slots, std::vector<unsigned>(L.h.slots, 1u), &pointed, why))
             return Outcome::kRefused;
         libs.emplace_back();
         if (!dxch::AssembleAndSign(pointed, &libs.back(), &err)) {
             *why = "the lowered library of " + Narrow(L.h.name) + " did not assemble: " + err;
             return Outcome::kRefused;
         }
-        info->hosted.push_back(L.h);
-    }
-
-    // The libraries in place of the application's: what is left of each, or
-    // where nothing is, one lowered library; the other lowered ones added.
-    std::map<UINT, const std::vector<uint8_t>*> code;
-    std::vector<const std::vector<uint8_t>*> added;
-    for (auto& b : libs) added.push_back(&b);
-    {
-        size_t k = 0;
-        for (const auto& p : placeOf) {
-            const std::vector<uint8_t>* st = &stripped[k++];
-            if (p.second) {
-                code[p.first] = added.back();
-                added.pop_back();
-            } else {
-                code[p.first] = st;
-            }
-        }
     }
 
     // Explicit associations of a library's subobject to a hosted shader:
     // what it names cannot be told here.
     std::set<std::wstring> hostedNames;
-    for (const auto& h : info->hosted) hostedNames.insert(h.name);
+    for (size_t k = 0; k < own; ++k) hostedNames.insert(info->hosted[k].name);
     for (UINT i = 0; i < n; ++i) {
         if (s[i].Type != D3D12_STATE_SUBOBJECT_TYPE_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION || !s[i].pDesc) continue;
         const auto* a = static_cast<const D3D12_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION*>(s[i].pDesc);
@@ -399,11 +482,11 @@ Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, gidx::Tr
     // The units: a raygen or miss itself, a closest-hit each hit group
     // importing it with that group's shaders. Their local root signatures
     // extended by one root SRV per scene slot (the shim's copy), then the
-    // miss index.
+    // three constants (miss index, first query slot, query slots).
     const auto groups = gidx::HitGroupUnits(in);
     std::vector<std::vector<std::wstring>> units;
     std::vector<std::pair<size_t, size_t>> unitOf;   // (hosted, unit)
-    for (size_t k = 0; k < info->hosted.size(); ++k) {
+    for (size_t k = 0; k < own; ++k) {
         Hosted& h = info->hosted[k];
         if (h.kind != kClosestHit) {
             h.units.push_back({ h.name });
@@ -417,11 +500,57 @@ Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, gidx::Tr
                 units.push_back(g);
                 unitOf.push_back({ k, h.units.size() - 1 });
             }
+        if (h.units.empty() && collection) {
+            *why = "a closest-hit with RayQuery in a collection that holds no hit group importing it";
+            return Outcome::kRefused;
+        }
     }
     std::vector<UINT> offsets;
-    if (!gidx::ExtendUnits(dev, in, srvs, 1, units, code, out, &offsets, why)) return Outcome::kRefused;
+    if (!gidx::ExtendUnits(dev, in, srvs, kConstants, units, code, out, &offsets, why)) return Outcome::kRefused;
     for (size_t u = 0; u < units.size(); ++u)
         info->hosted[unitOf[u].first].units[unitOf[u].second].insert = offsets[u];
+
+    // Libraries keep their order through ExtendUnits: what is left of each
+    // gets its export list less the shaders removed, and one with nothing
+    // left goes.
+    {
+        UINT ordinal = 0;
+        std::vector<UINT> libAt;   // input index of each library, in order
+        for (UINT i = 0; i < n; ++i)
+            if (s[i].Type == D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY) libAt.push_back(i);
+        std::vector<size_t> drop;
+        for (size_t k = 0; k < out->subs.size(); ++k) {
+            if (out->subs[k].Type != D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY) continue;
+            const UINT i = ordinal < libAt.size() ? libAt[ordinal] : ~0u;
+            ++ordinal;
+            if (removed.count(i)) { drop.push_back(k); continue; }
+            auto el = exportsLeft.find(i);
+            if (el == exportsLeft.end()) continue;
+            out->exportDescs.push_back(el->second);
+            D3D12_DXIL_LIBRARY_DESC ld = *static_cast<const D3D12_DXIL_LIBRARY_DESC*>(out->subs[k].pDesc);
+            ld.NumExports = (UINT)out->exportDescs.back().size();
+            ld.pExports = out->exportDescs.back().data();
+            out->libs.push_back(ld);
+            out->subs[k].pDesc = &out->libs.back();
+        }
+        if (!drop.empty()) {
+            // Associations point at subobjects by address: as indices while
+            // the array loses the libraries, then back.
+            for (auto& a : out->assoc)
+                a.pSubobjectToAssociate = reinterpret_cast<const D3D12_STATE_SUBOBJECT*>(
+                    (uintptr_t)(a.pSubobjectToAssociate - out->subs.data()));
+            for (auto it = drop.rbegin(); it != drop.rend(); ++it) {
+                out->subs.erase(out->subs.begin() + (ptrdiff_t)*it);
+                for (auto& a : out->assoc) {
+                    const size_t t = (size_t)(uintptr_t)a.pSubobjectToAssociate;
+                    if (t > *it)
+                        a.pSubobjectToAssociate = reinterpret_cast<const D3D12_STATE_SUBOBJECT*>((uintptr_t)(t - 1));
+                }
+            }
+            for (auto& a : out->assoc)
+                a.pSubobjectToAssociate = &out->subs[(size_t)(uintptr_t)a.pSubobjectToAssociate];
+        }
+    }
 
     // The association pointers into out->subs, as indices, while it grows.
     for (auto& a : out->assoc)
@@ -438,20 +567,27 @@ Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, gidx::Tr
         payload = (std::max)(payload, h.payloadBytes);
         deeper = deeper || h.kind != kRaygen;
     }
+    // Built again for a pipeline (0.83.0): its configs exactly.
+    if (force) payload = (std::max)(payload, force->payload);
     bool config = false;
     for (size_t k = 0; k < before; ++k) {
         auto& so = out->subs[k];
         if (so.Type == D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG && so.pDesc) {
             D3D12_RAYTRACING_SHADER_CONFIG c = *static_cast<const D3D12_RAYTRACING_SHADER_CONFIG*>(so.pDesc);
             c.MaxPayloadSizeInBytes = (std::max)(c.MaxPayloadSizeInBytes, payload);
-            c.MaxAttributeSizeInBytes = (std::max)(c.MaxAttributeSizeInBytes, kAttrBytes);
+            c.MaxAttributeSizeInBytes = (std::max)((std::max)(c.MaxAttributeSizeInBytes, kAttrBytes),
+                                                   force ? force->attr : 0u);
+            info->hasConfig = true;
+            info->payload = c.MaxPayloadSizeInBytes;
+            info->attr = c.MaxAttributeSizeInBytes;
             out->raw.emplace_back(sizeof(c));
             std::memcpy(out->raw.back().data(), &c, sizeof(c));
             so.pDesc = out->raw.back().data();
             config = true;
         } else if (so.Type == D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG && so.pDesc) {
             D3D12_RAYTRACING_PIPELINE_CONFIG c = *static_cast<const D3D12_RAYTRACING_PIPELINE_CONFIG*>(so.pDesc);
-            const UINT want = (std::max)(c.MaxTraceRecursionDepth + (deeper ? 1u : 0u), 1u);
+            const UINT want = force ? force->depth : (std::max)(c.MaxTraceRecursionDepth + (deeper ? 1u : 0u), 1u);
+            info->depth = want;
             if (want > D3D12_RAYTRACING_MAX_DECLARABLE_TRACE_RECURSION_DEPTH) {
                 *why = "a closest-hit or miss with RayQuery in a pipeline already at the deepest recursion "
                        "DXR allows";
@@ -465,18 +601,97 @@ Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, gidx::Tr
         }
     }
     if (!config) {
-        *why = "a RayQuery shader in a pipeline whose shader config is not at state object scope";
+        *why = "a RayQuery shader in a pipeline or collection whose shader config is not at its scope";
         return Outcome::kRefused;
     }
 
-    // The lowered libraries not already in place of the application's.
-    for (const auto* b : added) {
-        out->code.push_back(*b);   // kept with the description
-        D3D12_DXIL_LIBRARY_DESC ld{};
-        ld.DXILLibrary.pShaderBytecode = out->code.back().data();
-        ld.DXILLibrary.BytecodeLength = out->code.back().size();
-        out->libs.push_back(ld);
-        out->subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &out->libs.back() });
+    // A pipeline and the collections it links agree on the configs (D3D12
+    // refuses the pipeline otherwise): each linked collection built with
+    // other ones is built again from its kept description with these.
+    if (!collection) {
+        for (size_t k = 0; k < before; ++k) {
+            if (out->subs[k].Type != D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION || !out->subs[k].pDesc) continue;
+            const auto* ec = static_cast<const D3D12_EXISTING_COLLECTION_DESC*>(out->subs[k].pDesc);
+            D3D12_STATE_OBJECT_DESC od{};
+            pflags::Mode mode;
+            if (!pflags::CollectionOriginal(ec->pExistingCollection, &od, &mode)) {
+                *why = "a linked collection the shim did not see being created";
+                return Outcome::kRefused;
+            }
+            Configs has;
+            if (std::shared_ptr<Info> ci = Get(ec->pExistingCollection)) {
+                has.shader = ci->hasConfig;
+                has.payload = ci->payload;
+                has.attr = ci->attr;
+                has.depth = ci->depth;
+                has.pipeline = true;
+            } else {
+                has = ConfigsOf(od);
+            }
+            const bool payloadOk = !has.shader || (has.payload == info->payload && has.attr == info->attr);
+            const bool depthOk = !has.pipeline || has.depth == info->depth;
+            if (payloadOk && depthOk) continue;
+            Force f;
+            f.payload = info->payload;
+            f.attr = info->attr;
+            f.depth = info->depth;
+            Microsoft::WRL::ComPtr<ID3D12StateObject> rebuilt;
+            SetForce(&f);
+            const HRESULT hr = create ? create(od, mode, &rebuilt) : E_FAIL;
+            SetForce(nullptr);
+            if (FAILED(hr) || !rebuilt) {
+                char b[160];
+                std::snprintf(b, sizeof(b), "a linked collection could not be built again with the pipeline's "
+                              "configs (hr=0x%08lx)", (unsigned long)hr);
+                *why = b;
+                return Outcome::kRefused;
+            }
+            D3D12_EXISTING_COLLECTION_DESC nc = *ec;
+            nc.pExistingCollection = rebuilt.Get();
+            out->colls.push_back(nc);
+            out->subs[k].pDesc = &out->colls.back();
+            info->keep.push_back(rebuilt);
+        }
+    }
+
+    auto name = [&](const std::wstring& w) {
+        out->names.push_back(w);
+        return out->names.back().c_str();
+    };
+    // The lowered libraries, each through an export list: the shader under
+    // the name it is exported by, its generated shaders under the shim's
+    // names for that one.
+    std::vector<std::vector<std::wstring>> shadersOf;
+    {
+        size_t k = 0;
+        for (const auto& lib : libs) {
+            const Lowered& L = lowered[k];
+            const Hosted& r = info->hosted[k++];
+            std::string text, err;
+            if (!dxch::Disassemble(lib.data(), lib.size(), &text, &err)) {
+                *why = "a lowered library could not be read back";
+                return Outcome::kRefused;
+            }
+            std::vector<D3D12_EXPORT_DESC> ex;
+            std::vector<std::wstring> outer;
+            for (const auto& w : Defined(text, L.inner)) {
+                outer.push_back(r.prefix + w.substr(L.inner.size()));
+                const bool same = outer.back() == w;
+                ex.push_back({ name(outer.back()), same ? nullptr : name(w), D3D12_EXPORT_FLAG_NONE });
+            }
+            const std::wstring self = Wide(L.inner.substr(9, L.inner.size() - 10));   // its own name
+            ex.push_back({ name(r.name), self == r.name ? nullptr : name(self), D3D12_EXPORT_FLAG_NONE });
+            shadersOf.push_back(outer);
+            out->code.push_back(lib);   // kept with the description
+            out->exportDescs.push_back(ex);
+            D3D12_DXIL_LIBRARY_DESC ld{};
+            ld.DXILLibrary.pShaderBytecode = out->code.back().data();
+            ld.DXILLibrary.BytecodeLength = out->code.back().size();
+            ld.NumExports = (UINT)out->exportDescs.back().size();
+            ld.pExports = out->exportDescs.back().data();
+            out->libs.push_back(ld);
+            out->subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &out->libs.back() });
+        }
     }
 
     ComPtr<ID3D12RootSignature> pairRs, emptyRs;
@@ -484,10 +699,6 @@ Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, gidx::Tr
         ComPtr<ID3D12RootSignature>& r = pairSrv ? pairRs : emptyRs;
         if (!r && !LocalRs(dev, pairSrv, &r)) return nullptr;
         return r.Get();
-    };
-    auto name = [&](const std::wstring& w) {
-        out->names.push_back(w);
-        return out->names.back().c_str();
     };
     auto assoc = [&](size_t target, const std::vector<LPCWSTR>& list) {
         out->exportLists.push_back(list);
@@ -513,16 +724,10 @@ Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, gidx::Tr
         out->subs.push_back({ D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, out->raw.back().data() });
     };
 
-    size_t k = 0;
-    for (const auto& lib : libs) {
-        Hosted& r = info->hosted[k++];
-        std::string text, err;
-        if (!dxch::Disassemble(lib.data(), lib.size(), &text, &err)) {
-            *why = "a lowered library could not be read back";
-            return Outcome::kRefused;
-        }
-        // Its generated shaders, as the lowered library defines them.
-        const std::vector<std::wstring> shaders = Defined(text, Narrow(r.prefix));
+    for (size_t k = 0; k < own; ++k) {
+        Hosted& r = info->hosted[k];
+        // Its generated shaders, under the shim's names.
+        const std::vector<std::wstring>& shaders = shadersOf[k];
         auto has = [&](const std::wstring& w) {
             return std::find(shaders.begin(), shaders.end(), w) != shaders.end();
         };
@@ -616,8 +821,9 @@ Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, gidx::Tr
     out->desc.NumSubobjects = (UINT)out->subs.size();
     out->desc.pSubobjects = out->subs.data();
     char b[200];
-    std::snprintf(b, sizeof(b), "%zu RayQuery shader(s) lowered into the application's pipeline, %u query "
-                  "slot(s), %zu subobjects%s", info->hosted.size(), total, out->subs.size(),
+    std::snprintf(b, sizeof(b), "%zu RayQuery shader(s) lowered into the application's %s (%zu from linked "
+                  "collections), %u query slot(s), %zu subobjects%s", info->hosted.size(),
+                  collection ? "collection" : "pipeline", info->hosted.size() - own, total, out->subs.size(),
                   deeper ? ", recursion depth raised by 1" : "");
     out->summary = b;
     *infoOut = info;
@@ -627,6 +833,12 @@ Outcome Transform(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, gidx::Tr
 bool Attach(ID3D12StateObject* so, const std::shared_ptr<Info>& info, std::string* why) {
     ComPtr<ID3D12StateObjectProperties> props;
     if (FAILED(so->QueryInterface(IID_PPV_ARGS(&props)))) { *why = "no state object properties"; return false; }
+    if (info->collection) {
+        auto* h = new InfoHolder(info);
+        so->SetPrivateDataInterface(kInfoGuid, h);
+        h->Release();
+        return true;
+    }
     auto id = [&](const std::wstring& w, uint8_t* dst) {
         const void* p = props->GetShaderIdentifier(w.c_str());
         if (!p) return false;
@@ -810,15 +1022,17 @@ bool Dispatch(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, const Info& in
     // shim's table (GPU memory), and the upload buffer holding what the shim
     // writes itself: the copy pass's groups and arguments, the shim's misses,
     // its block and its pairs.
-    const UINT argDwords = 2 * info.srvs + 1, argBytes = 4 * argDwords;
+    auto argDwords = [](const Hosted& h) { return 2 * h.srvs + kConstants; };
     UINT needRg = appRg, needMiss = (std::max)(appMissSrc, kId), needHit = (std::max)(appHitStride, kId + (rc ? 8u : 0u));
-    UINT G = 0;
-    for (const auto& h : info.hosted)
+    UINT G = 0, argsAll = 0;
+    for (const auto& h : info.hosted) {
+        argsAll += argDwords(h);
         for (const auto& u : h.units) {
             ++G;
             UINT& need = h.kind == kRaygen ? needRg : h.kind == kMiss ? needMiss : needHit;
-            need = (std::max)(need, u.insert + argBytes);
+            need = (std::max)(need, u.insert + 4 * argDwords(h));
         }
+    }
     const UINT rgBytes = AlignUp(needRg, kRecAlign);
     const UINT missStride = AlignUp(needMiss, kRecAlign);
     const UINT hitStride = AlignUp(needHit, kRecAlign);
@@ -828,7 +1042,7 @@ bool Dispatch(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, const Info& in
     const UINT misses = appMiss + (UINT)H;
     const UINT hitOff = AlignUp(missOff + missStride * misses, kTableAlign);
     const UINT64 total = (UINT64)hitOff + (UINT64)hitStride * (std::max)(records, 1u);
-    const UINT metaDwords = 11 * G + argDwords * (UINT)H;
+    const UINT metaDwords = 11 * G + argsAll;
     const UINT u1 = AlignUp(4 * metaDwords, kTableAlign);
     const UINT u2 = AlignUp(u1 + missStride * (UINT)H, kTableAlign);
     const UINT u3 = u2 + hitStride * block;
@@ -852,33 +1066,37 @@ bool Dispatch(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, const Info& in
     const D3D12_GPU_VIRTUAL_ADDRESS uva = up->GetGPUVirtualAddress();
     // DXR_TIER11_RGQ_POISON=1 points every miss index at the application's
     // first miss: the sensitivity check of the run-time miss index. =2 gives
-    // every record of the shim's block the first instance's contribution.
+    // every record of the shim's block the first instance's contribution;
+    // =3 tells every shader the pipeline has one query slot (0.83.0).
     static const int poison = [] {
         char b[4] = {};
         if (!GetEnvironmentVariableA("DXR_TIER11_RGQ_POISON", b, sizeof(b))) return 0;
-        return b[0] == '2' ? 2 : 1;
+        return b[0] == '3' ? 3 : b[0] == '2' ? 2 : 1;
     }();
     uint32_t* meta = reinterpret_cast<uint32_t*>(p);
     {
-        UINT g = 0;
+        UINT g = 0, first = 11 * G;
         for (size_t h = 0; h < H; ++h) {
             const Hosted& hs = info.hosted[h];
-            const UINT first = 11 * G + argDwords * (UINT)h;
             // Its arguments: each slot's scene copy, then the index of its
-            // miss, after the application's.
-            for (UINT j = 0; j < info.srvs; ++j) {
+            // miss (after the application's), its first query slot, and the
+            // pipeline's query slots.
+            for (UINT j = 0; j < hs.srvs; ++j) {
                 const UINT x = sceneOf[h][j < hs.slots ? j : 0];
                 const D3D12_GPU_VIRTUAL_ADDRESS a = cps[x].tlas[0];
                 std::memcpy(meta + first + 2 * j, &a, 8);
             }
-            meta[first + 2 * info.srvs] = poison == 1 ? 0u : appMiss + (UINT)h;
+            meta[first + 2 * hs.srvs] = poison == 1 ? 0u : appMiss + (UINT)h;
+            meta[first + 2 * hs.srvs + 1] = hs.queryBase;
+            meta[first + 2 * hs.srvs + 2] = poison == 3 ? 1u : Q;
             for (const auto& u : hs.units) {
                 std::memcpy(meta + 11 * g, u.id, kId);
                 meta[11 * g + 8] = u.insert;
-                meta[11 * g + 9] = argDwords;
+                meta[11 * g + 9] = argDwords(hs);
                 meta[11 * g + 10] = first;
                 ++g;
             }
+            first += argDwords(hs);
             std::memcpy(p + u1 + missStride * (UINT)h, hs.idMiss, kId);
         }
     }

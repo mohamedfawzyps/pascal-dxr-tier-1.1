@@ -185,9 +185,11 @@ code (`rq_analyze.cpp`, `rq_lower.cpp`) on 2026-09-26, not from memory:
   their own signature back; recursion depth grows by 1; hosted shaders share
   one shim block, their arguments written into every record of their units
   by a GPU pass (`proxy/rg_table.hlsl`). `gitest --chquery`.
-- d. NEXT: collections (Unreal's way: each shader its own collection,
-  exports renamed, linked into a pipeline, often by AddToStateObject), and
-  libraries included through an export list.
+- d. Collections and export lists: DONE 0.83.0. A shader's query slot and
+  the pipeline's slot count are read at run time, so a collection is lowered
+  before its pipeline exists; a linked collection built with other configs
+  is built again with the pipeline's (D3D12 refuses a mismatch). `gitest
+  --collections`, `--grow`, `--rgsplit`. STEP 4 DONE.
 
 These can call `TraceRay`, so the lowering is the compute one, in place.
 The generated hit groups are added to the application's state object; the
@@ -257,7 +259,10 @@ Three-form matrix, dispatch suite, an Escher run. Then the limits list:
   name with a library's subobject; a shader config not at state object
   scope; GeometryIndex() in the same pipeline; more than 15 query slots in
   one pipeline; a closest-hit or miss query in a pipeline already at
-  recursion depth 31.
+  recursion depth 31; (0.83.0) a collection with RayQuery shaders linked
+  through an export list, a closest-hit with RayQuery in a collection
+  holding no hit group that imports it, GeometryIndex() in a DXR shader that
+  uses RayQuery.
 
 ## Size
 

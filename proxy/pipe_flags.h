@@ -76,6 +76,12 @@ Outcome Apply(const D3D12_STATE_OBJECT_DESC& in, const Mode* forced, const Creat
 // (copied and kept on the object), `applied` the mode it was built with.
 void NoteCollection(ID3D12StateObject* so, const D3D12_STATE_OBJECT_DESC& original, const Mode& applied);
 
+// A collection's kept copy of the application's description and the mode it
+// was built with: for building it again (0.83.0, rg_query: with the shader
+// and pipeline configs a pipeline hosting RayQuery shaders imposes). The
+// description lives as long as the collection. False when none was kept.
+bool CollectionOriginal(ID3D12StateObject* so, D3D12_STATE_OBJECT_DESC* desc, Mode* applied);
+
 // Keeps collections built again alive as long as the pipeline using them.
 void KeepWith(ID3D12StateObject* so, const Rewritten& r);
 

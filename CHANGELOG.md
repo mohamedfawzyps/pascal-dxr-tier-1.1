@@ -24,6 +24,55 @@ not.
 
 ---
 
+## 0.83.0
+
+**Plan step 4 d: collections, Unreal's way, and libraries through export
+lists. Step 4 is done.** RayQuery in a raygen, closest-hit or miss now draws
+however the application builds its pipeline: one state object, collections
+linked into a pipeline, or a pipeline grown by AddToStateObject.
+
+- **What a shader takes from the shim is read at run time.** Its first query
+  slot and the pipeline's query slots joined the miss index as constants the
+  shim appends to its local root signature (b0 in the shim's space, x the
+  miss index, y the first slot, z the slots); the lowered TraceRay traces
+  with ray contribution y + k and multiplier z. Until now both were literals,
+  so a library could not be lowered before the pipeline linking it existed,
+  which is what a collection is. Both rewriters, byte-identical
+  (`point_queries`, `PointRaygenQueries`). A DXR shader that uses RayQuery
+  and reads GeometryIndex() is refused by name: the shim reads its constants
+  there.
+- **Export lists.** A library included through one keeps its list, less the
+  shaders the shim moved out; a library left exporting nothing goes. Every
+  shader with RayQuery is removed from its library, exported or not (one it
+  does not export would still make the driver reject the library), and only
+  the exported ones are lowered. A renamed shader's shim shaders are named
+  after the name it is exported by, so two libraries holding the same
+  function do not clash; each lowered library is included through an export
+  list that renames them.
+- **Collections.** A collection is transformed like a pipeline and keeps its
+  hosted shaders; a pipeline linking it takes them over, assigns every query
+  slot and reads the identifiers. **D3D12 refuses a pipeline whose
+  collections disagree with it on the shader or pipeline config**, so a
+  linked collection built with other configs (one with no RayQuery at all,
+  left as it was) is built again from its kept description
+  (`pflags::CollectionOriginal`) with the pipeline's configs imposed
+  (`rgq::Force`), through the device's own path.
+- **Tests.** `gitest --collections` and `--grow` (AddToStateObject) with
+  `--rgquery`, `--chquery` and both, at 6.5 and 6.6; the hit collection
+  exports `ClosestHit` renamed `CH_a`. `--rgsplit` compiles the hit
+  collection's library apart with no RayQuery, as Unreal compiles every
+  shader alone, so the shim builds it again with the configs the raygen's
+  query needs: 7 rebuilds a run, all match. All 11 shapes match WARP in all 7
+  layouts. `DXR_TIER11_RGQ_POISON=3` (every shader told the pipeline has one
+  query slot) diverges, as poisons 1 and 2 do on the collection shapes.
+  Rewriter checks 108 of 108; dispatch suite 158 of 158 plus 39 raygen, closest-hit, miss and collection runs.
+- **Refused by name, on the limits list:** a collection with RayQuery shaders
+  linked through an export list; a closest-hit with RayQuery in a collection
+  holding no hit group that imports it; GeometryIndex() in a DXR shader that
+  uses RayQuery.
+- Escher: all 845 dumped Unreal shader inputs lower byte-identically to
+  0.82.0.
+
 ## 0.82.0
 
 **Plan step 4 c: RayQuery in an application's closest-hit and miss is

@@ -211,8 +211,7 @@ def raygen_checks(f, path, fn='RayGen'):
     mm = re.search(r'call void @dx\.op\.traceRay\.struct\.Payload\(i32 157, [^,]+, i32 [^,]+, '
                    r'i32 [^,]+, i32 [^,]+, i32 (\d+),', low)
     mult = mm.group(1) if mm else '0'
-    # A closest-hit or miss in the shared block's second slot of three (0.82.0).
-    slots = [] if own else ['1', '3']
+    slots = []
     r3 = subprocess.run([sys.executable, os.path.join('phase5', 'rewriter', 'dxrewrite.py'),
                          'pointraygen', py[0], pp, '1', mult] + slots, capture_output=True, text=True)
     r4 = subprocess.run([DXRW, 'pointraygen', cc[0], pc, '1', mult] + slots, capture_output=True, text=True)
@@ -223,7 +222,8 @@ def raygen_checks(f, path, fn='RayGen'):
         r = subprocess.run([os.path.join('phase5out', 'dxilrt.exe'), 'asm', pp, pp + '.dxil'],
                            capture_output=True, text=True)
         pointed = ('validated and signed ok' in r.stdout + r.stderr and '@dxr11.tlas' in pt and
-                   (own or ', i32 1, i32 3, i32 %rgq.ms0' in pt) and
+                   ', i32 %rgq.r0, i32 %rgq.tot0, i32 %rgq.ms0' in pt and
+                   '%rgq.r0 = add i32 %rgq.base0, ' in pt and
                    '@dxr11.gi' in pt and (not own or '@dx.op.traceRay.struct.Pay(' in pt))
     good = same and all(valid) and shaped and pointed
     print('  %s %-34s %s' % ('ok      ' if good else 'FAILED  ', name,

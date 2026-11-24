@@ -272,29 +272,64 @@ def shim_miss(text):
     return '\n'.join(out)
 
 
-def point_queries(text, queries, mult, slot_of=None, slots=1, caps=None, base=0, total=None):
-    """The lowered raygen library made ready for the application's pipeline
-    (0.81.0): the miss index read at run time, and the lowered TraceRay calls
-    pointed at the shim's copy of the scene with (query k, queries), as the
-    compute path's own layout does (0.61.0). The application's own TraceRay
-    is left alone. Several shaders of one pipeline share the shim's block
-    (0.82.0): this one's queries take ray contributions base .. base + queries
-    - 1 of `total`, the other places held by pairs no lowered call has."""
+_GI_RECORD = '!"dxr11.gi", i32 2147418112, i32 0, i32 1, i32 4, null'
+_MS_READ = re.compile(r'^(\s*)%rgq\.ms(\d+) = extractvalue %dx\.types\.CBufRet\.i32 (%gi\.\d+\.r), 0$')
+_SHIM_ARGS = re.compile(r', i32 (\d+), i32 (\d+), i32 %rgq\.ms(\d+), ')
+
+
+def point_queries(text, queries, mult, slot_of=None, slots=1, caps=None):
+    """The lowered library made ready for the application's pipeline (0.81.0):
+    the lowered TraceRay calls, and only they, pointed at the shim's copy of
+    the scene, as the compute path's own layout does (0.61.0).
+
+    What they take from the shim is read at run time from the constants it
+    appends to the shader's local root signature, b0 in GI_SPACE: x the miss
+    index (the shim's miss, after the application's), y the shader's first
+    query slot in the shim's block, z the pipeline's query slots (0.83.0;
+    until then y and z were literals, so a library could not be lowered before
+    the pipeline linking it existed, as a collection is). Call k traces with
+    ray contribution y + k and multiplier z."""
     import geomidx
     import shimtrace
+    if re.search(r'@dx\.op\.geometryIndex\.', text):
+        raise Unsupported('GeometryIndex() in a DXR shader that uses RayQuery: the shim reads its '
+                          'own constants where GeometryIndex() would be read')
     try:
         text, _ = geomidx.lower(shim_miss(text))
-        total = total or queries
-        pairs = [(15, 2 + j) for j in range(total)]
-        for k in range(queries):
-            pairs[base + k] = (k, mult)
+        pairs = [(k, mult) for k in range(queries)]
         text, n = shimtrace.retrace(text, pairs, 0, slot_of, slots, caps, only=SHIM_PAYLOAD)
     except geomidx.Unsupported as e:
         raise Unsupported(str(e))
     if not n:
         raise Unsupported("the lowered raygen has no TraceRay of its own to point at the "
                           "shim's scene")
-    return text
+    # The constants are three dwords now; then each call's ray contribution
+    # and multiplier from them.
+    if text.count(_GI_RECORD) != 1:
+        raise Unsupported("the shim's constant record is not where it was looked for")
+    text = text.replace(_GI_RECORD, _GI_RECORD.replace('i32 4, null', 'i32 12, null'))
+    lines = text.split('\n')
+    lit = {}
+    for n2, l in enumerate(lines):
+        if 'call void @dx.op.traceRay.struct.Payload(' not in l:
+            continue
+        m = _SHIM_ARGS.search(l)
+        if not m:
+            continue
+        k = m.group(3)
+        if lit.setdefault(k, m.group(1)) != m.group(1):
+            raise Unsupported('a lowered TraceRay traced with two query slots')
+        lines[n2] = l[:m.start()] + ', i32 %%rgq.r%s, i32 %%rgq.tot%s, i32 %%rgq.ms%s, ' % (k, k, k) + l[m.end():]
+    out = []
+    for l in lines:
+        out.append(l)
+        m = _MS_READ.match(l)
+        if m and m.group(2) in lit:
+            ind, k, r = m.group(1), m.group(2), m.group(3)
+            out += ['%s%%rgq.base%s = extractvalue %%dx.types.CBufRet.i32 %s, 1' % (ind, k, r),
+                    '%s%%rgq.tot%s = extractvalue %%dx.types.CBufRet.i32 %s, 2' % (ind, k, r),
+                    '%s%%rgq.r%s = add i32 %%rgq.base%s, %s' % (ind, k, k, lit[k])]
+    return '\n'.join(out)
 
 
 

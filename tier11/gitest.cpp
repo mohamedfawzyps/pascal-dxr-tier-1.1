@@ -167,6 +167,12 @@ static bool g_dynArgs = false;
 static bool g_dynMiss = false;
 static bool g_rgQuery = false;   // --rgquery (0.81.0)
 static bool g_chQuery = false;   // --chquery (0.82.0)
+// --rgsplit (0.83.0), with --collections or --grow: the hit collection's
+// library compiled apart, with no RayQuery and no GeometryIndex(), as Unreal
+// compiles every shader alone; the shim builds it again with the configs the
+// raygen collection's query needs.
+static bool g_rgSplit = false;
+static bool g_noGi = false;      // set while compiling that library
 // --twoscenes: the raygen traces the scene, then a SECOND scene (t1, the same
 // instances in reverse order) and folds both answers into its output; with
 // --recurse the closest-hits trace the second scene. With --localscene the
@@ -264,7 +270,7 @@ struct Pay {
 #define TRACE_FLAGS RAY_FLAG_FORCE_OPAQUE
 #endif
 #define NO_HIT uint4(0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
-#if RGQUERY || CHQUERY
+#if RGQUERY || CHQUERY || NOGI
 // --rgquery (0.81.0): the raygen runs an inline query beside its TraceRay;
 // --chquery (0.82.0): the closest-hit and the miss do. Nothing reads
 // GeometryIndex() in a hit shader, so the shim's RayQuery path for DXR
@@ -456,13 +462,14 @@ static ComPtr<IDxcBlob> Compile(int R, int M, bool anyhit, const char* src = kLi
     const wchar_t* ds = g_localScene ? L"LOCALSCENE=1" : L"LOCALSCENE=0";
     const wchar_t* dc = g_recurse ? L"RECURSE=1" : L"RECURSE=0";
     const wchar_t* dmiss = g_dynMiss ? L"DYNMISS=1" : L"DYNMISS=0";
-    const wchar_t* drq = g_rgQuery ? L"RGQUERY=1" : L"RGQUERY=0";
-    const wchar_t* dchq = g_chQuery ? L"CHQUERY=1" : L"CHQUERY=0";
+    const wchar_t* drq = g_rgQuery && !g_noGi ? L"RGQUERY=1" : L"RGQUERY=0";
+    const wchar_t* dchq = g_chQuery && !g_noGi ? L"CHQUERY=1" : L"CHQUERY=0";
+    const wchar_t* dnogi = g_noGi ? L"NOGI=1" : L"NOGI=0";
     std::vector<const wchar_t*> args = { L"-T", g_sm66 ? L"lib_6_6" : L"lib_6_5",
                                          L"-D", dr.c_str(), L"-D", dm.c_str(), L"-D", da.c_str(),
                                          L"-D", db, L"-D", dl, L"-D", ds, L"-D", dc,
                                          L"-D", dd, L"-D", d2, L"-D", dks.c_str(), L"-D", dmiss,
-                                         L"-D", drq, L"-D", dchq };
+                                         L"-D", drq, L"-D", dchq, L"-D", dnogi };
     DxcBuffer buf{ src, std::strlen(src), DXC_CP_UTF8 };
     ComPtr<IDxcResult> res;
     HR(c->Compile(&buf, args.data(), (UINT32)args.size(), nullptr, IID_PPV_ARGS(&res)), "Compile");
@@ -1012,6 +1019,13 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
         if (g_libassoc >= 1 && g_libassoc <= 3)
             for (const wchar_t* w : { L"AssocRec", L"AssocRec3" }) hList.push_back(name(w));
         D3D12_DXIL_LIBRARY_DESC hLib = libd;
+        ComPtr<IDxcBlob> hitOnly;
+        if (g_rgSplit) {
+            g_noGi = true;
+            hitOnly = Compile(L.R, L.M, L.anyhit);
+            g_noGi = false;
+            hLib.DXILLibrary = { hitOnly->GetBufferPointer(), hitOnly->GetBufferSize() };
+        }
         hLib.NumExports = (UINT)hList.size(); hLib.pExports = hList.data();
         const wchar_t* cx1[] = { L"HitGroup", L"HitGroupOther" };
         const wchar_t* cx3[] = { L"HitGroup3", L"CH_b" };
@@ -1320,6 +1334,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--dynmiss")) g_dynMiss = true;
         else if (!std::strcmp(argv[i], "--rgquery")) g_rgQuery = true;
         else if (!std::strcmp(argv[i], "--chquery")) g_chQuery = true;
+        else if (!std::strcmp(argv[i], "--rgsplit")) g_rgSplit = true;
         else if (!std::strcmp(argv[i], "--twoscenes")) g_twoScenes = 1;
         else if (!std::strcmp(argv[i], "--twoconflict")) g_twoScenes = 2;
         else if (!std::strcmp(argv[i], "--scenearray")) g_sceneKey = 1;

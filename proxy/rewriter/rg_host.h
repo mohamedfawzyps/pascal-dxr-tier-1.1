@@ -38,10 +38,9 @@ bool RestoreFunction(const std::string& lowered, const std::string& cs, const st
                      const std::string& exportName, std::string* out, std::string* why);
 bool PointRaygenQueries(const std::string& in, unsigned queries, unsigned mult,
                         const std::vector<unsigned>& slotOf, unsigned slots,
-                        const std::vector<unsigned>& caps, std::string* out, std::string* why,
-                        unsigned base = 0, unsigned total = 0);
-// `base`, `total` (0.82.0): several shaders of a pipeline share the shim's
-// block, this one's queries at ray contributions base .. base + queries - 1
-// of `total` (0: queries).
+                        const std::vector<unsigned>& caps, std::string* out, std::string* why);
+// The shim's constants at b0 (0.83.0): the miss index, the shader's first
+// query slot in the shim's block and the pipeline's query slots, all read at
+// run time, so a library is lowered without knowing what links it.
 
 }  // namespace rq

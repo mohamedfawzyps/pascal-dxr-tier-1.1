@@ -793,17 +793,38 @@ $gi = & .\gitest.exe --chquery mult 2>&1
 Remove-Item env:DXR_TIER11_RGQ_POISON
 if ($gi -match 'DIVERGE') { Write-Host '  gitest --chquery, DXR_TIER11_RGQ_POISON=2: diverges' }
 else { Write-Host '  POISON NOT SEEN: gitest --chquery, DXR_TIER11_RGQ_POISON=2'; $failed++ }
+# Collections, Unreal's way (0.83.0, plan step 4 d): every shader in a
+# collection of its own, exports renamed (the hit collection exports
+# ClosestHit as CH_a), linked into a pipeline or added by AddToStateObject
+# (--grow). --rgsplit compiles the hit collection's library apart, with no
+# RayQuery, so the shim builds it again with the configs the raygen's query
+# needs. Poison 3 tells every shader the pipeline has one query slot.
+foreach ($a in @(@('--rgquery', '--collections'), @('--chquery', '--collections'),
+                 @('--chquery', '--rgquery', '--collections'), @('--rgquery', '--grow'), @('--chquery', '--grow'),
+                 @('--chquery', '--rgquery', '--grow'), @('--rgquery', '--collections', '--sm66'),
+                 @('--chquery', '--grow', '--sm66'), @('--rgquery', '--collections', '--rgsplit'),
+                 @('--rgquery', '--grow', '--rgsplit'), @('--rgquery', '--collections', '--rgsplit', '--sm66'))) {
+    $gi = & .\gitest.exe @a 2>&1
+    if ($gi -match 'ALL MATCH') { Write-Host "  gitest $($a -join ' '): all layouts match" }
+    else { Write-Host "  gitest $($a -join ' '): NOT ALL MATCH"; $failed++ }
+}
+foreach ($t in @(@('1', '--rgquery', '--collections'), @('2', '--chquery', '--collections'),
+                 @('3', '--chquery', '--rgquery'), @('3', '--chquery', '--rgquery', '--collections'))) {
+    $env:DXR_TIER11_RGQ_POISON = $t[0]
+    $gi = & .\gitest.exe $t[1..($t.Count - 1)] mult 2>&1
+    Remove-Item env:DXR_TIER11_RGQ_POISON
+    if ($gi -match 'DIVERGE') { Write-Host "  gitest $($t[1..($t.Count - 1)] -join ' '), DXR_TIER11_RGQ_POISON=$($t[0]): diverges" }
+    else { Write-Host "  POISON NOT SEEN: gitest $($t[1..($t.Count - 1)] -join ' '), DXR_TIER11_RGQ_POISON=$($t[0])"; $failed++ }
+}
 $rlog = Join-Path $PWD 'rgq_refuse.log'
 Remove-Item $rlog -ErrorAction SilentlyContinue
 $env:DXR_TIER11_LOG = $rlog
 & .\gitest.exe --rgquery --scenearray mult 2>&1 | Out-Null
-& .\gitest.exe --rgquery --collections mult 2>&1 | Out-Null
 Remove-Item env:DXR_TIER11_LOG
 $said = Get-Content $rlog -ErrorAction SilentlyContinue
-if (($said -match 'NOT DRAWN: a query in an application.s DXR shader whose scene is picked per ray among several') -and
-    ($said -match 'REFUSED: RayQuery in a DXR shader of a collection')) {
-    Write-Host '  refused by name: a scene picked per ray among several, a RayQuery raygen in a collection'
-} else { Write-Host '  REFUSAL NOT LOGGED: --scenearray or --collections with --rgquery'; $failed++ }
+if ($said -match 'NOT DRAWN: a query in an application.s DXR shader whose scene is picked per ray among several') {
+    Write-Host '  refused by name: a scene picked per ray among several'
+} else { Write-Host '  REFUSAL NOT LOGGED: --scenearray with --rgquery'; $failed++ }
 Remove-Item $rlog -ErrorAction SilentlyContinue
 $env:DXR_TIER11 = ''
 
