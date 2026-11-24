@@ -647,21 +647,37 @@ def main():
         ok.append(expect_reject('committed status in an intersection', pst, 'no payload'))
         ok.append(cpp_agrees('committed status in an intersection', pst, 'no payload'))
 
-    # A resource handle indexed DYNAMICALLY and used inside the Proceed loop.
-    # The handle exemption in the isolation check is only sound when the module
-    # fully determines the handle; a dynamic index makes it depend on a value
-    # computed in the raygen, which the any-hit cannot see. Provoked from the
-    # independent shader, which is the one that genuinely reads a resource in
-    # its loop body.
-    if os.path.isfile(INDEP):
-        dyn = load(INDEP)
-        m = re.search(r'^.*dx\.op\.createHandle\(i32 57, i8 0.*$', dyn, re.M)
-        assert m, 'the independent case no longer creates an SRV handle'
-        dyn = dyn.replace(m.group(0),
-                          re.sub(r'(i32 57, i8 0, i32 \d+), i32 \d+',
-                                 r'\1, i32 %v1', m.group(0)))
-        ok.append(expect_lower_reject('dynamic handle used in the loop', dyn,
-                                      'indexed dynamically'))
+    # A resource handle indexed DYNAMICALLY and used inside the Proceed loop
+    # (0.78.0; refused until then, "the index is computed in the raygen"). The
+    # index is rebuilt where it can be (a shift) and otherwise carried (a
+    # division); a handle made before the loop is rebuilt from its carried
+    # index. No hit shader may keep a compute-form handle.
+    for f, carried in (('rayquery_dynloop', False), ('rayquery_dynloopc', True),
+                       ('rayquery_dynloopnu', True), ('rayquery_dynlooph', True),
+                       ('rayquery_dynloop_sm66', False), ('rayquery_dynloopc_sm66', True),
+                       ('rayquery_dynloopnu_sm66', True), ('rayquery_dynlooph_sm66', True)):
+        path = os.path.join('phase5', 'cases', f + '.ll')
+        if not os.path.isfile(path):
+            continue
+        t = load(path)
+        name = 'dynamic index in the loop (%s)' % f.split('_', 1)[1]
+        try:
+            m = Module(t)
+            out = lower.lower(m, rayquery.analyze(m))
+            ah = re.search(r'^define void @AnyHit\(.*?^}', out, re.M | re.S).group(0)
+            compute = re.search(r'@dx\.op\.createHandle(FromBinding)?\(', ah)
+            libs = len(re.findall(r'createHandleForLib', ah))
+            carries = '%rq.pac11 = ' in ah
+            good = not compute and libs >= 2 and carries == carried
+            print('  %s %-34s %s' % ('ok      ' if good else 'FAILED  ', name,
+                                     'index %s, handle rebuilt' % ('carried' if carries else 'rebuilt')
+                                     if good else 'compute=%s libs=%d carried=%s'
+                                     % (bool(compute), libs, carries)))
+            ok.append(good)
+        except (rayquery.Unsupported, lower.LowerError) as e:
+            print('  FAILED   %-34s refused: %s' % (name, e))
+            ok.append(False)
+        ok.append(cpp_agrees(name, t, None))
 
     print('\n%d of %d checks behaved as intended\n' % (sum(ok), len(ok)))
     return 0 if all(ok) else 1

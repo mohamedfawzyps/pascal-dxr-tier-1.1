@@ -623,6 +623,27 @@ def _handle_text(instr, table, globals_, binds=None):
     ).format(raw=raw, elem=elem, src=src, res=instr.result, fn=fnname)
 
 
+_HANDLE_OPS = (57, BIND_HANDLE, HEAP_HANDLE, ANNOTATE_HANDLE)
+
+
+def _handle_leaves(defs, name, ok, types):
+    """What a resource handle the hit shader cannot rebuild is missing, when
+    it is only its index (0.78.0): the values to carry so it can be."""
+    i = defs.get(name)
+    if i is None or i.dxop not in _HANDLE_OPS:
+        return set()
+    out = set()
+    for o in _operands(i, types):
+        if o in ok or o == name:
+            continue
+        oi = defs.get(o)
+        if oi is not None and oi.dxop in _HANDLE_OPS:
+            out |= _handle_leaves(defs, o, ok, types)
+        else:
+            out.add(o)
+    return out
+
+
 def _dynamic_index(instr):
     """The index operand of a createHandle, when it is NOT a constant."""
     if instr.dxop != 57 or len(instr.args) < 4:
@@ -1350,11 +1371,15 @@ def _handle_class(defs, name):
     return {'0': 'srv', '1': 'uav'}.get(m.group(1))
 
 
-def _recomputable(fn, types):
+def _recomputable(fn, types, leaves=()):
     """{result -> instr} for every value the generated hit shader can rebuild.
 
-    A fixpoint, because a chain is only recomputable if every link is."""
-    ok = {}
+    A fixpoint, because a chain is only recomputable if every link is.
+
+    `leaves` (0.78.0) are values the payload carries, so the hit shader has
+    them without rebuilding them: a resource handle indexed by one is rebuilt
+    from it. They map to None, and _needed_chain never emits them."""
+    ok = {l: None for l in leaves}
     defs = {i.result: i for _, i in fn.instrs() if i.result}
     changed = True
     while changed:
@@ -1393,7 +1418,7 @@ def _needed_chain(fn, recomputable, wanted, types, skip=()):
     frontier = [w for w in wanted if w not in skip]
     while frontier:
         r = frontier.pop()
-        if r in need or r in skip or r not in recomputable:
+        if r in need or r in skip or r not in recomputable or recomputable[r] is None:
             continue
         need.add(r)
         frontier.extend(_operands(recomputable[r], types))
@@ -1530,20 +1555,27 @@ def _check_loop_isolated(fn, q, header, latch, body, types):
     # the most common shape there is.
     handles = set(_recomputable(fn, types))
 
-    # But that exemption holds only for a handle the MODULE fully determines.
-    # A dynamically indexed one depends on a value computed in the raygen, and
-    # recreating it in the any-hit would need that value, which is exactly the
-    # caller state the payload cannot carry. So this one IS refused, precisely,
-    # rather than being swept up by the generic message below.
-    for _, i in fn.instrs():
-        if i.result in used and _dynamic_index(i):
-            raise rq.Unsupported(
-                'resource handle %s is indexed dynamically (%s) and used inside '
-                'the Proceed loop; the index is computed in the raygen and the '
-                'any-hit shader is a separate invocation that cannot see it'
-                % (i.result, _dynamic_index(i)))
-    outside = sorted(u for u in used
-                     if u not in defined and u != q.handle and u not in handles)
+    # A handle indexed at run time (0.78.0; refused until then, "the index is
+    # computed in the raygen"): its index is a value like any other, rebuilt
+    # where it can be and otherwise carried in the payload, and the handle is
+    # rebuilt from it. DXC usually creates such a handle inside the loop body,
+    # where it is simply the body's; one created before the loop has its index
+    # carried as a LEAF of the chain that rebuilds it.
+    defs = {i.result: i for _, i in fn.instrs() if i.result}
+    leaves = set()
+    while True:
+        outside = sorted(u for u in used
+                         if u not in defined and u != q.handle and u not in handles)
+        add = set()
+        for u in outside:
+            add |= _handle_leaves(defs, u, handles, types)
+        add -= leaves
+        if not add:
+            break
+        leaves |= add
+        handles = set(_recomputable(fn, types, leaves))
+    q.rec_leaves = leaves
+    outside = sorted(set(outside) | leaves)
     # A value the loop defines and code after it reads leaves through the
     # payload (0.65.0; until then refused).
     escapes = []
@@ -2391,7 +2423,8 @@ def _intersection(module, q, exports, table, globals_, binds=None):
     # DispatchRaysIndex, which is the SAME ray so the same value; everything
     # else is pure and is emitted as it stood. _check_loop_isolated has already
     # refused anything not on that list.
-    for i in _needed_chain(fn, _recomputable(fn, types), used, types, inBody):
+    for i in _needed_chain(fn, _recomputable(fn, types, q.rec_leaves), used, types,
+                           inBody | q.rec_leaves):
         if i.dxop in (57, BIND_HANDLE):
             out.append(_handle_text(i, table, globals_, binds))
         elif i.dxop in _THREAD_OPS:
@@ -2405,6 +2438,10 @@ def _intersection(module, q, exports, table, globals_, binds=None):
             out.append('')
             out.append('%s:' % label[1:])
         for i in blk.instrs:
+            if i.dxop in (57, BIND_HANDLE):
+                # A handle created in the loop body (0.78.0): its library form.
+                out.append(_handle_text(i, table, globals_, binds))
+                continue
             if i.dxop == rq.CANDIDATE_PROC_NON_OPAQUE:
                 # WRONG until 0.70.0, folded to true on the premise that only
                 # non-opaque procedural primitives reach a Proceed loop. Every
@@ -2606,7 +2643,9 @@ def _anyhit(module, q, exports, table, globals_, binds=None):
     # DispatchRaysIndex, which is the SAME ray so the same value; everything
     # else is pure and is emitted as it stood. _check_loop_isolated has already
     # refused anything not on that list.
-    for i in _needed_chain(fn, _recomputable(fn, types), used, types, inBody):
+    leaves = set().union(*(x.rec_leaves for x in loops))
+    for i in _needed_chain(fn, _recomputable(fn, types, leaves), used, types,
+                           inBody | leaves):
         if i.dxop in (57, BIND_HANDLE):
             out.append(_handle_text(i, table, globals_, binds))
         elif i.dxop in _THREAD_OPS:
@@ -2650,6 +2689,7 @@ def _anyhit(module, q, exports, table, globals_, binds=None):
         commit_blocks = {b.label for b, _ in x.commits}
         x.commit_blocks = commit_blocks
         order = [header] + sorted(l for l in body if l not in (header, latch))
+        x.handle_text = lambda i: _handle_text(i, table, globals_, binds)
         _anyhit_body(fn, x, order, header, latch, body, commit_blocks, subst,
                      multi, out)
     for x in loops:
@@ -2863,6 +2903,11 @@ def _anyhit_body(fn, q, order, header, latch, body, commit_blocks, subst, multi,
                 continue   # loaded from the payload at entry
             if i.dxop in (rq.CANDIDATE_TYPE, rq.COMMIT_NON_OPAQUE,
                           rq.CANDIDATE_PROC_NON_OPAQUE):
+                continue
+            if i.dxop in (57, BIND_HANDLE):
+                # A handle created in the loop body (0.78.0; DXC puts one
+                # indexed at run time there): its library form.
+                out.append(q.handle_text(i))
                 continue
             if i.dxop == rq.COMMIT_PROCEDURAL:
                 # A PROCEDURAL commit, in the arm CandidateType folded away.

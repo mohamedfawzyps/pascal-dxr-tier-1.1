@@ -180,7 +180,24 @@ $cases = @(
     @{ name = 'twoqproc'; src = 'phase5\cases\rayquery_twoqproc.ll'; pat = 'alpha'; flags = @('--mixed');
        norender = $true; desc = 'two procedural queries, records per query' },
     @{ name = 'twoqmix'; src = 'phase5\cases\rayquery_twoqmix.ll'; pat = 'alpha'; flags = @('--mixed');
-       norender = $true; desc = 'a triangle query and a procedural one' }
+       norender = $true; desc = 'a triangle query and a procedural one' },
+    # A run-time index in the loop (0.78.0): rendered by the dispatch suite.
+    @{ name = 'dynloop'; src = 'phase5\cases\rayquery_dynloop.ll'; pat = 'opaque'; flags = @('--table');
+       norender = $true; desc = 'a resource indexed at run time in the loop, the index rebuilt' },
+    @{ name = 'dynloop_sm66'; src = 'phase5\cases\rayquery_dynloop_sm66.ll'; pat = 'opaque'; flags = @('--table');
+       norender = $true; desc = 'a resource indexed at run time in the loop, the index rebuilt' },
+    @{ name = 'dynloopc'; src = 'phase5\cases\rayquery_dynloopc.ll'; pat = 'opaque'; flags = @('--table');
+       norender = $true; desc = 'the same, the index carried in the payload' },
+    @{ name = 'dynloopc_sm66'; src = 'phase5\cases\rayquery_dynloopc_sm66.ll'; pat = 'opaque'; flags = @('--table');
+       norender = $true; desc = 'the same, the index carried in the payload' },
+    @{ name = 'dynloopnu'; src = 'phase5\cases\rayquery_dynloopnu.ll'; pat = 'opaque'; flags = @('--table');
+       norender = $true; desc = 'the same through NonUniformResourceIndex' },
+    @{ name = 'dynloopnu_sm66'; src = 'phase5\cases\rayquery_dynloopnu_sm66.ll'; pat = 'opaque'; flags = @('--table');
+       norender = $true; desc = 'the same through NonUniformResourceIndex' },
+    @{ name = 'dynlooph'; src = 'phase5\cases\rayquery_dynlooph.ll'; pat = 'opaque'; flags = @('--table');
+       norender = $true; desc = 'the handle made before the loop, rebuilt from its carried index' },
+    @{ name = 'dynlooph_sm66'; src = 'phase5\cases\rayquery_dynlooph_sm66.ll'; pat = 'opaque'; flags = @('--table');
+       norender = $true; desc = 'the handle made before the loop, rebuilt from its carried index' }
 )
 
 if (-not (Test-Path 'phase5\dxil\rayquery_opaque.ll')) {

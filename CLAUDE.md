@@ -165,6 +165,15 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.78.0: PLAN STEP 3 l, FIRST HALF: A RESOURCE INDEXED AT RUN TIME INSIDE
+THE LOOP.** The index is rebuilt or carried in the payload like any value,
+the handle rebuilt from it; a handle DXC makes inside the loop body becomes
+its library form in both hit shader generators (at 6.6 it had failed at the
+assembler, loud). Eight cases match WARP, the poison diverges. Escher 845 of
+845 byte-identical. NEXT: step 3 l's second half, a query inside another's
+loop: that loop stays in the raygen, one front-to-back TraceRay per
+`Proceed()`.
+
 **0.77.0: PLAN STEP 3 k DONE, SEVERAL QUERIES WHERE ONE NEEDS AN
 INTERSECTION SHADER.** Each query gets hit shaders of its own and passes its
 query id as the ray contribution, so no shader reads a query id; drawn in

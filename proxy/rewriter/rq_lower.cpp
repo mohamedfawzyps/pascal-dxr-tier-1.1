@@ -564,9 +564,13 @@ std::string HandleClass(const std::map<std::string, const llm::Instr*>& defs,
     return cls == "0" ? "srv" : cls == "1" ? "uav" : "";
 }
 
+// `leaves` (0.78.0) are values the payload carries: a handle indexed by one
+// is rebuilt from it. They map to nullptr, which NeededChain never emits.
 std::map<std::string, const llm::Instr*> Recomputable(
-        const llm::Function& fn, const std::set<std::string>& types) {
+        const llm::Function& fn, const std::set<std::string>& types,
+        const std::set<std::string>& leaves = {}) {
     std::map<std::string, const llm::Instr*> ok, defs;
+    for (const auto& l : leaves) ok[l] = nullptr;
     for (const auto& b : fn.blocks)
         for (const auto& i : b.instrs)
             if (!i.result.empty()) defs[i.result] = &i;
@@ -660,6 +664,32 @@ std::string ResultType(const llm::Instr& i) {
     return rest.empty() ? "" : rest[0];
 }
 
+// What a resource handle the hit shader cannot rebuild is missing, when it is
+// only its index (0.78.0): the values to carry so it can be. _handle_leaves in
+// lower.py.
+bool IsHandleOp(int op) {
+    return op == kCreateHandle || op == kBindHandle || op == kHeapHandle ||
+           op == kAnnotateHandle;
+}
+
+std::set<std::string> HandleLeaves(
+        const std::map<std::string, const llm::Instr*>& defs, const std::string& name,
+        const std::set<std::string>& ok, const std::set<std::string>& types) {
+    std::set<std::string> out;
+    auto it = defs.find(name);
+    if (it == defs.end() || !IsHandleOp(it->second->DxOp())) return out;
+    for (const auto& o : Operands(*it->second, types)) {
+        if (ok.count(o) || o == name) continue;
+        auto oi = defs.find(o);
+        if (oi != defs.end() && IsHandleOp(oi->second->DxOp())) {
+            for (const auto& l : HandleLeaves(defs, o, ok, types)) out.insert(l);
+        } else {
+            out.insert(o);
+        }
+    }
+    return out;
+}
+
 // `skip` is what the loop body defines for itself. Without it the closure walks
 // straight back into the body and rebuilds its instructions in the prologue as
 // well, which is a duplicate definition.
@@ -677,7 +707,7 @@ std::vector<const llm::Instr*> NeededChain(
         frontier.pop_back();
         if (need.count(r) || skip.count(r)) continue;
         auto it = rec.find(r);
-        if (it == rec.end()) continue;
+        if (it == rec.end() || !it->second) continue;
         need.insert(r);
         for (const auto& u : Operands(*it->second, types)) frontier.push_back(u);
     }
@@ -1035,6 +1065,8 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         std::map<std::string, std::set<std::string>> dom;
     };
     std::map<const Query*, LoopState> states;
+    // Carried indices a handle chain starts from, per query (0.78.0).
+    std::map<const Query*, std::set<std::string>> leavesOf;
     // Every value carried by any query, in field order, once all are planned.
     std::vector<Carry> carry;
     auto CarryWordsOf = [](const std::vector<Carry>& cs) {
@@ -1274,6 +1306,22 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                "(i32 160, " + g->elem + " " + raw + ")  ; CreateHandleForLib(Resource)";
     };
 
+    // A handle a hit shader rebuilds (0.78.0). DXR_TIER11_DYNIDX_POISON=1:
+    // one indexed at run time takes element 0 instead, which the dispatch
+    // suite's --table binds to a decoy, so a lowering that did not carry the
+    // index to the hit shader would read the same.
+    auto hitHandleText = [&](const llm::Instr& instr) -> std::string {
+        static const bool dynPoison = std::getenv("DXR_TIER11_DYNIDX_POISON") != nullptr;
+        const int op = instr.DxOp();
+        const size_t ai = op == kCreateHandle ? 3 : 2;
+        if (!dynPoison || instr.args.size() <= ai) return handleText(instr);
+        static const std::regex kConst(R"(^i32\s+-?\d+$)");
+        if (std::regex_match(Trim(instr.args[ai]), kConst)) return handleText(instr);
+        llm::Instr c = instr;
+        c.args[ai] = " i32 0";
+        return handleText(c);
+    };
+
     std::map<int, std::optional<std::string>> edits;
     const llm::Function& fn = *q.fn;
 
@@ -1367,30 +1415,32 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
         // index, arithmetic on those. See Recomputable above.
         for (const auto& kv : Recomputable(fn, types)) handles.insert(kv.first);
 
-        // But that exemption holds only for a handle the MODULE fully
-        // determines. A dynamically indexed one depends on a value computed in
-        // the raygen, and recreating it in the any-hit would need that value,
-        // which is exactly the caller state the payload cannot carry. So this
-        // one IS refused, precisely, rather than being swept up by the generic
-        // message below.
-        static const std::regex kConstIdx(R"(^i32\s+\d+$)");
-        for (const auto& b : fn.blocks) {
-            for (const auto& i : b.instrs) {
-                if (i.DxOp() != kCreateHandle || i.result.empty()) continue;
-                if (!used.count(i.result) || i.args.size() < 4) continue;
-                const std::string a3 = Trim(i.args[3]);
-                if (std::regex_match(a3, kConstIdx)) continue;
-                r.error = "resource handle " + i.result + " is indexed dynamically (" +
-                          a3 + ") and used inside the Proceed loop; the index is "
-                          "computed in the raygen and the any-hit shader is a "
-                          "separate invocation that cannot see it";
-                return false;
-            }
+        // A handle indexed at run time (0.78.0; refused until then): its
+        // index is rebuilt where it can be and otherwise carried, and the
+        // handle is rebuilt from it. One created before the loop has its index
+        // carried as a LEAF of the chain that rebuilds it; see lower.py.
+        std::map<std::string, const llm::Instr*> hdefs;
+        for (const auto& b : fn.blocks)
+            for (const auto& i : b.instrs)
+                if (!i.result.empty()) hdefs[i.result] = &i;
+        std::set<std::string> leaves, outsideSet;
+        for (;;) {
+            outsideSet.clear();
+            for (const auto& u : used)
+                if (!defined.count(u) && u != x.handle && !handles.count(u))
+                    outsideSet.insert(u);
+            std::set<std::string> add;
+            for (const auto& u : outsideSet)
+                for (const auto& l : HandleLeaves(hdefs, u, handles, types))
+                    if (!leaves.count(l)) add.insert(l);
+            if (add.empty()) break;
+            leaves.insert(add.begin(), add.end());
+            handles.clear();
+            for (const auto& kv : Recomputable(fn, types, leaves)) handles.insert(kv.first);
         }
-        std::vector<std::string> outside;
-        for (const auto& u : used)
-            if (!defined.count(u) && u != x.handle && !handles.count(u))
-                outside.push_back(u);
+        leavesOf[&x] = leaves;
+        outsideSet.insert(leaves.begin(), leaves.end());
+        std::vector<std::string> outside(outsideSet.begin(), outsideSet.end());
         // A value the loop defines and code after it reads leaves through
         // the payload (0.65.0; until then refused).
         std::vector<std::string> escapes;
@@ -2594,11 +2644,14 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             // thread id becomes DispatchRaysIndex, which is the SAME ray so the
             // same value; everything else is pure and is emitted as it stood.
             // The isolation check has already refused anything not on the list.
+            const std::set<std::string> qleaves = leavesOf[&q];
+            std::set<std::string> iskip = inBody;
+            iskip.insert(qleaves.begin(), qleaves.end());
             for (const llm::Instr* pi :
-                 NeededChain(fn, Recomputable(fn, types), usedNames, types, inBody)) {
+                 NeededChain(fn, Recomputable(fn, types, qleaves), usedNames, types, iskip)) {
                 const llm::Instr& i = *pi;
                 if (i.DxOp() == kCreateHandle || i.DxOp() == kBindHandle) {
-                    const std::string ht = handleText(i);
+                    const std::string ht = hitHandleText(i);
                     if (!handleErr.empty()) { r.error = handleErr; return false; }
                     is.push_back(ht);
                 } else if (IsThreadOp(i.DxOp())) {
@@ -2620,6 +2673,13 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 }
                 for (const auto& i : b->instrs) {
                     const int op = i.DxOp();
+                    // A handle created in the loop body (0.78.0).
+                    if (op == kCreateHandle || op == kBindHandle) {
+                        const std::string ht = hitHandleText(i);
+                        if (!handleErr.empty()) { r.error = handleErr; return false; }
+                        is.push_back(ht);
+                        continue;
+                    }
                     // CandidateProceduralPrimitiveNonOpaque, computed (0.70.0):
                     // see _intersection in lower.py.
                     if (op == kCandidateProcNonOpaque) {
@@ -2862,11 +2922,18 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             // thread id becomes DispatchRaysIndex, which is the SAME ray so the
             // same value; everything else is pure and is emitted as it stood.
             // The isolation check has already refused anything not on the list.
+            std::set<std::string> aleaves;
+            for (const Query* xp : loops) {
+                const auto& l = leavesOf[xp];
+                aleaves.insert(l.begin(), l.end());
+            }
+            std::set<std::string> askip = inBody;
+            askip.insert(aleaves.begin(), aleaves.end());
             for (const llm::Instr* pi :
-                 NeededChain(fn, Recomputable(fn, types), usedNames, types, inBody)) {
+                 NeededChain(fn, Recomputable(fn, types, aleaves), usedNames, types, askip)) {
                 const llm::Instr& i = *pi;
                 if (i.DxOp() == kCreateHandle || i.DxOp() == kBindHandle) {
-                    const std::string ht = handleText(i);
+                    const std::string ht = hitHandleText(i);
                     if (!handleErr.empty()) { r.error = handleErr; return false; }
                     ah.push_back(ht);
                 } else if (IsThreadOp(i.DxOp())) {
@@ -3006,6 +3073,14 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                         const int op = i.DxOp();
                         if (op == kCandidateType || op == kCommitNonOpaque ||
                             op == kCandidateProcNonOpaque) continue;
+                        // A handle created in the loop body (0.78.0): its
+                        // library form.
+                        if (op == kCreateHandle || op == kBindHandle) {
+                            const std::string ht = hitHandleText(i);
+                            if (!handleErr.empty()) { r.error = handleErr; return false; }
+                            ah.push_back(ht);
+                            continue;
+                        }
                         // A PROCEDURAL commit, in the arm CandidateType folded
                         // away. Dead, and an any-hit shader cannot report a
                         // procedural hit, so it simply goes.

@@ -155,7 +155,13 @@ code (`rq_analyze.cpp`, `rq_lower.cpp`) on 2026-09-26, not from memory:
   of it on the limits list: more than 15 such queries, and such a shader
   whose scene is not resolved.
 - l. A query used inside another query's loop (nested), and a dynamically
-  indexed resource inside the loop.
+  indexed resource inside the loop. The resource: DONE 0.78.0 (the index
+  rebuilt or carried like any value, the handle rebuilt from it; a handle
+  made in the loop body turned into its library form, which at 6.6 had
+  failed at the assembler). The nested query: NEXT, 0.79.0. Its loop stays
+  in the raygen, each `Proceed()` one TraceRay finding the next candidate
+  front to back (a legal RayQuery order), so the inner query runs where
+  TraceRay can be called.
 
 ### 4. Spec item 3, RayQuery in raygen, closest-hit and miss (2 to 3 versions)
 

@@ -24,6 +24,43 @@ not.
 
 ---
 
+## 0.78.0
+
+**Plan step 3 l, first half: a resource indexed at run time inside the
+Proceed loop.** Refused since the dynamic index work ("the index is computed
+in the raygen and the any-hit shader is a separate invocation that cannot
+see it"), in the Shader Model 6.5 form. The index is a value like any other.
+
+- **The index is rebuilt where it can be** (a cbuffer read and arithmetic
+  on it, as every other value the any-hit rebuilds) **and otherwise carried
+  in the payload** (0.42.0's carried values); the handle is rebuilt from it,
+  with `!dx.nonuniform` kept where the original had it.
+- **A handle made inside the loop body** is what DXC emits for such an index,
+  at 6.5 and 6.6 alike. Both hit shader generators now turn it into its
+  library form (`createHandleForLib`). Found probing: the 6.6 form was not
+  refused but failed at the assembler (`use of undefined value
+  '@dx.op.createHandleFromBinding'`), so the shader was not lowered and the
+  driver refused it. Loud, not drawn wrong.
+- **A handle made before the loop** from a value the any-hit cannot rebuild:
+  its index travels as a leaf of the chain that rebuilds it.
+- **Tests.** `rayquery_dynloop*.hlsl`, eight cases (index rebuilt, carried,
+  through `NonUniformResourceIndex`, handle made before the loop; 6.5 and
+  6.6), each writing its candidates through the array inside the loop body
+  under `--table` (real output at slot 2, decoys at 0, 1, 3): all match WARP,
+  10837 hits. `DXR_TIER11_DYNIDX_POISON=1` (every handle a hit shader
+  rebuilds from a run-time index takes element 0) gives 0 hits, diverging,
+  on the carried form and the handle made before the loop. Byte-identical in
+  both rewriters; rewriter checks 89 of 89 (the old refusal is an acceptance
+  now); dispatch suite 150 of 150.
+- **Escher unchanged:** all 845 dumped Unreal shader inputs lower
+  byte-identically to 0.77.0.
+- **Left of step 3 l:** a query used inside another query's loop. Its loop
+  becomes an any-hit, which cannot call TraceRay. Design for 0.79.0: that
+  query's loop stays in the raygen, each `Proceed()` one TraceRay that finds
+  the next candidate front to back (the any-hit keeps the nearest candidate
+  past the last one and ignores every hit), so the body, and the query inside
+  it, run in the raygen. Refused by name until then.
+
 ## 0.77.0
 
 **Plan step 3 k: several queries where one needs an intersection shader.**

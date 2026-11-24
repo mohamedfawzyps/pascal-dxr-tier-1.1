@@ -238,6 +238,7 @@ class Query(object):
         # passing its query id as the ray contribution, because an
         # intersection shader has no payload to read a query id from.
         self.per_query = False
+        self.rec_leaves = set()     # carried indices a handle chain starts from (0.78.0)
         # One query traced more than once (0.73.0): each search is a query of
         # its own here, owning the ops it reaches. (its traces, owner
         # function); the traces that start it, more than one where a branch

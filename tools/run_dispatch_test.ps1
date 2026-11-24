@@ -474,7 +474,17 @@ $cases = @(
     # Tracked procedural queries in the own layout (0.77.0): until then its
     # state object had no AnyHitProc and failed to build (E_INVALIDARG).
     @{ name = 'ownprocabort'; pat = 'alpha'; envv = 'DXR_TIER11_RQOWN'; extra = @('--cs', 'phase5\cases\rayquery_proc_abortmix.hlsl', '--mixed', '--contrib'); desc = 'Abort() in a procedural query, the own layout forced' },
-    @{ name = 'ownprocbreak'; pat = 'alpha'; envv = 'DXR_TIER11_RQOWN'; extra = @('--cs', 'phase5\cases\rayquery_proc_break.hlsl', '--proc', '--stack'); desc = 'a break out of a procedural body, the own layout forced' }
+    @{ name = 'ownprocbreak'; pat = 'alpha'; envv = 'DXR_TIER11_RQOWN'; extra = @('--cs', 'phase5\cases\rayquery_proc_break.hlsl', '--proc', '--stack'); desc = 'a break out of a procedural body, the own layout forced' },
+    # A resource array indexed at run time inside the loop (0.78.0, plan step
+    # 3 l): --table puts the real output at slot 2, decoys at 0, 1 and 3.
+    @{ name = 'dynloop'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_dynloop.hlsl', '--table'); desc = 'a resource indexed at run time in the loop, the index rebuilt' },
+    @{ name = 'dynloop_sm66'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_dynloop_sm66.hlsl', '--table'); desc = 'a resource indexed at run time in the loop, the index rebuilt, at 6.6' },
+    @{ name = 'dynloopc'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_dynloopc.hlsl', '--table'); desc = 'the same, the index carried in the payload' },
+    @{ name = 'dynloopc_sm66'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_dynloopc_sm66.hlsl', '--table'); desc = 'the same, the index carried in the payload, at 6.6' },
+    @{ name = 'dynloopnu'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_dynloopnu.hlsl', '--table'); desc = 'the same through NonUniformResourceIndex' },
+    @{ name = 'dynloopnu_sm66'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_dynloopnu_sm66.hlsl', '--table'); desc = 'the same through NonUniformResourceIndex, at 6.6' },
+    @{ name = 'dynlooph'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_dynlooph.hlsl', '--table'); desc = 'the handle made before the loop, rebuilt from its carried index' },
+    @{ name = 'dynlooph_sm66'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_dynlooph_sm66.hlsl', '--table'); desc = 'the handle made before the loop, rebuilt from its carried index, at 6.6' }
 )
 
 $failed = 0
@@ -842,7 +852,7 @@ $env:DXR_TIER11 = ''
 # twoexits (the code after the loop that the original skipped) must DIVERGE;
 # with the procedural abort poison, procbreakstack must too.
 Write-Host ''
-Write-Host '=== exits, retraces, chains, aborts outside the loop, carried values, records per query ==='
+Write-Host '=== exits, retraces, chains, aborts outside the loop, carried values, records per query, run-time indices ==='
 $env:DXR_TIER11 = '1'
 $xg = @(
     @{ n = 'breakstack'; v = 'DXR_TIER11_EXIT_POISON'; x = @('--cs', 'phase5\cases\rayquery_break.hlsl', '--geom', '--stack') },
@@ -866,7 +876,11 @@ $xg = @(
     @{ n = 'carrymany'; v = 'DXR_TIER11_STATE_POISON'; x = @('--cs', 'phase5\cases\rayquery_carrymany.hlsl', '--geom', '--stack') },
     # Records per query (0.77.0): every query's boxes served by query 0's
     # intersection shader.
-    @{ n = 'twoqproc'; v = 'DXR_TIER11_PERQUERY_POISON'; x = @('--cs', 'phase5\cases\rayquery_twoqproc.hlsl', '--mixed') }
+    @{ n = 'twoqproc'; v = 'DXR_TIER11_PERQUERY_POISON'; x = @('--cs', 'phase5\cases\rayquery_twoqproc.hlsl', '--mixed') },
+    # A run-time index in the loop (0.78.0): every handle a hit shader
+    # rebuilds from one takes element 0, a decoy.
+    @{ n = 'dynloopc'; v = 'DXR_TIER11_DYNIDX_POISON'; x = @('--cs', 'phase5\cases\rayquery_dynloopc.hlsl', '--table') },
+    @{ n = 'dynlooph_sm66'; v = 'DXR_TIER11_DYNIDX_POISON'; x = @('--cs', 'phase5\cases\rayquery_dynlooph_sm66.hlsl', '--table') }
 )
 foreach ($g in $xg) {
     $x = $g.x
