@@ -302,6 +302,7 @@ struct GlobalInfo {
     std::string gty;
     std::string elem;
     std::string name;
+    bool own = false;   // a library's own global, which its record names (0.80.0)
 };
 
 std::string Trim(const std::string& s) {
@@ -455,9 +456,18 @@ bool PureInstruction(const llm::Instr& i) {
 // 94, 95 and 96 are the group forms of 93, and the hit shader rebuilds them
 // from DispatchRaysIndex exactly as the raygen does. See ThreadIndexText.
 bool PureDxOp(int op) {
+    // 160, 145, 146: a raygen presented as a compute shader (0.80.0); see
+    // _PURE_DXOP in lower.py.
     return op == 57 || op == 59 || op == 93 ||
            op == kGroupId || op == kThreadIdInGroup || op == kFlatThreadIdInGroup ||
-           op == kAnnotateHandle || op == kBindHandle || op == kHeapHandle;
+           op == kAnnotateHandle || op == kBindHandle || op == kHeapHandle ||
+           op == 160 || op == 145 || op == 146;
+}
+
+// A load of a resource global (0.80.0): constant for the dispatch.
+bool GlobalLoad(const llm::Instr& i) {
+    static const std::regex kLoad(R"(^load [^,]+, [^,]+\* @)");
+    return std::regex_search(i.body, kLoad);
 }
 
 // The compute thread-index ops. None is legal in a ray tracing stage, and a
@@ -592,7 +602,7 @@ std::map<std::string, const llm::Instr*> Recomputable(
                     if (!ok.count(h) || cls != "srv") continue;
                 }
                 else if (op >= 0) { if (!PureDxOp(op)) continue; }
-                else if (!PureInstruction(i)) continue;
+                else if (!PureInstruction(i) && !GlobalLoad(i)) continue;
                 bool all = true;
                 for (const auto& u : Operands(i, types))
                     if (!ok.count(u) && u != i.result) { all = false; break; }
@@ -1097,7 +1107,9 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
     std::map<int, std::vector<ResRec>> table;   // class -> records, in order
     {
         auto groups = SplitTop(md.at(std::stoi(resId)));
-        static const std::regex kType(R"RX((\[[^\]]+\]|%[\w.$-]+|%"[^"]+")\*\s+\S+)RX");
+        // A prefix, as Python's re.match: a 6.6 library's record bitcasts
+        // its global (0.80.0).
+        static const std::regex kType(R"RX(^(\[[^\]]+\]|%[\w.$-]+|%"[^"]+")\*\s+\S+)RX");
         static const std::regex kArr(R"(^\[(\d+) x (.+)\]$)");
         static const std::regex kName(R"RX(^!"([^"]*)")RX");
         for (size_t cls = 0; cls < groups.size(); ++cls) {
@@ -1108,7 +1120,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 const int nid = std::stoi(Trim(idTok).substr(1));
                 auto fields = SplitTop(md.at(nid));
                 std::smatch tm;
-                if (fields.size() < 3 || !std::regex_match(fields[1], tm, kType)) {
+                if (fields.size() < 3 || !std::regex_search(fields[1], tm, kType)) {
                     r.error = "resource record !" + std::to_string(nid) +
                               " has an unexpected shape";
                     return r;
@@ -1154,6 +1166,20 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                     g.sym = std::string("rq_") +
                             (kv.first >= 0 && kv.first < 4 ? clsName[kv.first] : "res") +
                             std::to_string(n);
+                // A library's own global, which its record names already
+                // (0.80.0, a raygen presented as a compute shader); see
+                // _existing_globals in lower.py.
+                {
+                    static const std::regex kExisting(R"RX(\*\s+(@"[^"]+"|@[\w.$-]+)$)RX");
+                    static const std::regex kCast(R"RX(bitcast \(\S+\* (@"[^"]+"|@[\w.$-]+) to \S+\)$)RX");
+                    const auto fs = SplitTop(md.at(rec.nid));
+                    std::smatch em;
+                    if (fs.size() > 1 && (std::regex_search(fs[1], em, kExisting) ||
+                                          std::regex_search(fs[1], em, kCast))) {
+                        g.sym = em[1].str().substr(1);
+                        g.own = true;
+                    }
+                }
                 g.gty = rec.gty;
                 g.elem = rec.elem;
                 g.name = rec.name.empty() ? g.sym : rec.name;
@@ -2327,7 +2353,9 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             ptype += ", i32";
         ptype += " }";
         decls.push_back(std::string(kPayload) + " = type " + ptype);
-        decls.push_back(std::string(kAttrs) + " = type { <2 x float> }");
+        // A library already has it for its own hit shaders (0.80.0).
+        if (out.find("\n" + std::string(kAttrs) + " = type ") == std::string::npos)
+            decls.push_back(std::string(kAttrs) + " = type { <2 x float> }");
         if (q.needsRecordConstants) {
             // The raw buffer's element type, as DXC declares a ByteAddressBuffer.
             // ResRet is added only when the application's module lacks it.
@@ -2345,6 +2373,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                             ", align 4");
         std::set<std::string> seen;
         for (const auto& g : globals) {
+            if (out.find("\n@" + g.sym + " = ") != std::string::npos) continue;
             if (!seen.insert(g.sym).second) continue;
             // In the binding form the global holds a HANDLE whatever the
             // resource is; the RECORD bitcasts it back to the resource type.
@@ -2537,6 +2566,10 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
             std::set<std::string> seenFn;
             for (const auto& g : globals) {
                 const std::string f = HandleFn(g.elem);
+                // A library declares the ones it uses already, and its own
+                // globals need none of the lowering's (0.80.0).
+                if (out.find("declare %dx.types.Handle @" + f + "(") != std::string::npos) continue;
+                if (g.own) continue;
                 if (!seenFn.insert(f).second) continue;
                 add.push_back("");
                 add.push_back("; Function Attrs: nounwind readonly");
@@ -3572,6 +3605,12 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
     {
         for (const auto& g : globals) {
             auto fields = SplitTop(md.at(g.nid));
+            // A library's own global, already named (0.80.0).
+            const std::string own = "@" + g.sym;
+            if (fields.size() > 1 && ((fields[1].size() >= own.size() &&
+                 fields[1].compare(fields[1].size() - own.size(), own.size(), own) == 0) ||
+                 fields[1].find(own + " to ") != std::string::npos))
+                continue;
             if (binding) {
                 // `%CB* bitcast (%dx.types.Handle* @CB to %CB*)`, copied from
                 // DXC. The global holds a handle; the record still has to name

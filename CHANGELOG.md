@@ -24,6 +24,47 @@ not.
 
 ---
 
+## 0.80.0
+
+**Plan step 4, first part: RayQuery in an application's raygen, the
+rewriter half.** A raygen can call TraceRay, so its queries lower exactly as
+a compute shader's do. Nothing in the proxy uses this yet: a library with
+RayQuery in a raygen is still forwarded and refused by the driver, as before.
+The proxy half is 0.81.0.
+
+- **Probed first** (`gitest --dynmiss`): a TraceRay whose miss index is
+  computed at run time selects that miss record on WARP and on the 1070, so
+  the shim's own miss can sit after the application's, at an index the shim
+  passes in. 16384 of 32768 pixels miss, all through the right record; a decoy
+  at index 0 would have shown.
+- **The raygen presented as a compute shader** (`phase5/rewriter/rghost.py`,
+  `proxy/rewriter/rg_host.cpp`): the library with its other shaders, their
+  entry points and annotations, and the declarations and resources only they
+  used removed, the raygen renamed `@main` with a compute entry. The compute
+  lowering turns it back into a library: the raygen under its own export
+  name, its own TraceRay calls kept, and the generated shaders named
+  `dxr11_rq_<raygen>_*` so they clash with nothing the application exports.
+  An application struct named `Payload` is renamed first.
+- **The library without the raygen** (`strip_function`): its function, entry,
+  annotation, and what only it used; the RayQuery flag cleared; the module
+  flags the remaining shaders need taken from the validator, which computes
+  them ("Flags declared=D, actual=A", `fix_flags`).
+- **The lowering, for a library's own resources:** a resource global the
+  record already names is used as it is (no second declaration, the record
+  left alone), in both forms (6.6 records bitcast a handle global); a load of
+  a resource global, `createHandleForLib`, `DispatchRaysIndex` and
+  `DispatchRaysDimensions` are rebuilt in the hit shaders like any other value
+  the shader determines; the built-in attribute type is not declared twice.
+  The C++ matched a resource record's type as the whole field where the
+  Python matched a prefix, so it refused a 6.6 library's records; now a
+  prefix in both.
+- **Tests.** `phase5/cases/lib_rgquery.hlsl` at 6.5 and 6.6 (an alpha-tested
+  query beside the raygen's own TraceRay): both rewriters byte-identical on
+  both outputs, both valid and signed (`dxrw lowerraygen`,
+  `dxrewrite.py lowerraygen`). Rewriter checks 103 of 103; dispatch suite 158 of 158.
+- **Escher unchanged:** all 845 dumped Unreal shader inputs lower
+  byte-identically to 0.79.0.
+
 ## 0.79.0
 
 **Plan step 3 l, second half: a query used inside another query's Proceed

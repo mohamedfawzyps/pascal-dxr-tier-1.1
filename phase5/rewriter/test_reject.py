@@ -160,6 +160,52 @@ def expect_lower_ok(name, text):
 DXRW = os.path.join('phase5out', 'dxrw.exe')
 
 
+def raygen_checks(f, path):
+    """lowerraygen in both rewriters, compared, and both outputs validated."""
+    import subprocess
+    import tempfile
+    import rghost
+    name = 'raygen RayQuery (%s)' % f
+    d = tempfile.mkdtemp()
+    py = [os.path.join(d, 'p_low.ll'), os.path.join(d, 'p_strip.ll')]
+    cc = [os.path.join(d, 'c_low.ll'), os.path.join(d, 'c_strip.ll')]
+    r1 = subprocess.run([sys.executable, os.path.join('phase5', 'rewriter', 'dxrewrite.py'),
+                         'lowerraygen', path, 'RayGen'] + py, capture_output=True, text=True)
+    r2 = subprocess.run([DXRW, 'lowerraygen', path, 'RayGen'] + cc, capture_output=True, text=True)
+    if r1.returncode or r2.returncode:
+        print('  FAILED   %-34s %s %s' % (name, r1.stderr.strip()[:60], r2.stderr.strip()[:60]))
+        return False
+    same = all(io.open(a, encoding='utf-8').read() == io.open(b, encoding='utf-8').read()
+               for a, b in zip(py, cc))
+    valid = []
+    for k, p in enumerate(py):
+        text = io.open(p, encoding='utf-8').read()
+        for attempt in range(2):
+            with io.open(p, 'w', encoding='utf-8', newline='\n') as h:
+                h.write(text)
+            r = subprocess.run([os.path.join('phase5out', 'dxilrt.exe'), 'asm', p, p + '.dxil'],
+                               capture_output=True, text=True)
+            said = r.stdout + r.stderr
+            if 'validated and signed ok' in said:
+                valid.append(True)
+                break
+            fixed = rghost.fix_flags(text, said) if k == 1 else None
+            if fixed is None:
+                valid.append(False)
+                break
+            text = fixed
+        else:
+            valid.append(False)
+    low = io.open(py[0], encoding='utf-8').read()
+    shaped = ('define void @RayGen(' in low and 'dxr11_rq_RayGen_' in low and
+              '@dx.op.traceRay.struct.Pay(' in low and 'rayQuery_' not in low)
+    good = same and all(valid) and shaped
+    print('  %s %-34s %s' % ('ok      ' if good else 'FAILED  ', name,
+                             'identical, both valid, the app\'s TraceRay kept' if good else
+                             'identical=%s valid=%s shaped=%s' % (same, valid, shaped)))
+    return good
+
+
 def cpp_agrees(name, text, must_mention=None, forbid=None):
     """The C++ port gives the same verdict. Byte-identity compares OUTPUTS, so
     it cannot see a refusal one side has and the other lacks; that is how the
@@ -706,6 +752,16 @@ def main():
             print('  FAILED   %-34s refused: %s' % (name, e))
             ok.append(False)
         ok.append(cpp_agrees(name, t, None))
+
+    # RayQuery in an APPLICATION's raygen (0.80.0): the raygen presented to
+    # the compute lowering as a compute shader (rghost.py), and the library
+    # without it. Both rewriters byte for byte, both outputs valid (the
+    # stripped one with the module flags the validator computes).
+    for f in ('lib_rgquery', 'lib_rgquery_sm66'):
+        path = os.path.join('phase5', 'cases', f + '.ll')
+        if not os.path.isfile(path):
+            continue
+        ok.append(raygen_checks(f, path))
 
     print('\n%d of %d checks behaved as intended\n' % (sum(ok), len(ok)))
     return 0 if all(ok) else 1

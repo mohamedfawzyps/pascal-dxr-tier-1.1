@@ -74,6 +74,29 @@ def cmd_analyze(path):
     return 0
 
 
+def cmd_lowerraygen(src, raygen, dst, stripped):
+    """RayQuery in an application's raygen (0.80.0): see rghost.py."""
+    import rghost
+    text = normalize(io.open(src, encoding='utf-8').read())
+    try:
+        cs = rghost.raygen_as_cs(text, raygen)
+        st = rghost.strip_function(text, raygen)
+        mod = Module(nvapi.fold(cs))
+        q = rayquery.analyze(mod)
+        out = lower.lower(mod, q, rghost.exports(raygen))
+    except (rayquery.Unsupported, lower.LowerError) as e:
+        sys.stderr.write('REFUSED: %s\n' % e)
+        return 2
+    with io.open(dst, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(out)
+    if st is not None:
+        with io.open(stripped, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(st)
+    print('lowered %s -> %s (%s)%s' % (raygen, dst, q.pattern_desc,
+                                       '' if st is not None else ", the library's only shader"))
+    return 0
+
+
 def cmd_lower(src, dst):
     text = normalize(io.open(src, encoding='utf-8').read())
     try:
@@ -100,6 +123,8 @@ def main(argv):
         return cmd_analyze(argv[2])
     if len(argv) >= 4 and argv[1] == 'lower':
         return cmd_lower(argv[2], argv[3])
+    if len(argv) >= 6 and argv[1] == 'lowerraygen':
+        return cmd_lowerraygen(argv[2], argv[3], argv[4], argv[5])
     print(__doc__)
     return 1
 

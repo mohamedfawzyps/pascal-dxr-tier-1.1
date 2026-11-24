@@ -170,6 +170,18 @@ code (`rq_analyze.cpp`, `rq_lower.cpp`) on 2026-09-26, not from memory:
 
 ### 4. Spec item 3, RayQuery in raygen, closest-hit and miss (2 to 3 versions)
 
+- a. The rewriter half for a raygen: DONE 0.80.0. Probe: a run-time
+  TraceRay miss index works on WARP and the 1070. The raygen is presented to
+  the compute lowering as a compute shader, and the application's library
+  stripped of it.
+- b. The proxy half, NEXT 0.81.0: the state object (the two libraries, the
+  shim's hit groups and miss, the raygen's local root signature extended with
+  the scene copy and the miss index), and at DispatchRays the shim's tables:
+  the application's records unchanged, then the shim's block, reached
+  through a scene copy whose contributions point at it. Render tests in
+  `gitest`.
+- c. Closest-hit and miss (recursion depth grows by 1), and collections.
+
 These can call `TraceRay`, so the lowering is the compute one, in place.
 The generated hit groups are added to the application's state object; the
 shader tables are the shim's copies (the variant machinery already builds

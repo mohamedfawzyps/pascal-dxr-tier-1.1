@@ -162,6 +162,9 @@ static bool g_warpGlobal = false;
 // shim reads no constant at the dispatch, so every pair counts (its widest
 // layout, several scene structures).
 static bool g_dynArgs = false;
+// --dynmiss (0.80.0 probe): the raygen's TraceRay takes its miss index from a
+// cbuffer value, 1 at run time, record 0 a decoy miss. One state object only.
+static bool g_dynMiss = false;
 // --twoscenes: the raygen traces the scene, then a SECOND scene (t1, the same
 // instances in reverse order) and folds both answers into its output; with
 // --recurse the closest-hits trace the second scene. With --localscene the
@@ -259,6 +262,13 @@ struct Pay {
 #define TRACE_FLAGS RAY_FLAG_FORCE_OPAQUE
 #endif
 #define NO_HIT uint4(0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
+#if DYNMISS
+// The raygen's miss index computed at run time, 1 (0.80.0 probe): record 0 of
+// the miss table is a decoy.
+#define MISS_VAL min(NInst, 1u)
+#else
+#define MISS_VAL 0
+#endif
 
 RayDesc MakeRay(uint2 p) {
     RayDesc r;
@@ -277,7 +287,10 @@ RayDesc MakeRay(uint2 p) {
     pay.depth = 0;
     if (p.y >= H / 2) r.Origin.x = -5.0;   // misses: the miss shader traces it
 #endif
-    TraceRay(TSCENE, TRACE_FLAGS, 0xFF, R_VAL, M_VAL, 0, r, pay);
+#if DYNMISS
+    if (p.y >= H / 2) r.Origin.x = -5.0;   // misses: the miss index is the probe
+#endif
+    TraceRay(TSCENE, TRACE_FLAGS, 0xFF, R_VAL, M_VAL, MISS_VAL, r, pay);
 #if TWOSCENES
     Pay q; q.v = NO_HIT;
 #if RECURSE
@@ -310,6 +323,10 @@ void Follow(inout Pay p) {
     p.v.x += 16 * (q.v.x & 0xFF);
     p.v.w += 65536 * (q.v.w & 0xFFFF);
 }
+#endif
+
+#if DYNMISS
+[shader("miss")] void MissDecoy(inout Pay p) { p.v = uint4(7, 7, 7, 7); }
 #endif
 
 [shader("miss")] void Miss(inout Pay p) {
@@ -377,10 +394,11 @@ static ComPtr<IDxcBlob> Compile(int R, int M, bool anyhit, const char* src = kLi
     const wchar_t* dl = dls.c_str();
     const wchar_t* ds = g_localScene ? L"LOCALSCENE=1" : L"LOCALSCENE=0";
     const wchar_t* dc = g_recurse ? L"RECURSE=1" : L"RECURSE=0";
+    const wchar_t* dmiss = g_dynMiss ? L"DYNMISS=1" : L"DYNMISS=0";
     std::vector<const wchar_t*> args = { L"-T", g_sm66 ? L"lib_6_6" : L"lib_6_5",
                                          L"-D", dr.c_str(), L"-D", dm.c_str(), L"-D", da.c_str(),
                                          L"-D", db, L"-D", dl, L"-D", ds, L"-D", dc,
-                                         L"-D", dd, L"-D", d2, L"-D", dks.c_str() };
+                                         L"-D", dd, L"-D", d2, L"-D", dks.c_str(), L"-D", dmiss };
     DxcBuffer buf{ src, std::strlen(src), DXC_CP_UTF8 };
     ComPtr<IDxcResult> res;
     HR(c->Compile(&buf, args.data(), (UINT32)args.size(), nullptr, IID_PPV_ARGS(&res)), "Compile");
@@ -1011,12 +1029,17 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     // --biglrs the raygen record is 800 bytes, and the rest move up.
     const UINT64 idSz = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES, stride = 64;
     const UINT64 offMiss = g_bigLrs ? 832 : 64;
-    const UINT64 offHit = offMiss + 64, total = offHit + stride * L.records;
+    const UINT64 offHit = offMiss + (g_dynMiss ? 128 : 64), total = offHit + stride * L.records;
     auto table = Buffer(g.dev.Get(), total, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     uint8_t* t = nullptr; HR(table->Map(0, nullptr, (void**)&t), "Map table");
     std::memset(t, 0, (size_t)total);
     std::memcpy(t, props->GetShaderIdentifier(L"RayGen"), idSz);
-    std::memcpy(t + offMiss, props->GetShaderIdentifier(L"Miss"), idSz);
+    if (g_dynMiss) {
+        std::memcpy(t + offMiss, props->GetShaderIdentifier(L"MissDecoy"), idSz);
+        std::memcpy(t + offMiss + 64, props->GetShaderIdentifier(L"Miss"), idSz);
+    } else {
+        std::memcpy(t + offMiss, props->GetShaderIdentifier(L"Miss"), idSz);
+    }
     for (UINT i = 0; i < L.records; ++i) {
         uint8_t* rec = t + offHit + stride * i;
         std::memcpy(rec, props->GetShaderIdentifier(hgName[L.group[i]]), idSz);
@@ -1153,7 +1176,8 @@ static std::vector<uint32_t> Run(IDXGIAdapter1* ad, const Layout& L) {
     D3D12_DISPATCH_RAYS_DESC dr{};
     const auto base = tableAt;
     dr.RayGenerationShaderRecord = { base, rgBytes };
-    dr.MissShaderTable = hitScene || (g_libassoc == 5 && g_mode == 0)
+    dr.MissShaderTable = g_dynMiss ? D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE{ base + offMiss, 128, 64 }
+                       : hitScene || (g_libassoc == 5 && g_mode == 0)
                              ? D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE{ base + offMiss, 64, 64 }
                              : D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE{ base + offMiss, idSz, idSz };
     dr.HitGroupTable = { base + offHit, stride * L.records, stride };
@@ -1229,6 +1253,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--recurse")) g_recurse = true;
         else if (!std::strcmp(argv[i], "--warpglobal")) g_warpGlobal = true;
         else if (!std::strcmp(argv[i], "--dynargs")) g_dynArgs = true;
+        else if (!std::strcmp(argv[i], "--dynmiss")) g_dynMiss = true;
         else if (!std::strcmp(argv[i], "--twoscenes")) g_twoScenes = 1;
         else if (!std::strcmp(argv[i], "--twoconflict")) g_twoScenes = 2;
         else if (!std::strcmp(argv[i], "--scenearray")) g_sceneKey = 1;

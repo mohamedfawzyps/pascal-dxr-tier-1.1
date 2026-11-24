@@ -16,6 +16,7 @@
 
 #include "../proxy/rewriter/ll_model.h"
 #include "../proxy/rewriter/nvapi_fold.h"
+#include "../proxy/rewriter/rg_host.h"
 #include "../proxy/rewriter/geom_index.h"
 #include "../proxy/rewriter/rq_analyze.h"
 #include "../proxy/rewriter/rq_lower.h"
@@ -147,6 +148,31 @@ int main(int argc, char** argv) {
         if (!WriteAll(argv[3], l.text)) { std::printf("cannot write %s\n", argv[3]); return 1; }
         std::printf("lowered %s -> %s (pattern %d, %s)\n", argv[2], argv[3],
                     a.query.patternNum, a.query.patternDesc.c_str());
+        return 0;
+    }
+    if (argc >= 6 && std::string(argv[1]) == "lowerraygen") {
+        // RayQuery in an application's raygen (0.80.0): <in.ll> <raygen>
+        // <lowered.ll> <stripped.ll>. See rghost.py.
+        std::string raw;
+        if (!ReadAll(argv[2], raw)) { std::printf("cannot read %s\n", argv[2]); return 1; }
+        const std::string rg = argv[3];
+        const std::string norm = llm::Normalize(raw);
+        std::string cs, text, why, strip;
+        bool empty = false;
+        if (!rq::RaygenAsCs(norm, rg, &cs, &why) || !rq::StripFunction(norm, rg, &strip, &empty, &why) ||
+            !rq::FoldNvapi(cs, &text, &why)) {
+            std::fprintf(stderr, "REFUSED: %s\n", why.c_str());
+            return 2;
+        }
+        llm::Module m(text);
+        auto a = rq::Analyze(m);
+        if (!a.ok) { std::fprintf(stderr, "REFUSED: %s\n", a.error.c_str()); return 2; }
+        auto l = rq::Lower(m, a.query, rq::RaygenExports(rg));
+        if (!l.ok) { std::fprintf(stderr, "REFUSED: %s\n", l.error.c_str()); return 2; }
+        if (!WriteAll(argv[4], l.text)) { std::printf("cannot write %s\n", argv[4]); return 1; }
+        if (!empty && !WriteAll(argv[5], strip)) { std::printf("cannot write %s\n", argv[5]); return 1; }
+        std::printf("lowered %s -> %s (%s)%s\n", rg.c_str(), argv[4], a.query.patternDesc.c_str(),
+                    empty ? ", the library's only shader" : "");
         return 0;
     }
     if (argc >= 4 && std::string(argv[1]) == "rewrite") {

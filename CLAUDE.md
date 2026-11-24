@@ -165,6 +165,17 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.80.0: PLAN STEP 4 BEGUN, THE REWRITER HALF OF RAYQUERY IN AN
+APPLICATION'S RAYGEN.** The raygen is presented to the compute lowering as a
+compute shader (`rghost.py`, `rg_host.cpp`) and comes back a library of its
+own (raygen + generated shaders `dxr11_rq_<raygen>_*`); the application's
+library loses only that function (module flags from the validator). Probed:
+a run-time TraceRay miss index works on WARP and the 1070. The proxy does not
+use it yet. NEXT, 0.81.0: at `CreateStateObject` swap the libraries, add the
+shim's hit groups and miss, extend the raygen's local root signature (scene
+copy, miss index); at `DispatchRays` the shim's tables, the application's
+records then the shim's block; render tests in `gitest`.
+
 **0.79.0: PLAN STEP 3 DONE; A QUERY INSIDE ANOTHER'S LOOP IS STEPPED.** A
 pre-pass (`nest.py`, `nest_step.cpp`) keeps the outer loop in the raygen, each
 `Proceed()` a search by a fresh query for the nearest non-opaque candidate past

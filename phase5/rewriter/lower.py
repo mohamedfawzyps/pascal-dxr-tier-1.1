@@ -286,7 +286,11 @@ def lower(module, q, exports=None):
         x.record_sm66 = _is_sm66(text)
         x.needs_record_constants = rc
         x.carry = []
-    globals_ = _plan_globals(table)
+    existing = _existing_globals(md, table)
+    globals_ = _plan_globals(table, existing)
+    # The library's own globals (0.80.0): declared by the input, so neither
+    # they nor their handle functions are declared again.
+    q.own_globals = set(e[1:] for e in existing.values())
     _edit_resources(module, q, edits, table, globals_, binds)
     _edit_ray_index(module, q, edits)
     for x in queries:
@@ -491,13 +495,33 @@ def _binding_map(text, md):
     return out
 
 
-def _plan_globals(table):
+def _existing_globals(md, table):
+    """node id -> the global a record already names (0.80.0): a library's
+    resources, presented as a compute shader by rghost.py, are globals
+    already; a compute shader's records name `undef`."""
+    out = {}
+    for recs in table.values():
+        for nid, _gty, _elem, _count, _name in recs:
+            fields = [f.strip() for f in md[nid].split(',')]
+            # At 6.6 the record bitcasts the handle global, as DXC's do:
+            # `%T* bitcast (%dx.types.Handle* @g to %T*)`.
+            m = re.search(r'\*\s+(@"[^"]+"|@[\w.$-]+)$', fields[1]) if len(fields) > 1 else None
+            m = m or (re.search(r'bitcast \(\S+\* (@"[^"]+"|@[\w.$-]+) to \S+\)$', fields[1])
+                      if len(fields) > 1 else None)
+            if m:
+                out[nid] = m.group(1)
+    return out
+
+
+def _plan_globals(table, existing=None):
     """(class, node id) -> (global name, global type, element type, name)."""
     g = {}
     for cls, recs in table.items():
         for n, (nid, gty, elem, count, name) in enumerate(recs):
             sym = name if re.match(r'^[A-Za-z_]\w*$', name or '') \
                 else 'rq_%s%d' % (_CLASS_NAMES.get(cls, 'res'), n)
+            if existing and nid in existing:
+                sym = existing[nid][1:]
             g[(cls, nid)] = (sym, gty, elem, name or sym)
     return g
 
@@ -1280,7 +1304,18 @@ _PURE = {
 # 94, 95 and 96 are the group forms of 93, and the hit shader rebuilds them
 # from DispatchRaysIndex exactly as the raygen does. See _THREAD_OPS.
 _PURE_DXOP = {57, 59, 93, GROUP_ID, THREAD_ID_IN_GROUP, FLAT_THREAD_ID_IN_GROUP,
-              ANNOTATE_HANDLE, BIND_HANDLE, HEAP_HANDLE}
+              ANNOTATE_HANDLE, BIND_HANDLE, HEAP_HANDLE,
+              # A raygen presented as a compute shader (0.80.0, rghost.py):
+              # its resources are already in the library form, and it reads
+              # the ray index itself. 160 createHandleForLib, 145
+              # DispatchRaysIndex, 146 DispatchRaysDimensions; all legal in
+              # every ray tracing stage.
+              160, 145, 146}
+
+
+def _global_load(i):
+    """A load of a resource global (0.80.0): constant for the dispatch."""
+    return bool(re.match(r'^load [^,]+, [^,]+\* @', i.body))
 
 
 # Every %name an instruction READS, not just its call arguments.
@@ -1396,7 +1431,7 @@ def _recomputable(fn, types, leaves=()):
                 continue
             if i.dxop is None:
                 op = re.match(r'\s*%\S+\s*=\s*(\w+)', i.line)
-                if not op or op.group(1) not in _PURE:
+                if not op or (op.group(1) not in _PURE and not _global_load(i)):
                     continue
             if all(u in ok or u == i.result for u in _operands(i, types)):
                 ok[i.result] = i
@@ -2010,8 +2045,11 @@ def _edit_committed(q, edits):
 
 def _add_types_and_globals(text, globals_, needs_record=False, binding=False,
                            sm66=False, payload_type=PAYLOAD_TYPE):
-    decls = ['%s = type %s' % (PAYLOAD, payload_type),
-             '%s = type { <2 x float> }' % ATTRS, '']
+    decls = ['%s = type %s' % (PAYLOAD, payload_type)]
+    # A library already has it for its own hit shaders (0.80.0, rghost.py).
+    if ('\n%s = type ' % ATTRS) not in text:
+        decls.append('%s = type { <2 x float> }' % ATTRS)
+    decls.append('')
     if needs_record:
         # The raw buffer's element type, as DXC declares a ByteAddressBuffer.
         # ResRet is added only when the application's module lacks it.
@@ -2025,7 +2063,7 @@ def _add_types_and_globals(text, globals_, needs_record=False, binding=False,
                      % (RECORD_GLOBAL, HANDLE_TYPE if sm66 else RECORD_TYPE))
     seen = set()
     for sym, gty, elem, _ in globals_.values():
-        if sym in seen:
+        if sym in seen or ('\n@%s = ' % sym) in text:
             continue
         seen.add(sym)
         # In the binding form the global holds a HANDLE whatever the resource
@@ -2154,7 +2192,10 @@ def _swap_declarations(text, q, globals_, binding=False):
         seen = set()
         for sym, gty, elem, _ in globals_.values():
             fnname, _ = _handle_fn(elem)
-            if fnname in seen:
+            # A library declares the ones it uses already, and its own
+            # globals need none of the lowering's (0.80.0).
+            if fnname in seen or ('declare %%dx.types.Handle @%s(' % fnname) in text \
+                    or sym in q.own_globals:
                 continue
             seen.add(fnname)
             new += ['', '; Function Attrs: nounwind readonly',
@@ -3091,6 +3132,8 @@ def _rewrite_metadata(text, md, table, globals_, q, exports, binding=False):
     """Point the resource records at the globals and rebuild the entry points."""
     for (cls, nid), (sym, gty, elem, name) in globals_.items():
         fields = [f.strip() for f in md[nid].split(',')]
+        if fields[1].endswith('@' + sym) or ('@%s to ' % sym) in fields[1]:
+            continue   # a library's own global, already named (0.80.0)
         if binding:
             # `%CB* bitcast (%dx.types.Handle* @CB to %CB*)`, copied from DXC.
             # The global holds a handle; the record still has to name the
