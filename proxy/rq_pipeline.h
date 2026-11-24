@@ -124,6 +124,28 @@ public:
     };
     bool NeedsOwn() const { return !m_perQuery.empty(); }
 
+    // Plan step 5 (0.84.0): a RayQuery compute shader beside groupshared
+    // memory, group barriers or wave ops, which a raygen cannot host, split
+    // at its query (proxy/rewriter/split.h). This object is then the query
+    // part, Q, lowered as any; A runs before it and B after it, all three on
+    // the application's root signature with a scratch buffer appended, a
+    // root UAV at u0 in space 0x7FFF0000. A Dispatch writes the group counts
+    // into the scratch buffer's header, then runs A, Q, B.
+    struct SplitParts {
+        ID3D12PipelineState* a = nullptr;
+        ID3D12PipelineState* b = nullptr;
+        ID3D12RootSignature* rs = nullptr;   // the application's, extended
+        UINT param = 0;                      // the scratch buffer's root parameter
+        UINT K = 0, G = 0, NT = 0;           // dwords a thread, a group; threads a group
+        std::mutex lock;
+        std::vector<std::pair<ID3D12Resource*, const void*>> pool;   // buffer, last list
+        // A scratch buffer of at least `bytes` that no other list can still
+        // read, now used by `owner`. Null when it cannot be created.
+        ID3D12Resource* Scratch(ID3D12Device* dev, UINT64 bytes, const void* owner);
+        ~SplitParts();
+    };
+    const std::shared_ptr<SplitParts>& Split() const { return m_split; }
+
     // Where the lowered library's TraceRay calls take their scene from, read
     // off the lowered text, so a dispatch can be judged against the ONE scene
     // it traces (gidx::ResolveScenes) instead of every live one.
@@ -273,6 +295,7 @@ private:
     // Kept for the shim's own layout, which until 0.77.0 built without it.
     bool m_trackProc = false;
     std::vector<QueryShape> m_perQuery;   // see NeedsOwn
+    std::shared_ptr<SplitParts> m_split;  // see Split
     gidx::Scenes m_scenes;
     ID3D12RootSignature* m_localRs = nullptr;   // owned; null without record data
     // What the current table's records point at, one pair per record.

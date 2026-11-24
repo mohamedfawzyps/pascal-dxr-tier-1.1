@@ -344,6 +344,11 @@ static bool g_bindless = false;
 // traversal order, which is implementation-defined, so only the multiset is
 // comparable between WARP and the 1070. Direct dispatch only.
 static bool g_append = false;
+// --split a,q,b (0.84.0, plan step 5 probe): the RayQuery side runs three
+// compute shaders in turn, a scratch buffer between them as a root UAV at u1:
+// a hand split of one shader at its query, held against the original (--cs)
+// on the other side.
+static std::vector<std::string> g_split;
 // --prefill N: fill the output buffer with a pattern seeded by N before the
 // dispatch, on both sides, so a shader that READS its output slot before the
 // trace (Unreal's MegaLights does) reads data rather than zeros. Different
@@ -1306,6 +1311,12 @@ static ComPtr<ID3D12RootSignature> MakeRootSig(ID3D12Device* dev) {
     params[4].DescriptorTable.NumDescriptorRanges = 1;
     params[4].DescriptorTable.pDescriptorRanges = &logRange;
     D3D12_ROOT_SIGNATURE_DESC rd{}; rd.NumParameters = g_append ? 5 : 4; rd.pParameters = params;
+    if (!g_split.empty()) {   // the scratch buffer, a root UAV at u1
+        params[4] = D3D12_ROOT_PARAMETER{};
+        params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        params[4].Descriptor.ShaderRegister = 1;
+        rd.NumParameters = 5;
+    }
     if (g_bindless) rd.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
     ComPtr<ID3DBlob> blob, err;
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC vrd{};
@@ -1578,8 +1589,43 @@ static ComPtr<ID3D12DescriptorHeap> MakeSceneHeap(ID3D12Device* dev, ID3D12Resou
     return heap;
 }
 
+static void RunSplit(Gpu& g, Dxc& dxc, const Scene& s, ID3D12Resource* cb, ID3D12Resource* out) {
+    auto rs = MakeRootSig(g.device.Get());
+    std::vector<ComPtr<ID3D12PipelineState>> psos;
+    for (const auto& f : g_split) {
+        auto bytes = ReadAll(f.c_str());
+        const std::string src((const char*)bytes.data(), bytes.size());
+        ComPtr<IDxcBlob> cs = dxc.compile(src.c_str(), L"main", L"cs_6_5");
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = rs.Get();
+        pd.CS.pShaderBytecode = cs->GetBufferPointer();
+        pd.CS.BytecodeLength = cs->GetBufferSize();
+        ComPtr<ID3D12PipelineState> pso;
+        HR(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)), "CreateComputePipelineState (split)");
+        psos.push_back(pso);
+        std::printf("        split part %zu from %s\n", psos.size(), f.c_str());
+    }
+    const UINT gx = (kWidth + 7) / 8, gy = (kHeight + 7) / 8;
+    auto scratch = CreateBuffer(g.device.Get(), (UINT64)gx * 8 * gy * 8 * 16, D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto mask = MakeAlphaMask(g.device.Get());
+    HR(g.list->Close(), "cmdlist Close before split");
+    HR(g.list->Reset(g.alloc.Get(), psos[0].Get()), "cmdlist Reset (split)");
+    BindRoots(g.list.Get(), rs.Get(), cb->GetGPUVirtualAddress(), s.tlas->GetGPUVirtualAddress(),
+              out->GetGPUVirtualAddress(), mask->GetGPUVirtualAddress());
+    g.list->SetComputeRootUnorderedAccessView(4, scratch->GetGPUVirtualAddress());
+    for (size_t k = 0; k < psos.size(); ++k) {
+        g.list->SetPipelineState(psos[k].Get());
+        g.list->Dispatch(gx, gy, 1);
+        UavBarrier(g.list.Get(), scratch.Get());
+    }
+    UavBarrier(g.list.Get(), out);
+    g.flush();
+}
+
 static void RunRayQuery(Gpu& g, Dxc& dxc, const Scene& s,
         ID3D12Resource* cb, ID3D12Resource* out, const char* hlsl) {
+    if (!g_split.empty()) { RunSplit(g, dxc, s, cb, out); return; }
     // --table has to reach this side too, or a shader written against a
     // descriptor table cannot run as a RayQuery compute shader at all, which
     // is what kept the array cases out of the proxy's dispatch path.
@@ -2262,6 +2308,18 @@ int main(int argc, char** argv) {
                 g_multi = true;
                 for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
                 --argc; --i;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--split") == 0 && i + 1 < argc) {
+                std::string list = argv[i + 1];
+                for (size_t at = 0; at <= list.size();) {
+                    const size_t c = list.find(',', at);
+                    g_split.push_back(list.substr(at, c == std::string::npos ? std::string::npos : c - at));
+                    if (c == std::string::npos) break;
+                    at = c + 1;
+                }
+                for (int j = i; j + 2 < argc; ++j) argv[j] = argv[j + 2];
+                argc -= 2; --i;
                 continue;
             }
             if (std::strcmp(argv[i], "--cs") == 0 && i + 1 < argc) {

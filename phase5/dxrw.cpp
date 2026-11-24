@@ -20,6 +20,7 @@
 #include "../proxy/rewriter/geom_index.h"
 #include "../proxy/rewriter/rq_analyze.h"
 #include "../proxy/rewriter/rq_lower.h"
+#include "../proxy/rewriter/split.h"
 #include "../proxy/rewriter/dxc_host.h"
 
 static bool ReadAll(const char* path, std::string& out) {
@@ -148,6 +149,23 @@ int main(int argc, char** argv) {
         if (!WriteAll(argv[3], l.text)) { std::printf("cannot write %s\n", argv[3]); return 1; }
         std::printf("lowered %s -> %s (pattern %d, %s)\n", argv[2], argv[3],
                     a.query.patternNum, a.query.patternDesc.c_str());
+        return 0;
+    }
+    if (argc >= 6 && std::string(argv[1]) == "split") {
+        // A RayQuery compute shader beside groupshared memory, barriers or
+        // wave ops, split at its query (0.84.0): <in.ll> <a.ll> <q.ll> <b.ll>.
+        std::string raw;
+        if (!ReadAll(argv[2], raw)) { std::printf("cannot read %s\n", argv[2]); return 1; }
+        auto s = rq::SplitAtQuery(llm::Normalize(raw));
+        if (!s.ok) { std::fprintf(stderr, "REFUSED: %s\n", s.error.c_str()); return 2; }
+        if (!WriteAll(argv[3], s.a) || !WriteAll(argv[4], s.q) || !WriteAll(argv[5], s.b)) {
+            std::printf("cannot write the parts\n");
+            return 1;
+        }
+        std::string saved;
+        for (const auto& n : s.saved) saved += (saved.empty() ? "" : ", ") + n;
+        std::printf("split %s: %u dwords a thread (%u values stored), %u a group (%s)\n", argv[2], s.K,
+                    s.stored, s.G, saved.empty() ? "no groupshared saved" : saved.c_str());
         return 0;
     }
     if (argc >= 6 && std::string(argv[1]) == "pointraygen") {

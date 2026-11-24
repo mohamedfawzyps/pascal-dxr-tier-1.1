@@ -114,6 +114,25 @@ def cmd_pointraygen(src, dst, queries, mult):
     return 0
 
 
+def cmd_split(src, a, q, b):
+    """A RayQuery compute shader beside groupshared memory, barriers or wave
+    ops, split at its query (0.84.0): see split.py."""
+    import split
+    text = normalize(io.open(src, encoding='utf-8').read())
+    try:
+        parts = split.split(text)
+    except rayquery.Unsupported as e:
+        sys.stderr.write('REFUSED: %s\n' % e)
+        return 2
+    for path, t in zip((a, q, b), parts[:3]):
+        with io.open(path, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(t)
+    i = parts[3]
+    print('split %s: %d dwords a thread (%d values stored), %d a group (%s)'
+          % (src, i['K'], i['stored'], i['G'], ', '.join(i['saved']) or 'no groupshared saved'))
+    return 0
+
+
 def cmd_lower(src, dst):
     text = normalize(io.open(src, encoding='utf-8').read())
     try:
@@ -142,6 +161,8 @@ def main(argv):
         return cmd_lower(argv[2], argv[3])
     if len(argv) >= 6 and argv[1] == 'lowerraygen':
         return cmd_lowerraygen(argv[2], argv[3], argv[4], argv[5])
+    if len(argv) >= 6 and argv[1] == 'split':
+        return cmd_split(argv[2], argv[3], argv[4], argv[5])
     if len(argv) >= 6 and argv[1] == 'pointraygen':
         return cmd_pointraygen(argv[2], argv[3], int(argv[4]), int(argv[5]))
     print(__doc__)

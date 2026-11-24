@@ -24,6 +24,58 @@ not.
 
 ---
 
+## 0.84.0
+
+**Plan step 5, first version: a RayQuery compute shader beside groupshared
+memory, group barriers or wave ops is split at its query and drawn.** Such a
+shader cannot become a raygen (no thread group, waves laid out differently),
+and until now it was refused and drew nothing.
+
+- **The split** (`phase5/rewriter/split.py`, `proxy/rewriter/split.cpp`,
+  byte-identical; `dxrw split`). Three compute shaders: A runs the original
+  up to the first query op, Q is the query region alone (to the nearest
+  block that post-dominates every query op), B runs from where its control
+  flow rejoins. Values cross through a scratch buffer, a root UAV at u0 in
+  the shim's space: per thread an alive flag and every scalar a later part
+  needs (one dword, two for i64 and double), per group every groupshared
+  array of i32 or float that A writes and B reads, copied out after a
+  barrier in A and back in before one in B. Handles, cbuffer reads, thread
+  and group ids and groupshared addresses are rebuilt instead. An early
+  return before the query joins A's barrier with the alive flag 0, so Q and
+  B return for that thread as the original did. Q is an ordinary RayQuery
+  compute shader and is lowered as any. Each part drops the resource records
+  it makes no handle for: lowered into a library an unused resource is an
+  unused global, which the validator refuses.
+- **The proxy.** `CreateComputePipelineState` splits a shader the lowering
+  refuses for groupshared, barriers or wave ops, makes A and B on the
+  application's root signature extended with the scratch buffer, and builds
+  Q's state object on the same signature. `Dispatch` writes the group counts
+  into the scratch buffer's header (`WriteBufferImmediate`), replays the
+  application's bindings onto the extended signature, and runs A, Q (as any
+  lowered dispatch) and B with UAV barriers between. A Q deferred to submit,
+  its scene not read from its latest build yet, puts B in the segment after
+  it. Scratch buffers are pooled and released through `gpu_hold`. The stats
+  line counts split dispatches drawn and refused.
+- **Tests.** `phase5/cases/split/`: `gs_orig` (a groupshared jitter across a
+  barrier before an opaque query, the hit distance shared across a barrier
+  after it, a wave op) and `gs_save` (groupshared written before an
+  alpha-tested query and read after it, an atomic and a barrier after, whole
+  groups returning before the query), each at 6.5 and 6.6. Dispatch suite:
+  7 new cases, deferred to submit, mixed scene and four geometries included,
+  all match WARP; `DXR_TIER11_SPLITPOISON=1` (B told one group fewer a row)
+  and `=2` (A skipped) diverge; an indirect split is refused by name.
+  Rewriter checks: the split in both rewriters on all four inputs, three
+  parts and the lowered query part valid, and two refusals word for word.
+  Rewriter checks 114 of 114; dispatch suite 165 of 165 plus every gate.
+- Escher: all 845 dumped Unreal shader inputs lower byte-identically to
+  0.83.0 (none of them is split: Escher has no such shader).
+- **Refused by name.** For step 5's next version: an indirect dispatch of a
+  split pipeline; a path around the query that rejoins after it; a query
+  inside a loop; a local array or a groupshared variable of another shape
+  crossing the split; a barrier or wave op inside the query region. On the
+  limits list: a scratch buffer past 4 GB; a root signature with no room for
+  the scratch buffer's root UAV.
+
 ## 0.83.0
 
 **Plan step 4 d: collections, Unreal's way, and libraries through export

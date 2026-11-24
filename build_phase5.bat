@@ -62,6 +62,16 @@ for %%f in ("%~dp0phase5\cases\lib_*sm66.hlsl") do (
     if exist "%~dp0phase5\cases\%%~nf.ll" (echo   ok  case %%~nf ^(lib_6_6^))
 )
 
+rem The split at a query (0.84.0): compute shaders beside groupshared memory,
+rem barriers or wave ops. cs_6_5, then cs_6_6 for the *sm66 ones.
+for %%f in ("%~dp0phase5\cases\split\*.hlsl") do (
+    "%DXC%" -T cs_6_5 -E main -Fc "%~dp0phase5\cases\split\%%~nf.ll" -Fo "%~dp0phase5\cases\split\%%~nf.dxil" "%%f" >nul 2>&1
+)
+for %%f in ("%~dp0phase5\cases\split\*sm66.hlsl") do (
+    "%DXC%" -T cs_6_6 -E main -Fc "%~dp0phase5\cases\split\%%~nf.ll" -Fo "%~dp0phase5\cases\split\%%~nf.dxil" "%%f" >nul 2>&1
+    if exist "%~dp0phase5\cases\split\%%~nf.ll" (echo   ok  case split\%%~nf ^(cs_6_6^))
+)
+
 echo.
 echo Disassembly in phase5\dxil\*.ll, containers in phase5\dxil\*.dxil
 echo Findings in docs\phase5-dxil-recon.md

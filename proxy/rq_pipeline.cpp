@@ -17,6 +17,8 @@
 #include "rewriter/nvapi_fold.h"
 #include "rewriter/rq_analyze.h"
 #include "rewriter/rq_lower.h"
+#include "rewriter/rg_host.h"
+#include "rewriter/split.h"
 
 // Defined below, next to the rest of the crash instrumentation.
 static void LogVideoMemory(ID3D12Device5* dev, const char* when);
@@ -687,6 +689,168 @@ static bool RayQueryLimitReached(std::string* why) {
     return true;
 }
 
+// --- the split at a query (0.84.0, plan step 5) -----------------------------
+
+// The refusals a split answers: what a raygen cannot host.
+static bool SplitAnswers(const std::string& e) {
+    return e.find("uses groupshared memory") != std::string::npos ||
+           e.find("uses a group barrier") != std::string::npos ||
+           e.find("uses wave intrinsics around the query") != std::string::npos;
+}
+
+// Assembled and signed, the module flags taken from the validator when it
+// says the declared ones do not match usage (a part uses less than the whole).
+static bool AssembleParts(const std::string& text, std::vector<uint8_t>* out, std::string* err) {
+    if (dxch::AssembleAndSign(text, out, err)) return true;
+    std::string fixed;
+    return rq::FixFlags(text, *err, &fixed) && dxch::AssembleAndSign(fixed, out, err);
+}
+
+// The application's root signature with the scratch buffer appended: a root
+// UAV at u0 in space kGeomIndexSpace, its parameter index in *param.
+static bool ExtendForSplit(ID3D12Device5* dev, ID3D12RootSignature* app, ID3D12RootSignature** out,
+                           UINT* param, std::string* why) {
+    std::vector<uint8_t> blob;
+    if (!gidx::RootSignatureBlob(app, &blob)) {
+        *why = "its root signature was not seen being created";
+        return false;
+    }
+    Microsoft::WRL::ComPtr<ID3D12VersionedRootSignatureDeserializer> des;
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* got = nullptr;
+    if (FAILED(D3D12CreateVersionedRootSignatureDeserializer(blob.data(), blob.size(), IID_PPV_ARGS(&des))) ||
+        FAILED(des->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &got)) || !got) {
+        *why = "its root signature could not be read back";
+        return false;
+    }
+    std::vector<D3D12_ROOT_PARAMETER1> params(got->Desc_1_1.pParameters,
+                                              got->Desc_1_1.pParameters + got->Desc_1_1.NumParameters);
+    UINT dwords = 0;
+    for (const auto& p : params)
+        dwords += p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ? 1u
+                : p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS ? p.Constants.Num32BitValues : 2u;
+    if (dwords + 2 > 64) {
+        char b[160];
+        std::snprintf(b, sizeof(b), "its root signature costs %u of 64 dwords, which leaves no room for "
+                      "the split's scratch buffer (2)", dwords);
+        *why = b;
+        return false;
+    }
+    D3D12_ROOT_PARAMETER1 u{};
+    u.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    u.Descriptor.ShaderRegister = 0;
+    u.Descriptor.RegisterSpace = rq::kGeomIndexSpace;
+    u.Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_NONE;
+    u.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    *param = (UINT)params.size();
+    params.push_back(u);
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC v{};
+    v.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    v.Desc_1_1 = got->Desc_1_1;
+    v.Desc_1_1.NumParameters = (UINT)params.size();
+    v.Desc_1_1.pParameters = params.data();
+    Microsoft::WRL::ComPtr<ID3DBlob> sb, err;
+    if (FAILED(D3D12SerializeVersionedRootSignature(&v, &sb, &err))) {
+        *why = std::string("its extended root signature could not be serialized: ") +
+               (err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
+        return false;
+    }
+    if (FAILED(dev->CreateRootSignature(0, sb->GetBufferPointer(), sb->GetBufferSize(), IID_PPV_ARGS(out)))) {
+        *why = "its extended root signature could not be created";
+        return false;
+    }
+    // Kept on it like an application's, so a dispatch resolves its scenes
+    // through it (parameters 0 to N-1 are the application's).
+    gidx::NoteRootSignature(*out, sb->GetBufferPointer(), sb->GetBufferSize());
+    return true;
+}
+
+static ID3D12PipelineState* MakePart(ID3D12Device5* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
+                                     ID3D12RootSignature* rs, const std::vector<uint8_t>& cs) {
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = rs;
+    pd.CS.pShaderBytecode = cs.data();
+    pd.CS.BytecodeLength = cs.size();
+    pd.NodeMask = desc->NodeMask;
+    ID3D12PipelineState* p = nullptr;
+    return SUCCEEDED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&p))) ? p : nullptr;
+}
+
+// Split the shader at its query: A and B made here, Q lowered into *lib and
+// *x as any RayQuery compute shader. `refusal` is why it was not lowered whole.
+static std::shared_ptr<Dxr11RayQueryPso::SplitParts> MakeSplit(
+        ID3D12Device5* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, Xform* x,
+        std::vector<uint8_t>* lib, const std::string& refusal, std::string* why) {
+    auto fail = [&](const std::string& w) {
+        *why = refusal + "; split at its query, " + w;
+        return std::shared_ptr<Dxr11RayQueryPso::SplitParts>();
+    };
+    std::string text, folded, err;
+    if (!dxch::Disassemble(desc->CS.pShaderBytecode, static_cast<size_t>(desc->CS.BytecodeLength), &text, &err))
+        return fail("it could not be disassembled: " + err);
+    if (!rq::FoldNvapi(llm::Normalize(text), &folded, &err)) return fail(err);
+    const rq::SplitResult s = rq::SplitAtQuery(folded);
+    if (!s.ok) return fail(s.error);
+    std::string lq;
+    if (!DoLower(s.q, &lq, &err, x)) return fail("the query part: " + err);
+    std::vector<uint8_t> a, b;
+    if (!AssembleParts(lq, lib, &err)) return fail("the query part does not assemble: " + err);
+    if (!AssembleParts(s.a, &a, &err)) return fail("the part before the query does not assemble: " + err);
+    if (!AssembleParts(s.b, &b, &err)) return fail("the part after the query does not assemble: " + err);
+    auto sp = std::make_shared<Dxr11RayQueryPso::SplitParts>();
+    if (!ExtendForSplit(dev, desc->pRootSignature, &sp->rs, &sp->param, &err)) return fail(err);
+    sp->a = MakePart(dev, desc, sp->rs, a);
+    sp->b = MakePart(dev, desc, sp->rs, b);
+    if (!sp->a || !sp->b) return fail("the driver did not create its compute parts");
+    sp->K = s.K;
+    sp->G = s.G;
+    sp->NT = s.threads[0] * s.threads[1] * s.threads[2];
+    ProxyLog("[dxr-tier-11-proxy-log] RayQuery compute shader beside groupshared memory, barriers or "
+             "wave ops SPLIT at its query: %u dwords a thread (%u values), %u a group%s\n",
+             s.K, s.stored, s.G, s.saved.empty() ? "" : " (groupshared saved across the query)");
+    return sp;
+}
+
+Dxr11RayQueryPso::SplitParts::~SplitParts() {
+    for (auto& e : pool) e.first->Release();
+    if (a) a->Release();
+    if (b) b->Release();
+    if (rs) rs->Release();
+}
+
+ID3D12Resource* Dxr11RayQueryPso::SplitParts::Scratch(ID3D12Device* dev, UINT64 bytes, const void* owner) {
+    std::lock_guard<std::mutex> g(lock);
+    // The list's own buffer again (its uses are ordered by barriers), or one
+    // nothing can still read.
+    for (auto& e : pool)
+        if (e.first->GetDesc().Width >= bytes && (e.second == owner || !gpuhold::Busy(e.first))) {
+            e.second = owner;
+            gpuhold::Use(e.first, owner);
+            return e.first;
+        }
+    for (size_t i = 0; i < pool.size(); ++i)
+        if (!gpuhold::Busy(pool[i].first)) {   // too small: give way
+            pool[i].first->Release();
+            pool.erase(pool.begin() + i);
+            break;
+        }
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = (bytes + 65535) & ~65535ull;
+    rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ID3D12Resource* r = nullptr;
+    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&r))))
+        return nullptr;
+    pool.emplace_back(r, owner);
+    gpuhold::Use(r, owner);
+    return r;
+}
+
 ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
         ID3D12Device5* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
         std::string* why) {
@@ -699,11 +863,22 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
     Xform x;
     std::vector<uint8_t> lib;
     std::string err;
+    // The state object's global root signature: the application's, or for a
+    // split one extended with the scratch buffer.
+    ID3D12RootSignature* soRs = desc->pRootSignature;
+    std::shared_ptr<SplitParts> split;
     if (!dxch::RewriteContainer(desc->CS.pShaderBytecode,
                                 static_cast<size_t>(desc->CS.BytecodeLength),
                                 DoLower, &x, &lib, &err)) {
-        *why = err;
-        return nullptr;
+        if (!SplitAnswers(err)) {
+            *why = err;
+            return nullptr;
+        }
+        x = Xform();
+        lib.clear();
+        split = MakeSplit(dev, desc, &x, &lib, err, why);
+        if (!split) return nullptr;
+        soRs = split->rs;
     }
 
     if (RayQueryPhase() == 1) {
@@ -725,7 +900,7 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
 
     // --- state object -------------------------------------------------------
     Built b;
-    if (!BuildStateObject(dev, lib, x, desc->pRootSignature, &b, why))
+    if (!BuildStateObject(dev, lib, x, soRs, &b, why))
         return nullptr;
 
     auto* self = new (std::nothrow) Dxr11RayQueryPso();
@@ -736,8 +911,9 @@ ID3D12PipelineState* Dxr11RayQueryPso::TryCreate(
     }
     self->m_dev = dev;
     self->m_so = b.so;
-    self->m_rootSig = desc->pRootSignature;
+    self->m_rootSig = soRs;
     if (self->m_rootSig) self->m_rootSig->AddRef();
+    self->m_split = split;
     for (int i = 0; i < 3; ++i) self->m_threads[i] = static_cast<UINT>(x.threads[i]);
     // A both-kinds shader serves both; otherwise exactly one. Since 0.69.0
     // that includes a triangle query whose body writes for procedural

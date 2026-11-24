@@ -238,7 +238,9 @@ def fix_flags(text, said):
         return None
     lines = text.split('\n')
     for n, l in enumerate(lines):
-        fm = re.match(r'^(!\d+ = !\{i32 0, i64 )%s(\}.*)$' % m.group(1), l)
+        # A compute entry's properties go on after the flags (numthreads,
+        # 0.84.0); a library's end with them.
+        fm = re.match(r'^(!\d+ = !\{i32 0, i64 )%s([,}].*)$' % m.group(1), l)
         if fm:
             lines[n] = fm.group(1) + m.group(2) + fm.group(2)
             return '\n'.join(lines)

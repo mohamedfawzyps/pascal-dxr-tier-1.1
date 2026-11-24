@@ -165,6 +165,17 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.84.0: PLAN STEP 5 a, A RAYQUERY COMPUTE SHADER BESIDE GROUPSHARED,
+BARRIERS OR WAVE OPS IS SPLIT AT ITS QUERY AND DRAWN.** `split.py` /
+`split.cpp`: A (up to the query), Q (the query region, lowered as any), B
+(from its exit), values and groupshared arrays through a scratch buffer
+(root UAV u0, space 0x7FFF0000, appended to the application's signature).
+Dispatch writes the group counts with `WriteBufferImmediate`, then A, Q, B.
+7 dispatch cases match WARP, 2 poisons diverge. **A part the lowering turns
+into a library must not carry resource records it never uses: each is an
+unused global the validator refuses.** NEXT: step 5 b (indirect split, a
+path around the query, a query in a loop, other shapes crossing).
+
 **0.83.0: PLAN STEP 4 DONE; RAYQUERY IN A RAYGEN, CLOSEST-HIT OR MISS DRAWS
 IN COLLECTIONS AND THROUGH EXPORT LISTS.** A shader's query slot and the
 pipeline's slot count are read at run time beside the miss index, so a

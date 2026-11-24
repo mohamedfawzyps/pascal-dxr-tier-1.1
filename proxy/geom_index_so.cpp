@@ -1260,6 +1260,12 @@ bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, UINT srvs, UI
 void NoteRootSignature(ID3D12RootSignature* rs, const void* blob, size_t size) {
     if (rs && blob && size) rs->SetPrivateData(kBlobGuid, (UINT)size, blob);
 }
+bool RootSignatureBlob(ID3D12RootSignature* rs, std::vector<uint8_t>* out) {
+    UINT size = 0;
+    if (!rs || FAILED(rs->GetPrivateData(kBlobGuid, &size, nullptr)) || !size) return false;
+    out->resize(size);
+    return SUCCEEDED(rs->GetPrivateData(kBlobGuid, &size, out->data()));
+}
 
 void ScanScenes(const std::string& text, Scenes* out) { SceneRegs(text, out); }
 void ScanCallScenes(const std::string& text, std::vector<Scenes>* calls) {

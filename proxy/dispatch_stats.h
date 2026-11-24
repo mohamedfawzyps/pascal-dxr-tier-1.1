@@ -33,6 +33,8 @@ enum Counter {
     kRefusedUnknownBlas,  // an instance on a bottom-level structure of unknown geometry
     kOwnLayout,           // of those drawn, in the shim's own record layout (0.61.0)
     kRefusedPerQuery,     // records per query (0.77.0) and the own layout cannot serve it
+    kSplit,               // of those drawn, split at the query (0.84.0): A, Q, B
+    kRefusedSplit,        // a split pipeline dispatched where the split cannot run
     kCount
 };
 

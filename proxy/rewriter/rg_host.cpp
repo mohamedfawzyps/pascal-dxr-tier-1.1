@@ -320,7 +320,9 @@ bool FixFlags(const std::string& in, const std::string& said, std::string* out) 
     static const std::regex kSaid(R"(Flags declared=(\d+), actual=(\d+))");
     std::smatch m;
     if (!std::regex_search(said, m, kSaid)) return false;
-    const std::regex kLine("^(!\\d+ = !\\{i32 0, i64 )" + m[1].str() + "(\\}.*)$");
+    // A compute entry's properties go on after the flags (numthreads,
+    // 0.84.0); a library's end with them.
+    const std::regex kLine("^(!\\d+ = !\\{i32 0, i64 )" + m[1].str() + "([,}].*)$");
     auto lines = llm::SplitLines(in);
     for (auto& l : lines) {
         std::smatch fm;
@@ -487,6 +489,10 @@ bool RestoreFunction(const std::string& lowered, const std::string& cs, const st
     }
     *out = Join(lines);
     return true;
+}
+
+std::vector<std::string> RgDropUnusedDeclarations(const std::vector<std::string>& lines) {
+    return DropUnusedDeclarations(lines);
 }
 
 }  // namespace rq

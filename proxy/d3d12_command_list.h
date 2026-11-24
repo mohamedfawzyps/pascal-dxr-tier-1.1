@@ -401,6 +401,9 @@ private:
     void FlushQueuedSplit();
     // True when a dispatch is queued and the caller is about to record work.
     void WorkBarrier() { if (!m_openPendings.empty()) FlushQueuedSplit(); }
+    // A lowered RayQuery compute dispatch, and one split at its query (0.84.0).
+    void DispatchLowered(UINT x, UINT y, UINT z);
+    void DispatchSplit(UINT x, UINT y, UINT z);
     // After a capture borrowed the compute bindings: put them back.
     void RestoreComputeAfterCapture();
     // The scenes `sc` names, resolved through the bound compute root

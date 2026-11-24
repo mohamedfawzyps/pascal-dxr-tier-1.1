@@ -65,6 +65,8 @@ namespace gidx {
 // Every root signature the application creates: its blob is kept on the
 // object, so an extended copy of a LOCAL one can be made later.
 void NoteRootSignature(ID3D12RootSignature* rs, const void* blob, size_t size);
+// That blob, false for a root signature the shim did not see being created.
+bool RootSignatureBlob(ID3D12RootSignature* rs, std::vector<uint8_t>* out);
 
 // A hit group whose records carry the geometry index.
 struct Group {

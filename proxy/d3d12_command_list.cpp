@@ -338,6 +338,108 @@ void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) {
     // Dispatch becomes DispatchRays. Its root bindings need no translation:
     // DXR's global root signature IS the compute root signature.
     if (m_rqPso) {
+        if (m_rqPso->Split()) DispatchSplit(x, y, z);
+        else DispatchLowered(x, y, z);
+        return;
+    }
+    FWD(Dispatch(x, y, z));
+}
+
+// A RayQuery compute shader split at its query (0.84.0, plan step 5): the
+// group counts into the scratch buffer's header, then A, then the query part
+// as any lowered dispatch (drawn now, or at submit when its scene is not read
+// yet, in which case B goes into the segment after it), then B. All three on
+// the application's root signature with the scratch buffer appended, its
+// arguments replayed; given back after.
+void Dxr11CommandList::DispatchSplit(UINT x, UINT y, UINT z) {
+    const std::shared_ptr<Dxr11RayQueryPso::SplitParts> sp = m_rqPso->Split();
+    const UINT64 groups = (UINT64)x * y * z;
+    if (!groups) return;
+    const UINT64 bytes = 16 + groups * ((UINT64)sp->NT * sp->K + sp->G) * 4;
+    ID3D12Resource* scratch = nullptr;
+    const char* refuse = nullptr;
+    if (bytes > 0xFFFFFFF0ull)
+        refuse = "its scratch buffer would pass 4 GB, past what a 32-bit offset reaches";
+    else if (sp->param >= Dxr11Bindings::kMaxRootParams)
+        refuse = "its root signature has too many parameters";
+    else if (!(scratch = sp->Scratch(RealDevice(), bytes, this)))
+        refuse = "its scratch buffer could not be created";
+    if (refuse) {
+        dstats::Add(dstats::kRefusedSplit);
+        static LONG once = 0;
+        if (InterlockedCompareExchange(&once, 1, 0) == 0)
+            ProxyLog("[dxr-tier-11-proxy-log] split RayQuery dispatch REFUSED: %s. Nothing is drawn "
+                     "for it.\n", refuse);
+        return;
+    }
+    auto transition = [&](D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+        D3D12_RESOURCE_BARRIER br{};
+        br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        br.Transition.pResource = scratch;
+        br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        br.Transition.StateBefore = from;
+        br.Transition.StateAfter = to;
+        m_real->ResourceBarrier(1, &br);
+    };
+    auto uavBarrier = [&] {
+        // Every UAV: the parts pass values through the scratch buffer, and
+        // a thread reads in B what it wrote to the application's in A.
+        D3D12_RESOURCE_BARRIER br{};
+        br.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        m_real->ResourceBarrier(1, &br);
+    };
+    transition(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER hdr[3];
+    // DXR_TIER11_SPLITPOISON, for the suite's sensitivity check: 1 tells
+    // part B one group fewer a row (it reads other threads' values, every
+    // slot still in the buffer), 2 skips part A.
+    static const int poison = [] {
+        char v[8] = {};
+        return GetEnvironmentVariableA("DXR_TIER11_SPLITPOISON", v, sizeof(v)) ? std::atoi(v) : 0;
+    }();
+    const UINT counts[3] = { x, y, z };
+    for (int i = 0; i < 3; ++i) {
+        hdr[i].Dest = scratch->GetGPUVirtualAddress() + 4 * i;
+        hdr[i].Value = counts[i];
+    }
+    m_real->WriteBufferImmediate(3, hdr, nullptr);
+    transition(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    // The extended bindings stand in for the application's while the parts
+    // record, so anything that replays the compute bindings (a capture's
+    // restore, the segment after a deferred query, the deferred query
+    // itself at submit) replays these.
+    const Dxr11Bindings app = m_bindings;
+    m_bindings.rootSig = sp->rs;
+    Dxr11RootParam u;
+    u.kind = Dxr11RootParam::UAV;
+    u.address = scratch->GetGPUVirtualAddress();
+    m_bindings.roots[sp->param] = u;
+    m_bindings.Replay(m_real);
+    m_real->SetPipelineState(sp->a);
+    if (poison != 2) m_real->Dispatch(x, y, z);
+    uavBarrier();
+    DispatchLowered(x, y, z);
+    WorkBarrier();   // a query deferred to submit: B in the segment after it
+    uavBarrier();
+    if (poison == 1 && x > 1) {
+        transition(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+        hdr[0].Value = x - 1;
+        m_real->WriteBufferImmediate(1, hdr, nullptr);
+        transition(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    m_bindings.Replay(m_real);
+    m_real->SetPipelineState(sp->b);
+    m_real->Dispatch(x, y, z);
+    uavBarrier();
+    gpuhold::Use(scratch, this);
+    m_bindings = app;
+    RestoreComputeAfterCapture();
+    dstats::Add(dstats::kSplit);
+}
+
+void Dxr11CommandList::DispatchLowered(UINT x, UINT y, UINT z) {
+    {
         // The instance data now says whether the table the shim built can be
         // right for this scene. If it cannot, refuse rather than draw a wrong
         // image: a silently wrong result is the one failure mode this project
@@ -407,9 +509,7 @@ void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) {
         // instance descriptions. Empty until a top-level structure has been
         // seen, which is the right answer for a scene that has none.
         m_rqPso->DispatchAsRays(m_real, x, y, z, astrack::RecordKinds(only), this, only);
-        return;
     }
-    FWD(Dispatch(x, y, z));
 }
 void STDMETHODCALLTYPE Dxr11CommandList::CopyBufferRegion(ID3D12Resource* d, UINT64 dof, ID3D12Resource* s, UINT64 sof, UINT64 n) { WorkBarrier(); FWD(CopyBufferRegion(d, dof, s, sof, n)); }
 void STDMETHODCALLTYPE Dxr11CommandList::CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION* d, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION* s, const D3D12_BOX* b) { WorkBarrier(); FWD(CopyTextureRegion(d, x, y, z, s, b)); }
@@ -614,13 +714,17 @@ void STDMETHODCALLTYPE Dxr11CommandList::ExecuteIndirect(ID3D12CommandSignature*
         UINT stride = 0;
         const groupcount::Shape shape = groupcount::SignatureShape(sig, &stride);
         const char* refuse = nullptr;
-        if (shape != groupcount::Shape::kDispatch)
+        if (m_rqPso->Split())
+            refuse = "it is split at its query (groupshared memory, barriers or wave ops), and an "
+                     "indirect split is not built yet";
+        else if (shape != groupcount::Shape::kDispatch)
             refuse = shape == groupcount::Shape::kUnsupported
                 ? "its signature has other arguments or a root signature besides the DISPATCH"
                 : "its signature is not a DISPATCH signature this shim saw created";
         else if (countBuf) refuse = "a count buffer is not supported";
         else if (!args) refuse = "the argument buffer is null";
         if (refuse) {
+            if (m_rqPso->Split()) dstats::Add(dstats::kRefusedSplit);
             static LONG once = 0;
             if (InterlockedCompareExchange(&once, 1, 0) == 0)
                 ProxyLog("[dxr-tier-11-proxy-log] ExecuteIndirect on a lowered RayQuery pipeline "

@@ -206,6 +206,46 @@ query, compute pass B from the query on (reloads them). Groups and waves
 keep their layout in A and B. Probe first: split one real Unreal-shaped
 shader by hand, check against WARP.
 
+- Probe DONE (2026-11-24): `phase5/cases/split/gs_orig.hlsl` (a groupshared
+  jitter exchanged across a barrier before the query, the hit distance
+  shared through groupshared across a barrier after it, a wave op) against
+  its hand split `gs_a` / `gs_q` / `gs_b`, run in turn by `raytest --split`
+  with a scratch buffer at u1: 14500 of 65536 rays hit on both, 0
+  mismatches; the chain without A diverges. The query part is an ordinary
+  RayQuery compute shader, which the shim lowers as it is, so the split
+  needs no new lowering. (Found writing it: `frac(sin(x) * 43758)` is not a
+  usable test input, the WARP and NVIDIA `sin` differ enough to move rays.)
+- Design it decides: the rewriter splits the compute shader into A, Q and
+  B, three compute shaders. A runs the original up to the query and stores
+  every value live past it, an alive flag per thread, and any groupshared
+  array a later read can see (copied out per group after a barrier); Q is
+  the query region alone, reading its inputs and writing its results; B
+  restores groupshared (copy in, barrier), skips threads not alive, and
+  runs from the query's exit. The proxy turns the application's Dispatch
+  into A, Q (lowered, through `DispatchRays`) and B with UAV barriers
+  between, the scratch bound through the application's root signature
+  extended by one root UAV (the bindings replayed onto it). First version:
+  a query outside any loop, its region single-entry and single-exit.
+- a. First version DONE 0.84.0. `split.py` / `split.cpp`, byte-identical:
+  the region runs from the first query op to the nearest block that
+  post-dominates every query op. Handles, cbuffer reads, thread and group
+  ids and groupshared addresses are rebuilt in a later part; every other
+  scalar is stored (one dword, two for i64 and double). A groupshared array
+  of i32 or float that A writes and B reads is saved per group. An early
+  return before the query joins A's barrier and leaves the alive flag 0.
+  Each part drops the resource records it makes no handle for (lowered
+  into a library, an unused one is an unused global the validator
+  refuses). The proxy (`rq_pipeline`, `DispatchSplit`) writes the group
+  counts into the scratch buffer's header (`WriteBufferImmediate`), then
+  runs A, the lowered Q and B, with UAV barriers between; a Q deferred to
+  submit (its scene not read yet) puts B in the segment after it. Seven
+  dispatch cases (6.5 and 6.6; opaque and alpha-tested; groupshared saved;
+  deferred; mixed; four geometries) match WARP; two poisons diverge.
+- b. Next: an indirect dispatch of a split pipeline (refused by name now),
+  a path around the query that rejoins after it, a query inside a loop,
+  a local array or a groupshared variable of another shape crossing the
+  split, a barrier or wave op inside the query region (the Proceed body).
+
 ### 6. Spec item 3, pixel, vertex, mesh, amplification (4 or more versions)
 
 Same split, across a draw: a first pass of the draw writes each
@@ -262,7 +302,10 @@ Three-form matrix, dispatch suite, an Escher run. Then the limits list:
   recursion depth 31; (0.83.0) a collection with RayQuery shaders linked
   through an export list, a closest-hit with RayQuery in a collection
   holding no hit group that imports it, GeometryIndex() in a DXR shader that
-  uses RayQuery.
+  uses RayQuery;
+- a split pipeline (0.84.0) whose scratch buffer would pass 4 GB, or whose
+  root signature is at 63 or 64 dwords (no room for the scratch buffer's
+  root UAV).
 
 ## Size
 

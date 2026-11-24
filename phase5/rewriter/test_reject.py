@@ -233,6 +233,72 @@ def raygen_checks(f, path, fn='RayGen'):
     return good
 
 
+def split_checks(f, path):
+    """The split at a query (0.84.0) in both rewriters, compared; all three
+    parts valid; the query part lowered by both and valid too."""
+    import subprocess
+    import tempfile
+    import rghost
+    d = tempfile.mkdtemp()
+    py = [os.path.join(d, 'p_%s.ll' % p) for p in 'aqb']
+    cc = [os.path.join(d, 'c_%s.ll' % p) for p in 'aqb']
+    r1 = subprocess.run([sys.executable, os.path.join('phase5', 'rewriter', 'dxrewrite.py'), 'split', path] + py,
+                        capture_output=True, text=True)
+    r2 = subprocess.run([DXRW, 'split', path] + cc, capture_output=True, text=True)
+    name = 'split (%s)' % f
+    if r1.returncode or r2.returncode:
+        print('  FAILED   %-34s %s %s' % (name, r1.stderr.strip()[:60], r2.stderr.strip()[:60]))
+        return False
+    same = all(io.open(a, encoding='utf-8').read() == io.open(b, encoding='utf-8').read() for a, b in zip(py, cc))
+
+    def valid(p):
+        text = io.open(p, encoding='utf-8').read()
+        for attempt in range(2):
+            with io.open(p, 'w', encoding='utf-8', newline='\n') as h:
+                h.write(text)
+            r = subprocess.run([os.path.join('phase5out', 'dxilrt.exe'), 'asm', p, p + '.dxil'],
+                               capture_output=True, text=True)
+            said = r.stdout + r.stderr
+            if 'validated and signed ok' in said:
+                return True
+            text = rghost.fix_flags(text, said)
+            if text is None:
+                return False
+        return False
+    parts = [valid(p) for p in py]
+    ql = [os.path.join(d, 'p_ql.ll'), os.path.join(d, 'c_ql.ll')]
+    l1 = subprocess.run([sys.executable, os.path.join('phase5', 'rewriter', 'dxrewrite.py'), 'lower', py[1], ql[0]],
+                        capture_output=True, text=True)
+    l2 = subprocess.run([DXRW, 'lower', py[1], ql[1]], capture_output=True, text=True)
+    lowered = not l1.returncode and not l2.returncode and \
+        io.open(ql[0], encoding='utf-8').read() == io.open(ql[1], encoding='utf-8').read() and valid(ql[0])
+    good = same and all(parts) and lowered
+    print('  %s %-34s %s' % ('ok      ' if good else 'FAILED  ', name,
+                             'identical, three parts valid, the query part lowered and valid' if good else
+                             'identical=%s parts=%s lowered=%s' % (same, parts, lowered)))
+    return good
+
+
+def split_refuses(name, text, must_mention):
+    """Both rewriters refuse a split, with the same message."""
+    import subprocess
+    import tempfile
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, 'in.ll')
+    with io.open(src, 'w', encoding='utf-8', newline='\n') as h:
+        h.write(text)
+    outs = [os.path.join(d, x) for x in ('a.ll', 'q.ll', 'b.ll')]
+    r1 = subprocess.run([sys.executable, os.path.join('phase5', 'rewriter', 'dxrewrite.py'), 'split', src] + outs,
+                        capture_output=True, text=True)
+    r2 = subprocess.run([DXRW, 'split', src] + outs, capture_output=True, text=True)
+    good = r1.returncode == 2 and r2.returncode == 2 and must_mention in r1.stderr and \
+        r1.stderr.strip() == r2.stderr.strip()
+    print('  %s %-34s %s' % ('ok      ' if good else 'FAILED  ', name,
+                             'refused by both: %s' % must_mention if good else
+                             'py=%r cpp=%r' % (r1.stderr.strip()[:80], r2.stderr.strip()[:80])))
+    return good
+
+
 def cpp_agrees(name, text, must_mention=None, forbid=None):
     """The C++ port gives the same verdict. Byte-identity compares OUTPUTS, so
     it cannot see a refusal one side has and the other lacks; that is how the
@@ -799,6 +865,27 @@ def main():
             continue
         for fn in ('ClosestHit', 'Miss'):
             ok.append(raygen_checks(f, path, fn))
+
+    # Beside groupshared memory, barriers or wave ops (0.84.0, plan step 5):
+    # split at the query, both rewriters byte for byte, every part valid.
+    print('\n-- the split at a query --')
+    for f in ('gs_orig', 'gs_orig_sm66', 'gs_save', 'gs_save_sm66'):
+        path = os.path.join('phase5', 'cases', 'split', f + '.ll')
+        if not os.path.isfile(path):
+            print('  FAILED   %-34s input missing (build_phase5.bat)' % f)
+            ok.append(False)
+            continue
+        ok.append(split_checks(f, path))
+    save = os.path.join('phase5', 'cases', 'split', 'gs_save.ll')
+    if os.path.isfile(save):
+        t = load(save)
+        ok.append(split_refuses('split, a second function', t.replace(
+            '\ndeclare ', '\ndefine void @extra() {\n  ret void\n}\n\ndeclare ', 1),
+            'a compute shader with more than one function'))
+        bad = '\n'.join(l.replace('global [64 x float]', 'global [64 x double]')
+                        if 'addrspace(3) global' in l else l for l in t.split('\n'))
+        ok.append(split_refuses('split, a groupshared double array', bad,
+                                'a groupshared variable of a shape the split does not save'))
 
     print('\n%d of %d checks behaved as intended\n' % (sum(ok), len(ok)))
     return 0 if all(ok) else 1

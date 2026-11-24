@@ -3953,4 +3953,11 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
     return r;
 }
 
+// For the split at a query (0.84.0, split.cpp).
+bool SplitIsSm66(const std::string& t) { return IsSm66(t); }
+std::set<std::string> SplitTypeNames(const std::string& t) { return TypeNames(t); }
+std::vector<std::string> SplitOperands(const llm::Instr& i, const std::set<std::string>& t) {
+    return Operands(i, t);
+}
+
 }  // namespace rq

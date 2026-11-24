@@ -494,7 +494,18 @@ $cases = @(
     @{ name = 'nestedmix'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_nestedfront.hlsl', '--mixed', '--contrib'); desc = 'the same on a mixed scene' },
     @{ name = 'nestedstep'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\probe_nested_step.hlsl', '--geom', '--stack'); desc = 'the stepped form written by hand' },
     @{ name = 'retraceinloop'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_retraceinloop.hlsl', '--geom', '--stack'); desc = 'a query traced again inside its own loop, stepped' },
-    @{ name = 'looped'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_looped.hlsl'); desc = 'a query proceeded once per iteration of an ordinary loop' }
+    @{ name = 'looped'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_looped.hlsl'); desc = 'a query proceeded once per iteration of an ordinary loop' },
+    # Beside groupshared memory, barriers and wave ops (0.84.0, plan step 5):
+    # split at the query, A and B compute shaders around the lowered query,
+    # values and groupshared arrays through the shim's scratch buffer. The
+    # gates below poison the split and must diverge.
+    @{ name = 'split'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\split\gs_orig.hlsl'); desc = 'groupshared, two barriers and a wave op around an opaque query' },
+    @{ name = 'splitsm66'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\split\gs_orig_sm66.hlsl'); desc = 'the same at 6.6' },
+    @{ name = 'splitsave'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_save.hlsl'); desc = 'groupshared saved across an alpha-tested query, an early return before it' },
+    @{ name = 'splitsavesm66'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_save_sm66.hlsl'); desc = 'the same at 6.6' },
+    @{ name = 'splitstale'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_save.hlsl', '--rebuild', '--gpuinst'); desc = 'the query deferred to submit, B in the segment after it' },
+    @{ name = 'splitmixed'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_save.hlsl', '--mixed', '--contrib'); desc = 'the same on a mixed scene' },
+    @{ name = 'splitgeom'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_save_sm66.hlsl', '--geom', '--contrib'); desc = 'the same on four geometries' }
 )
 
 $failed = 0
@@ -703,6 +714,39 @@ foreach ($o in $own) {
         $failed++
     }
 }
+$env:DXR_TIER11 = ''
+
+Write-Host ''
+Write-Host '=== the split at a query carries the result (0.84.0) ==='
+# DXR_TIER11_SPLITPOISON=1 tells part B one group fewer a row, so it reads
+# other threads' values; =2 skips part A. Each must DIVERGE. An indirect
+# dispatch of a split pipeline is refused by name (not built yet), which the
+# log must say.
+$env:DXR_TIER11 = '1'
+foreach ($p in @('1', '2')) {
+    foreach ($s in @(@('opaque', 'gs_orig'), @('alpha', 'gs_save_sm66'))) {
+        $x = @('--cs', "phase5\cases\split\$($s[1]).hlsl")
+        & .\raytest.exe warp rayquery $s[0] dp_sp_a.bin @x | Out-Null
+        $env:DXR_TIER11_SPLITPOISON = $p
+        & .\raytest.exe hw rayquery $s[0] dp_sp_b.bin @x | Out-Null
+        Remove-Item env:DXR_TIER11_SPLITPOISON
+        $diff = & .\raytest.exe diff dp_sp_a.bin dp_sp_b.bin 2>&1
+        Remove-Item dp_sp_a.bin, dp_sp_b.bin -ErrorAction SilentlyContinue
+        if ($diff -match 'RESULT: DIVERGE') { Write-Host "  $($s[1]), DXR_TIER11_SPLITPOISON=${p}: diverges" }
+        else { Write-Host "  POISON NOT SEEN: $($s[1]), DXR_TIER11_SPLITPOISON=$p"; $failed++ }
+    }
+}
+$splitLog = Join-Path $env:TEMP 'dp_split_log.txt'
+Remove-Item $splitLog -ErrorAction SilentlyContinue
+$prevLog = $env:DXR_TIER11_LOG
+$env:DXR_TIER11_LOG = $splitLog
+& .\raytest.exe hw rayquery alpha dp_sp_b.bin --cs phase5\cases\split\gs_save.hlsl --indirect | Out-Null
+$env:DXR_TIER11_LOG = $prevLog
+Remove-Item dp_sp_b.bin -ErrorAction SilentlyContinue
+if ((Test-Path $splitLog) -and (Select-String -Path $splitLog -SimpleMatch 'an indirect split is not built yet' -Quiet)) {
+    Write-Host '  an indirect split dispatch: refused by name'
+} else { Write-Host '  an indirect split dispatch: NOT REFUSED BY NAME'; $failed++ }
+Remove-Item $splitLog -ErrorAction SilentlyContinue
 $env:DXR_TIER11 = ''
 
 # Past the local root signature size the GTX 1070 takes, the shim's own
