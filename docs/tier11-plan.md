@@ -241,8 +241,11 @@ shader by hand, check against WARP.
   submit (its scene not read yet) puts B in the segment after it. Seven
   dispatch cases (6.5 and 6.6; opaque and alpha-tested; groupshared saved;
   deferred; mixed; four geometries) match WARP; two poisons diverge.
-- b. Next: an indirect dispatch of a split pipeline (refused by name now),
-  a path around the query that rejoins after it, a query inside a loop,
+- b. An indirect dispatch of a split pipeline: DONE 0.85.0, A, Q and B all
+  issued at submit once the group counts are read back. A path around the
+  query that joins it at P (`if (c) { query }`): DONE 0.85.0, through a
+  block of A storing alive 2 and P's phi values for that edge.
+- c. Next: a query inside a loop, a path around the query joining past P,
   a local array or a groupshared variable of another shape crossing the
   split, a barrier or wave op inside the query region (the Proceed body).
 

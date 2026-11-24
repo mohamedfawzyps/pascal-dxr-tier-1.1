@@ -24,6 +24,39 @@ not.
 
 ---
 
+## 0.85.0
+
+**Plan step 5 b, first two items: an indirect dispatch of a split pipeline,
+and a path around the query that joins it after.** Both were refused by
+name in 0.84.0.
+
+- **Indirect.** `ExecuteIndirect` with a DISPATCH signature on a split
+  pipeline is queued like any indirect lowered dispatch (the group counts
+  captured on the GPU, read back at submit), and at submit A, Q and B are
+  all issued on the dispatch list, since the scratch buffer's size and
+  header need the counts. The split's recording is shared by the direct and
+  the submit path (`SplitScratch`, `SplitBefore`, `SplitAfter`). Arguments
+  in an upload heap still take the direct path.
+- **A path around the query** (`if (c) { query }` and on, the commonest
+  shape): an edge from part A straight to the block where the query's
+  control flow rejoins (P) goes through a block of its own in A that stores
+  the alive flag 2 and P's phi values for that edge. Q runs only for alive
+  1; B resumes 1 and 2 at P. Q's copy of a P phi keeps only its incomings
+  from the query region (and its header loses the preds comment, which the
+  normaliser read as a reference to the entry block). Both rewriters,
+  byte-identical. A path joining past P is still refused by name.
+- **Tests.** `gs_around` (the query under an `if` divergent within a group,
+  groupshared and barriers on both sides), at 6.5 and 6.6. Dispatch suite:
+  `splitindirect`, `splitindirectgpu` (GPU-written, rebuilt scene),
+  `splitindirectup`, `splitaround`, `splitaroundsm66` (mixed scene),
+  `splitaroundind`; all match WARP. The split poisons 1 and 2 diverge
+  indirect too; `DXR_TIER11_SPLITPOISON=3` (the path around stores alive 1,
+  so Q runs for it) diverges on both around cases and changes nothing on a
+  shader with no such path. Rewriter checks 116 of 116; dispatch suite 171
+  of 171 plus every gate.
+- Escher: all 845 dumped Unreal shader inputs lower byte-identically to
+  0.84.0.
+
 ## 0.84.0
 
 **Plan step 5, first version: a RayQuery compute shader beside groupshared

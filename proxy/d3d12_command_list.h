@@ -146,6 +146,9 @@ struct Dxr11PendingDispatch {
     // scene was an older build's (0.52.0): its group counts, no readback.
     bool                                         rqDirect = false;
     UINT                                         rqGroups[3] = { 0, 0, 0 };
+    // An indirect dispatch of a split pipeline (0.84.0): A and B around the
+    // query, issued at submit with the group counts read back.
+    bool                                         rqSplit = false;
     // An indirect DispatchRays of a GeometryIndex() pipeline: the scene it
     // traces, resolved when recorded, for the shim's table at submit.
     bool                                         giScenesSet = false;

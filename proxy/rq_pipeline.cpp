@@ -794,7 +794,18 @@ static std::shared_ptr<Dxr11RayQueryPso::SplitParts> MakeSplit(
     if (!DoLower(s.q, &lq, &err, x)) return fail("the query part: " + err);
     std::vector<uint8_t> a, b;
     if (!AssembleParts(lq, lib, &err)) return fail("the query part does not assemble: " + err);
-    if (!AssembleParts(s.a, &a, &err)) return fail("the part before the query does not assemble: " + err);
+    std::string partA = s.a;
+    {
+        // DXR_TIER11_SPLITPOISON=3, for the suite: a path around the query
+        // stores the alive flag 1, so Q runs the query for it too.
+        char v[8] = {};
+        if (GetEnvironmentVariableA("DXR_TIER11_SPLITPOISON", v, sizeof(v)) && std::atoi(v) == 3) {
+            const std::string from = "i32 %sp.tb, i32 undef, i32 2,", to = "i32 %sp.tb, i32 undef, i32 1,";
+            for (size_t at = partA.find(from); at != std::string::npos; at = partA.find(from, at + to.size()))
+                partA.replace(at, from.size(), to);
+        }
+    }
+    if (!AssembleParts(partA, &a, &err)) return fail("the part before the query does not assemble: " + err);
     if (!AssembleParts(s.b, &b, &err)) return fail("the part after the query does not assemble: " + err);
     auto sp = std::make_shared<Dxr11RayQueryPso::SplitParts>();
     if (!ExtendForSplit(dev, desc->pRootSignature, &sp->rs, &sp->param, &err)) return fail(err);

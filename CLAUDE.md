@@ -165,6 +165,15 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.85.0: PLAN STEP 5 b, AN INDIRECT SPLIT AND A PATH AROUND THE QUERY.**
+An indirect split is issued whole at submit (A, Q, B on the dispatch list,
+the counts read back). `if (c) { query }`: the edge around goes through a
+block of A storing alive 2 and P's phi values; Q runs for alive 1 only.
+**A "; preds =" comment counts as a reference to the normaliser: a copied
+block header that drops incomings must drop the comment too.** 6 new
+dispatch cases match, poison 3 diverges. NEXT: step 5 c (a query inside a
+loop, a path joining past P, other shapes crossing, ops in the Proceed body).
+
 **0.84.0: PLAN STEP 5 a, A RAYQUERY COMPUTE SHADER BESIDE GROUPSHARED,
 BARRIERS OR WAVE OPS IS SPLIT AT ITS QUERY AND DRAWN.** `split.py` /
 `split.cpp`: A (up to the query), Q (the query region, lowered as any), B

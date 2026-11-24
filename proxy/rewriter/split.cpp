@@ -463,6 +463,7 @@ SplitResult SplitAtQuery(const std::string& text) {
 
     std::map<const llm::Instr*, char> where;
     std::map<std::string, const llm::Instr*> defs;
+    std::map<std::string, std::string> home;   // the block defining each value
     for (const auto& b : fn.blocks)
         for (size_t k = 0; k < b.instrs.size(); ++k) {
             const llm::Instr& i = b.instrs[k];
@@ -472,7 +473,7 @@ SplitResult SplitAtQuery(const std::string& text) {
             else if (Bpart.count(b.label)) p = 'B';
             else p = 'A';
             where[&i] = p;
-            if (!i.result.empty()) defs[i.result] = &i;
+            if (!i.result.empty()) { defs[i.result] = &i; home[i.result] = b.label; }
         }
     static const std::regex kWave(R"(dx\.op\.(wave|quad))");
     for (const auto& b : fn.blocks)
@@ -520,11 +521,37 @@ SplitResult SplitAtQuery(const std::string& text) {
         loads[Y].push_back(u);
         return true;
     };
+    // A path around the query that joins it at P (0.85.0): `if (c) { query }`
+    // and on. Such an edge goes through a block of its own in A that stores
+    // the alive flag 2 (Q skips the thread, B resumes it at P) and P's phi
+    // values for that edge, so a P phi reads, in Q, only its incomings from
+    // the query region.
+    std::vector<std::string> around;
+    const bool pRet = Pb->instrs.size() == 1 && StartsWith(Pb->instrs[0].body, "ret void");
+    for (const auto& b : fn.blocks) {
+        if (R.count(b.label) || b.label == P || Bpart.count(b.label) || pRet) continue;
+        const auto ss = b.Successors();
+        if (std::find(ss.begin(), ss.end(), P) != ss.end()) around.push_back(b.label);
+    }
+    auto aroundIndex = [&](const std::string& l) {
+        return (int)(std::find(around.begin(), around.end(), l) - around.begin());
+    };
+    auto isAround = [&](const std::string& l) { return aroundIndex(l) < (int)around.size(); };
     for (const auto& b : fn.blocks)
         for (const auto& i : b.instrs) {
             const char Y = where[&i];
             if (Y == 'A') continue;
-            for (const auto& u : SplitOperands(i, types))
+            std::vector<std::string> ops;
+            if (!around.empty() && b.label == P && i.isPhi) {
+                for (const auto& in : i.phiIncoming) {
+                    if (!R.count(in.second)) continue;
+                    const std::string n = llm::OperandName(in.first);
+                    if (!n.empty()) ops.push_back(n);
+                }
+            } else {
+                ops = SplitOperands(i, types);
+            }
+            for (const auto& u : ops)
                 if (defs.count(u) && where[defs[u]] != Y && !need(u, Y)) { res.error = err; return res; }
         }
     std::map<std::string, unsigned> field;
@@ -734,29 +761,66 @@ SplitResult SplitAtQuery(const std::string& text) {
     for (const auto& b : fn.blocks) {
         if (R.count(b.label) || b.label == P || Bpart.count(b.label)) continue;
         for (const auto& s : b.Successors()) {
+            if (s == P && isAround(b.label)) continue;
             if (s != P && !Bpart.count(s)) continue;
             const llm::Block* t = fn.FindBlock(s);
             if (!t || t->instrs.size() != 1 || !StartsWith(t->instrs[0].body, "ret void")) {
-                res.error = "a path around the query that rejoins after it";
+                res.error = "a path around the query that rejoins after where the query does";
                 return res;
             }
             leave.insert(s);
         }
     }
-    auto retarget = [&](std::string line) {
-        for (const auto& s : leave) {
-            const std::string pat = "label " + s;
-            for (size_t at = line.find(pat); at != std::string::npos; at = line.find(pat, at)) {
-                const size_t e = at + pat.size();
-                if (e < line.size() && (std::isalnum((unsigned char)line[e]) || std::strchr("_.$-", line[e]))) {
-                    at = e;
-                    continue;
-                }
-                line.replace(at, pat.size(), "label %sp.ajoin");
-                at += 15;
+    auto relabel = [](std::string line, const std::string& from, const std::string& to) {
+        const std::string pat = "label " + from;
+        const std::string rep = "label " + to;
+        for (size_t at = line.find(pat); at != std::string::npos; at = line.find(pat, at)) {
+            const size_t e = at + pat.size();
+            if (e < line.size() && (std::isalnum((unsigned char)line[e]) || std::strchr("_.$-", line[e]))) {
+                at = e;
+                continue;
             }
+            line.replace(at, pat.size(), rep);
+            at += rep.size();
         }
         return line;
+    };
+    auto retarget = [&](std::string line, const llm::Block& b) {
+        for (const auto& s : leave) line = relabel(line, s, "%sp.ajoin");
+        if (isAround(b.label)) line = relabel(line, P, "%sp.lv" + std::to_string(aroundIndex(b.label)));
+        return line;
+    };
+    // The edge from `b` around the query to P: alive 2, what B reads from A,
+    // and P's phis as that edge gives them.
+    auto leaveBlock = [&](const llm::Block& b, std::vector<std::string>& o) -> bool {
+        o.push_back("sp.lv" + std::to_string(aroundIndex(b.label)) + ":");
+        rawStore(o, "%sp.tb", "2");
+        for (const auto& u : store['A']) {
+            if (std::find(loads['B'].begin(), loads['B'].end(), u) == loads['B'].end()) continue;
+            if (!dom[b.label].count(home[u])) {
+                res.error = "a value B reads does not reach the path around the query: " + u;
+                return false;
+            }
+            auto ws = toWords(o, u, TypeOf(*defs[u]));
+            for (size_t d = 0; d < ws.size(); ++d) rawStore(o, addr(o, field[u] + (unsigned)d), ws[d]);
+        }
+        for (const auto& u : store['Q']) {
+            const llm::Instr* d = defs[u];
+            if (home[u] != P || !d->isPhi) {
+                res.error = "a value of the query region B reads is not a phi where it rejoins: " + u;
+                return false;
+            }
+            std::string v;
+            for (const auto& in : d->phiIncoming)
+                if (in.second == b.label) { v = in.first; break; }
+            while (!v.empty() && v.back() == ' ') v.pop_back();
+            while (!v.empty() && v.front() == ' ') v.erase(v.begin());
+            auto ws = toWords(o, v, TypeOf(*d));
+            for (size_t k = 0; k < ws.size(); ++k) rawStore(o, addr(o, field[u] + (unsigned)k), ws[k]);
+        }
+        o.push_back("  br label %sp.ajoin");
+        o.push_back("");
+        return true;
     };
 
     // --- A ---
@@ -787,16 +851,17 @@ SplitResult SplitAtQuery(const std::string& text) {
             }
             A.push_back("  ret void");
         } else {
-            for (const auto& i : b.instrs) A.push_back(retarget(i.line));
+            for (const auto& i : b.instrs) A.push_back(retarget(i.line, b));
         }
         A.push_back("");
+        if (isAround(b.label) && !leaveBlock(b, A)) return res;
     }
 
     // --- Q ---
     std::vector<std::string> Q = { "sp.qentry:" };
     prologue(Q);
     rawLoad(Q, "%sp.tb", "%sp.al");
-    for (const char* l : { "  %sp.alc = icmp ne i32 %sp.al, 0", "  br i1 %sp.alc, label %sp.qgo, label %sp.qret", "",
+    for (const char* l : { "  %sp.alc = icmp eq i32 %sp.al, 1", "  br i1 %sp.alc, label %sp.qgo, label %sp.qret", "",
                            "sp.qret:", "  ret void", "", "sp.qgo:" })
         Q.push_back(l);
     loadAll(Q, 'Q');
@@ -813,8 +878,32 @@ SplitResult SplitAtQuery(const std::string& text) {
             for (const auto& i : b.instrs) Q.push_back(i.line);
             Q.push_back("");
         }
-    Q.push_back(header(*Pb));
-    for (const auto& i : Pb->instrs) if (i.isPhi) Q.push_back(i.line);
+    // Its "; preds =" comment names the blocks around the query too, which
+    // the normaliser would take for a reference.
+    {
+        std::string h = header(*Pb);
+        if (!around.empty()) {
+            h = h.substr(0, h.find(';'));
+            while (!h.empty() && h.back() == ' ') h.pop_back();
+        }
+        Q.push_back(h);
+    }
+    for (const auto& i : Pb->instrs) {
+        if (!i.isPhi) continue;
+        std::vector<std::pair<std::string, std::string>> keep;
+        for (const auto& in : i.phiIncoming) if (R.count(in.second)) keep.push_back(in);
+        if (keep.size() == i.phiIncoming.size()) { Q.push_back(i.line); continue; }
+        // The incomings around the query are part A's.
+        std::string l = i.line.substr(0, i.line.find('['));
+        while (!l.empty() && l.back() == ' ') l.pop_back();
+        for (size_t k = 0; k < keep.size(); ++k) {
+            std::string v = keep[k].first;
+            while (!v.empty() && v.back() == ' ') v.pop_back();
+            while (!v.empty() && v.front() == ' ') v.erase(v.begin());
+            l += (k ? ", [ " : " [ ") + v + ", " + keep[k].second + " ]";
+        }
+        Q.push_back(l);
+    }
     for (const auto& u : store['Q']) {
         auto ws = toWords(Q, u, TypeOf(*defs[u]));
         for (size_t d = 0; d < ws.size(); ++d) rawStore(Q, addr(Q, field[u] + (unsigned)d), ws[d]);

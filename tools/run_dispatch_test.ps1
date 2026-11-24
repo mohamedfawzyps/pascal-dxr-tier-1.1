@@ -505,7 +505,16 @@ $cases = @(
     @{ name = 'splitsavesm66'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_save_sm66.hlsl'); desc = 'the same at 6.6' },
     @{ name = 'splitstale'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_save.hlsl', '--rebuild', '--gpuinst'); desc = 'the query deferred to submit, B in the segment after it' },
     @{ name = 'splitmixed'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_save.hlsl', '--mixed', '--contrib'); desc = 'the same on a mixed scene' },
-    @{ name = 'splitgeom'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_save_sm66.hlsl', '--geom', '--contrib'); desc = 'the same on four geometries' }
+    @{ name = 'splitgeom'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_save_sm66.hlsl', '--geom', '--contrib'); desc = 'the same on four geometries' },
+    # Indirect (0.85.0, step 5 b): A, Q and B issued at submit, the group
+    # counts read back.
+    @{ name = 'splitindirect'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_save.hlsl', '--indirect'); desc = 'an indirect dispatch of a split pipeline' },
+    @{ name = 'splitindirectgpu'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\split\gs_orig_sm66.hlsl', '--indirect', '--gpuinst', '--rebuild'); desc = 'the same, its scene GPU-written and rebuilt' },
+    @{ name = 'splitindirectup'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_save_sm66.hlsl', '--indirectup'); desc = 'the same, the arguments in an upload heap' },
+    # A path around the query that joins it after (0.85.0): `if (c) { query }`.
+    @{ name = 'splitaround'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_around.hlsl'); desc = 'the query under a divergent if, groupshared and barriers on both sides' },
+    @{ name = 'splitaroundsm66'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_around_sm66.hlsl', '--mixed', '--contrib'); desc = 'the same at 6.6 on a mixed scene' },
+    @{ name = 'splitaroundind'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\split\gs_around.hlsl', '--indirect'); desc = 'the same, dispatched indirectly' }
 )
 
 $failed = 0
@@ -719,34 +728,37 @@ $env:DXR_TIER11 = ''
 Write-Host ''
 Write-Host '=== the split at a query carries the result (0.84.0) ==='
 # DXR_TIER11_SPLITPOISON=1 tells part B one group fewer a row, so it reads
-# other threads' values; =2 skips part A. Each must DIVERGE. An indirect
-# dispatch of a split pipeline is refused by name (not built yet), which the
-# log must say.
+# other threads' values; =2 skips part A. Each must DIVERGE, direct and
+# indirect (issued at submit).
 $env:DXR_TIER11 = '1'
 foreach ($p in @('1', '2')) {
-    foreach ($s in @(@('opaque', 'gs_orig'), @('alpha', 'gs_save_sm66'))) {
-        $x = @('--cs', "phase5\cases\split\$($s[1]).hlsl")
-        & .\raytest.exe warp rayquery $s[0] dp_sp_a.bin @x | Out-Null
+    foreach ($s in @(@{ pat = 'opaque'; f = 'gs_orig'; ind = $false }, @{ pat = 'alpha'; f = 'gs_save_sm66'; ind = $false },
+                     @{ pat = 'alpha'; f = 'gs_save'; ind = $true })) {
+        $x = @('--cs', "phase5\cases\split\$($s.f).hlsl")
+        if ($s.ind) { $x += '--indirect' }
+        & .\raytest.exe warp rayquery $s.pat dp_sp_a.bin @x | Out-Null
         $env:DXR_TIER11_SPLITPOISON = $p
-        & .\raytest.exe hw rayquery $s[0] dp_sp_b.bin @x | Out-Null
+        & .\raytest.exe hw rayquery $s.pat dp_sp_b.bin @x | Out-Null
         Remove-Item env:DXR_TIER11_SPLITPOISON
         $diff = & .\raytest.exe diff dp_sp_a.bin dp_sp_b.bin 2>&1
         Remove-Item dp_sp_a.bin, dp_sp_b.bin -ErrorAction SilentlyContinue
-        if ($diff -match 'RESULT: DIVERGE') { Write-Host "  $($s[1]), DXR_TIER11_SPLITPOISON=${p}: diverges" }
-        else { Write-Host "  POISON NOT SEEN: $($s[1]), DXR_TIER11_SPLITPOISON=$p"; $failed++ }
+        $w = "$($s.f)$(if ($s.ind) { ' --indirect' })"
+        if ($diff -match 'RESULT: DIVERGE') { Write-Host "  $w, DXR_TIER11_SPLITPOISON=${p}: diverges" }
+        else { Write-Host "  POISON NOT SEEN: $w, DXR_TIER11_SPLITPOISON=$p"; $failed++ }
     }
 }
-$splitLog = Join-Path $env:TEMP 'dp_split_log.txt'
-Remove-Item $splitLog -ErrorAction SilentlyContinue
-$prevLog = $env:DXR_TIER11_LOG
-$env:DXR_TIER11_LOG = $splitLog
-& .\raytest.exe hw rayquery alpha dp_sp_b.bin --cs phase5\cases\split\gs_save.hlsl --indirect | Out-Null
-$env:DXR_TIER11_LOG = $prevLog
-Remove-Item dp_sp_b.bin -ErrorAction SilentlyContinue
-if ((Test-Path $splitLog) -and (Select-String -Path $splitLog -SimpleMatch 'an indirect split is not built yet' -Quiet)) {
-    Write-Host '  an indirect split dispatch: refused by name'
-} else { Write-Host '  an indirect split dispatch: NOT REFUSED BY NAME'; $failed++ }
-Remove-Item $splitLog -ErrorAction SilentlyContinue
+# =3: a path around the query stores the alive flag 1, so Q runs for it.
+foreach ($f in @('gs_around', 'gs_around_sm66')) {
+    $x = @('--cs', "phase5\cases\split\$f.hlsl")
+    & .\raytest.exe warp rayquery alpha dp_sp_a.bin @x | Out-Null
+    $env:DXR_TIER11_SPLITPOISON = '3'
+    & .\raytest.exe hw rayquery alpha dp_sp_b.bin @x | Out-Null
+    Remove-Item env:DXR_TIER11_SPLITPOISON
+    $diff = & .\raytest.exe diff dp_sp_a.bin dp_sp_b.bin 2>&1
+    Remove-Item dp_sp_a.bin, dp_sp_b.bin -ErrorAction SilentlyContinue
+    if ($diff -match 'RESULT: DIVERGE') { Write-Host "  $f, DXR_TIER11_SPLITPOISON=3: diverges" }
+    else { Write-Host "  POISON NOT SEEN: $f, DXR_TIER11_SPLITPOISON=3"; $failed++ }
+}
 $env:DXR_TIER11 = ''
 
 # Past the local root signature size the GTX 1070 takes, the shim's own

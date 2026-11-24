@@ -40,7 +40,7 @@ Runs on NORMALISED text; returns (a, q, b, info) as text.
 
 import re
 
-from dxil import Module, split_args
+from dxil import Module, operand_name, split_args
 from lower import _resolve_attrs, _is_sm66, _operands, _type_names, HANDLE_TYPE
 from rayquery import Unsupported
 
@@ -194,11 +194,13 @@ def split(text):
 
     defs = {}
     where = {}
+    home = {}   # the block defining each value
     for b in fn.blocks:
         for k, i in enumerate(b.instrs):
             where[id(i)] = part(b, k, i)
             if i.result:
                 defs[i.result] = i
+                home[i.result] = b.label
     for b in fn.blocks:
         for k, i in enumerate(b.instrs):
             if where[id(i)] != 'Q':
@@ -239,12 +241,26 @@ def split(text):
             store[X].append(u)
         loads[Y].append(u)
 
+    # A path around the query that joins it at P (0.85.0): `if (c) { query }`
+    # and on. Such an edge goes through a block of its own in A that stores
+    # the alive flag 2 (Q skips the thread, B resumes it at P) and P's phi
+    # values for that edge, so a P phi reads, in Q, only its incomings from
+    # the query region.
+    around = [b.label for b in fn.blocks
+              if b.label not in R and b.label != P and b.label not in Bpart and P in b.successors()
+              and not (len(Pb.instrs) == 1 and Pb.instrs[0].body.startswith('ret void'))]
+
+    def operands(b, i):
+        if around and b.label == P and i.is_phi:
+            return [n for n in (operand_name(v) for v, blk in i.phi_incoming if blk in R) if n]
+        return _operands(i, types)
+
     for b in fn.blocks:
         for k, i in enumerate(b.instrs):
             Y = where[id(i)]
             if Y == 'A':
                 continue
-            for u in _operands(i, types):
+            for u in operands(b, i):
                 if u in defs and where[id(defs[u])] != Y:
                     need(u, Y)
     field, K = {}, 1
@@ -445,16 +461,44 @@ def split(text):
         if b.label in R or b.label == P or b.label in Bpart:
             continue
         for s in b.successors():
+            if s == P and b.label in around:
+                continue
             if s == P or s in Bpart:
                 t = fn.block(s)
                 if len(t.instrs) != 1 or not t.instrs[0].body.startswith('ret void'):
-                    raise Unsupported('a path around the query that rejoins after it')
+                    raise Unsupported('a path around the query that rejoins after where the query does')
                 leave.add(s)
 
-    def retarget(line):
+    def retarget(line, b):
         for s in leave:
             line = re.sub(r'label %s(?![\w.$-])' % re.escape(s), 'label %sp.ajoin', line)
+        if b.label in around:
+            line = re.sub(r'label %s(?![\w.$-])' % re.escape(P), 'label %%sp.lv%d' % around.index(b.label), line)
         return line
+
+    def leave_block(b):
+        """The edge from `b` around the query to P: alive 2, what B reads
+        from A, and P's phis as that edge gives them."""
+        o = ['sp.lv%d:' % around.index(b.label)]
+        raw_store(o, '%sp.tb', '2')
+        for u in store['A']:
+            if u not in loads['B']:
+                continue
+            if home[u] not in dom[b.label]:
+                raise Unsupported('a value B reads does not reach the path around the query: %s' % u)
+            ws = to_words(o, u, _type_of(defs[u]))
+            for d, w in enumerate(ws):
+                raw_store(o, addr(o, field[u] + d), w)
+        for u in store['Q']:
+            d = defs[u]
+            if home[u] != P or not d.is_phi:
+                raise Unsupported('a value of the query region B reads is not a phi where it rejoins: %s' % u)
+            vals = [v for v, blk in d.phi_incoming if blk == b.label]
+            ws = to_words(o, vals[0].strip(), _type_of(d))
+            for k, w in enumerate(ws):
+                raw_store(o, addr(o, field[u] + k), w)
+        o += ['  br label %sp.ajoin', '']
+        return o
 
     # --- A ---
     A = []
@@ -483,14 +527,16 @@ def split(text):
                 gs_copy(A, True, 'sp.ajoin')
             A.append('  ret void')
         else:
-            A += [retarget(l) for l in body_lines(b, lambda k, i: True)]
+            A += [retarget(l, b) for l in body_lines(b, lambda k, i: True)]
         A.append('')
+        if b.label in around:
+            A += leave_block(b)
 
     # --- Q ---
     Q = ['sp.qentry:']
     prologue(Q)
     raw_load(Q, '%sp.tb', '%sp.al')
-    Q += ['  %sp.alc = icmp ne i32 %sp.al, 0', '  br i1 %sp.alc, label %sp.qgo, label %sp.qret', '',
+    Q += ['  %sp.alc = icmp eq i32 %sp.al, 1', '  br i1 %sp.alc, label %sp.qgo, label %sp.qret', '',
           'sp.qret:', '  ret void', '', 'sp.qgo:']
     load_all(Q, 'Q')
     rebuilt(Q, 'Q')
@@ -503,8 +549,18 @@ def split(text):
             Q.append(b.header_line)
             Q += body_lines(b, lambda k, i: True)
             Q.append('')
-    Q.append(Pb.header_line)
-    Q += [i.line for i in Pb.instrs if i.is_phi]
+    # Its "; preds =" comment names the blocks around the query too, which
+    # the normaliser would take for a reference.
+    Q.append(Pb.header_line.split(';')[0].rstrip() if around else Pb.header_line)
+    for i in Pb.instrs:
+        if not i.is_phi:
+            continue
+        keep = [(v, blk) for v, blk in i.phi_incoming if blk in R]
+        if len(keep) == len(i.phi_incoming):
+            Q.append(i.line)
+        else:   # the incomings around the query are part A's
+            Q.append('%s %s' % (i.line[:i.line.index('[')].rstrip(),
+                                ', '.join('[ %s, %s ]' % (v.strip(), blk) for v, blk in keep)))
     for u in store['Q']:
         ws = to_words(Q, u, _type_of(defs[u]))
         for d, w in enumerate(ws):

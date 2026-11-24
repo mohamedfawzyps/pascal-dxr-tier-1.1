@@ -869,7 +869,8 @@ def main():
     # Beside groupshared memory, barriers or wave ops (0.84.0, plan step 5):
     # split at the query, both rewriters byte for byte, every part valid.
     print('\n-- the split at a query --')
-    for f in ('gs_orig', 'gs_orig_sm66', 'gs_save', 'gs_save_sm66'):
+    # 0.85.0: a path around the query that joins it at its exit.
+    for f in ('gs_orig', 'gs_orig_sm66', 'gs_save', 'gs_save_sm66', 'gs_around', 'gs_around_sm66'):
         path = os.path.join('phase5', 'cases', 'split', f + '.ll')
         if not os.path.isfile(path):
             print('  FAILED   %-34s input missing (build_phase5.bat)' % f)

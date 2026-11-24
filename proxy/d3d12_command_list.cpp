@@ -351,18 +351,65 @@ void STDMETHODCALLTYPE Dxr11CommandList::Dispatch(UINT x, UINT y, UINT z) {
 // yet, in which case B goes into the segment after it), then B. All three on
 // the application's root signature with the scratch buffer appended, its
 // arguments replayed; given back after.
-void Dxr11CommandList::DispatchSplit(UINT x, UINT y, UINT z) {
-    const std::shared_ptr<Dxr11RayQueryPso::SplitParts> sp = m_rqPso->Split();
-    const UINT64 groups = (UINT64)x * y * z;
-    if (!groups) return;
-    const UINT64 bytes = 16 + groups * ((UINT64)sp->NT * sp->K + sp->G) * 4;
+namespace {
+
+// DXR_TIER11_SPLITPOISON, for the suite's sensitivity check: 1 tells part B
+// one group fewer a row (it reads other threads' values, every slot still in
+// the buffer), 2 skips part A.
+int SplitPoison() {
+    static const int poison = [] {
+        char v[8] = {};
+        return GetEnvironmentVariableA("DXR_TIER11_SPLITPOISON", v, sizeof(v)) ? std::atoi(v) : 0;
+    }();
+    return poison;
+}
+
+void SplitTransition(ID3D12GraphicsCommandList4* cl, ID3D12Resource* r, D3D12_RESOURCE_STATES from,
+                     D3D12_RESOURCE_STATES to) {
+    D3D12_RESOURCE_BARRIER br{};
+    br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    br.Transition.pResource = r;
+    br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    br.Transition.StateBefore = from;
+    br.Transition.StateAfter = to;
+    cl->ResourceBarrier(1, &br);
+}
+
+// Every UAV: the parts pass values through the scratch buffer, and a thread
+// reads in B what it wrote to the application's in A.
+void SplitUavBarrier(ID3D12GraphicsCommandList4* cl) {
+    D3D12_RESOURCE_BARRIER br{};
+    br.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    cl->ResourceBarrier(1, &br);
+}
+
+void SplitHeader(ID3D12GraphicsCommandList4* cl, ID3D12Resource* scratch, UINT n, const UINT* v) {
+    SplitTransition(cl, scratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER hdr[3];
+    for (UINT i = 0; i < n; ++i) {
+        hdr[i].Dest = scratch->GetGPUVirtualAddress() + 4 * i;
+        hdr[i].Value = v[i];
+    }
+    cl->WriteBufferImmediate(n, hdr, nullptr);
+    SplitTransition(cl, scratch, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+}
+
+}  // namespace
+
+// The scratch buffer for a split dispatch of x*y*z groups, used by `owner`,
+// and `app` extended with it; null (logged and counted) when the split
+// cannot run.
+static ID3D12Resource* SplitScratch(ID3D12Device* dev, Dxr11RayQueryPso::SplitParts& sp,
+                                    const Dxr11Bindings& app, UINT x, UINT y, UINT z, const void* owner,
+                                    Dxr11Bindings* ext) {
+    const UINT64 bytes = 16 + (UINT64)x * y * z * ((UINT64)sp.NT * sp.K + sp.G) * 4;
     ID3D12Resource* scratch = nullptr;
     const char* refuse = nullptr;
     if (bytes > 0xFFFFFFF0ull)
         refuse = "its scratch buffer would pass 4 GB, past what a 32-bit offset reaches";
-    else if (sp->param >= Dxr11Bindings::kMaxRootParams)
+    else if (sp.param >= Dxr11Bindings::kMaxRootParams)
         refuse = "its root signature has too many parameters";
-    else if (!(scratch = sp->Scratch(RealDevice(), bytes, this)))
+    else if (!(scratch = sp.Scratch(dev, bytes, owner)))
         refuse = "its scratch buffer could not be created";
     if (refuse) {
         dstats::Add(dstats::kRefusedSplit);
@@ -370,72 +417,64 @@ void Dxr11CommandList::DispatchSplit(UINT x, UINT y, UINT z) {
         if (InterlockedCompareExchange(&once, 1, 0) == 0)
             ProxyLog("[dxr-tier-11-proxy-log] split RayQuery dispatch REFUSED: %s. Nothing is drawn "
                      "for it.\n", refuse);
-        return;
+        return nullptr;
     }
-    auto transition = [&](D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
-        D3D12_RESOURCE_BARRIER br{};
-        br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        br.Transition.pResource = scratch;
-        br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        br.Transition.StateBefore = from;
-        br.Transition.StateAfter = to;
-        m_real->ResourceBarrier(1, &br);
-    };
-    auto uavBarrier = [&] {
-        // Every UAV: the parts pass values through the scratch buffer, and
-        // a thread reads in B what it wrote to the application's in A.
-        D3D12_RESOURCE_BARRIER br{};
-        br.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        m_real->ResourceBarrier(1, &br);
-    };
-    transition(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER hdr[3];
-    // DXR_TIER11_SPLITPOISON, for the suite's sensitivity check: 1 tells
-    // part B one group fewer a row (it reads other threads' values, every
-    // slot still in the buffer), 2 skips part A.
-    static const int poison = [] {
-        char v[8] = {};
-        return GetEnvironmentVariableA("DXR_TIER11_SPLITPOISON", v, sizeof(v)) ? std::atoi(v) : 0;
-    }();
-    const UINT counts[3] = { x, y, z };
-    for (int i = 0; i < 3; ++i) {
-        hdr[i].Dest = scratch->GetGPUVirtualAddress() + 4 * i;
-        hdr[i].Value = counts[i];
-    }
-    m_real->WriteBufferImmediate(3, hdr, nullptr);
-    transition(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    *ext = app;
+    ext->rootSig = sp.rs;
+    Dxr11RootParam u;
+    u.kind = Dxr11RootParam::UAV;
+    u.address = scratch->GetGPUVirtualAddress();
+    ext->roots[sp.param] = u;
+    return scratch;
+}
 
+// Before the query part: the group counts into the header, the extended
+// bindings, part A.
+static void SplitBefore(ID3D12GraphicsCommandList4* cl, Dxr11RayQueryPso::SplitParts& sp,
+                        ID3D12Resource* scratch, const Dxr11Bindings& ext, UINT x, UINT y, UINT z) {
+    const UINT counts[3] = { x, y, z };
+    SplitHeader(cl, scratch, 3, counts);
+    ext.Replay(cl);
+    cl->SetPipelineState(sp.a);
+    if (SplitPoison() != 2) cl->Dispatch(x, y, z);
+    SplitUavBarrier(cl);
+}
+
+// After it: part B, on the extended bindings again.
+static void SplitAfter(ID3D12GraphicsCommandList4* cl, Dxr11RayQueryPso::SplitParts& sp,
+                       ID3D12Resource* scratch, const Dxr11Bindings& ext, UINT x, UINT y, UINT z,
+                       const void* owner) {
+    SplitUavBarrier(cl);
+    if (SplitPoison() == 1 && x > 1) {
+        const UINT fewer = x - 1;
+        SplitHeader(cl, scratch, 1, &fewer);
+    }
+    ext.Replay(cl);
+    cl->SetPipelineState(sp.b);
+    cl->Dispatch(x, y, z);
+    SplitUavBarrier(cl);
+    gpuhold::Use(scratch, owner);
+    dstats::Add(dstats::kSplit);
+}
+
+void Dxr11CommandList::DispatchSplit(UINT x, UINT y, UINT z) {
+    const std::shared_ptr<Dxr11RayQueryPso::SplitParts> sp = m_rqPso->Split();
+    if (!x || !y || !z) return;
+    Dxr11Bindings ext;
+    ID3D12Resource* scratch = SplitScratch(RealDevice(), *sp, m_bindings, x, y, z, this, &ext);
+    if (!scratch) return;
     // The extended bindings stand in for the application's while the parts
     // record, so anything that replays the compute bindings (a capture's
     // restore, the segment after a deferred query, the deferred query
     // itself at submit) replays these.
     const Dxr11Bindings app = m_bindings;
-    m_bindings.rootSig = sp->rs;
-    Dxr11RootParam u;
-    u.kind = Dxr11RootParam::UAV;
-    u.address = scratch->GetGPUVirtualAddress();
-    m_bindings.roots[sp->param] = u;
-    m_bindings.Replay(m_real);
-    m_real->SetPipelineState(sp->a);
-    if (poison != 2) m_real->Dispatch(x, y, z);
-    uavBarrier();
+    m_bindings = ext;
+    SplitBefore(m_real, *sp, scratch, ext, x, y, z);
     DispatchLowered(x, y, z);
     WorkBarrier();   // a query deferred to submit: B in the segment after it
-    uavBarrier();
-    if (poison == 1 && x > 1) {
-        transition(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-        hdr[0].Value = x - 1;
-        m_real->WriteBufferImmediate(1, hdr, nullptr);
-        transition(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    }
-    m_bindings.Replay(m_real);
-    m_real->SetPipelineState(sp->b);
-    m_real->Dispatch(x, y, z);
-    uavBarrier();
-    gpuhold::Use(scratch, this);
+    SplitAfter(m_real, *sp, scratch, ext, x, y, z, this);
     m_bindings = app;
     RestoreComputeAfterCapture();
-    dstats::Add(dstats::kSplit);
 }
 
 void Dxr11CommandList::DispatchLowered(UINT x, UINT y, UINT z) {
@@ -714,10 +753,7 @@ void STDMETHODCALLTYPE Dxr11CommandList::ExecuteIndirect(ID3D12CommandSignature*
         UINT stride = 0;
         const groupcount::Shape shape = groupcount::SignatureShape(sig, &stride);
         const char* refuse = nullptr;
-        if (m_rqPso->Split())
-            refuse = "it is split at its query (groupshared memory, barriers or wave ops), and an "
-                     "indirect split is not built yet";
-        else if (shape != groupcount::Shape::kDispatch)
+        if (shape != groupcount::Shape::kDispatch)
             refuse = shape == groupcount::Shape::kUnsupported
                 ? "its signature has other arguments or a root signature besides the DISPATCH"
                 : "its signature is not a DISPATCH signature this shim saw created";
@@ -1669,6 +1705,10 @@ bool Dxr11CommandList::QueueIndirectCompute(ID3D12CommandSignature* sig,
     if (m_rqPso) pend.rqExact = RayQueryScenes(m_rqPso, &pend.rqScenes);
     if (pend.rqExact) ScenesSel(m_rqPso->Scenes(), m_bindings, &pend.rqSel);
     for (auto a : pend.rqScenes) pend.rqBuilds.push_back(astrack::LatestBuild(a));
+    // Split at its query (0.84.0): A, Q and B all issued at submit, once the
+    // group counts are read back, since the scratch buffer's size and header
+    // need them.
+    pend.rqSplit = m_rqPso && m_rqPso->Split();
     pend.bindings = m_bindings;
     pend.bindings.Retain();
     m_openPendings.push_back(pend);
@@ -1947,11 +1987,24 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
                 continue;
             }
 
-            pend.bindings.Replay(slot->list.Get());
+            // An indirect dispatch of a split pipeline (0.84.0): A before the
+            // query part and B after it, all on this list, the query part on
+            // the extended bindings.
+            const std::shared_ptr<Dxr11RayQueryPso::SplitParts> sp =
+                pend.rq && pend.rqSplit ? pend.rq->Split() : nullptr;
+            Dxr11Bindings ext;
+            ID3D12Resource* scratch = sp ? SplitScratch(dev, *sp, pend.bindings, groups[0], groups[1],
+                                                        groups[2], slot->list.Get(), &ext)
+                                         : nullptr;
+            const Dxr11Bindings& pq = sp ? ext : pend.bindings;
+            if (sp && scratch) SplitBefore(slot->list.Get(), *sp, scratch, ext, groups[0], groups[1], groups[2]);
+            else pend.bindings.Replay(slot->list.Get());
             if (pend.rq && !pend.rqDirect) dstats::Add(dstats::kIndirect);
-            if (pend.rq && rqOwn) {
+            if (sp && !scratch) {
+                // Refused, logged: nothing is drawn for it.
+            } else if (pend.rq && rqOwn) {
                 ID3D12GraphicsCommandList4* sl = slot->list.Get();
-                const Dxr11Bindings& pb = pend.bindings;
+                const Dxr11Bindings& pb = pq;
                 std::vector<std::pair<D3D12_GPU_VIRTUAL_ADDRESS, UINT64>> builds;
                 for (size_t k = 0; k < pend.rqScenes.size() && k < pend.rqBuilds.size(); ++k)
                     builds.push_back({ pend.rqScenes[k], pend.rqBuilds[k] });
@@ -1982,6 +2035,8 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
             } else {
                 slot->list->DispatchRays(&desc);
             }
+            if (sp && scratch)
+                SplitAfter(slot->list.Get(), *sp, scratch, ext, groups[0], groups[1], groups[2], slot->list.Get());
             if (FAILED(slot->list->Close())) {
                 gpuhold::Detach(slot->list.Get());   // never submitted
                 continue;
