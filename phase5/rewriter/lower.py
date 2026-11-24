@@ -215,7 +215,7 @@ def _resource_table(text, md):
         ids = [int(x.strip()[1:]) for x in md[int(g[1:])].split(',')]
         recs = []
         for nid in ids:
-            fields = [f.strip() for f in md[nid].split(',')]
+            fields = split_args(md[nid])
             t = re.match(r'(\[[^\]]+\]|%[\w.$-]+|%"[^"]+")\*\s+\S+', fields[1])
             if not t:
                 raise LowerError('resource record !%d has an unexpected shape' % nid)
@@ -487,7 +487,7 @@ def _binding_map(text, md):
             continue
         for tok in md[int(g[1:])].split(','):
             nid = int(tok.strip()[1:])
-            f = [x.strip() for x in md[nid].split(',')]
+            f = split_args(md[nid])
             sp = re.match(r'i32\s+(-?\d+)', f[3])
             lo = re.match(r'i32\s+(-?\d+)', f[4])
             if sp and lo:
@@ -502,11 +502,12 @@ def _existing_globals(md, table):
     out = {}
     for recs in table.values():
         for nid, _gty, _elem, _count, _name in recs:
-            fields = [f.strip() for f in md[nid].split(',')]
+            fields = split_args(md[nid])
             # At 6.6 the record bitcasts the handle global, as DXC's do:
             # `%T* bitcast (%dx.types.Handle* @g to %T*)`.
             m = re.search(r'\*\s+(@"[^"]+"|@[\w.$-]+)$', fields[1]) if len(fields) > 1 else None
-            m = m or (re.search(r'bitcast \(\S+\* (@"[^"]+"|@[\w.$-]+) to \S+\)$', fields[1])
+            m = m or (re.search(r'bitcast \((?:%"[^"]+"|\S+)\* (@"[^"]+"|@[\w.$-]+) to (?:%"[^"]+"\*|\S+)\)$',
+                                fields[1])
                       if len(fields) > 1 else None)
             if m:
                 out[nid] = m.group(1)
@@ -3131,7 +3132,7 @@ def Block_successors(line):
 def _rewrite_metadata(text, md, table, globals_, q, exports, binding=False):
     """Point the resource records at the globals and rebuild the entry points."""
     for (cls, nid), (sym, gty, elem, name) in globals_.items():
-        fields = [f.strip() for f in md[nid].split(',')]
+        fields = split_args(md[nid])
         if fields[1].endswith('@' + sym) or ('@%s to ' % sym) in fields[1]:
             continue   # a library's own global, already named (0.80.0)
         if binding:
@@ -3141,7 +3142,8 @@ def _rewrite_metadata(text, md, table, globals_, q, exports, binding=False):
             fields[1] = ('%s* bitcast (%s* @%s to %s*)'
                          % (gty, _binding_gty(gty, elem), sym, gty))
         else:
-            fields[1] = re.sub(r'\*\s+\S+$', '* @%s' % sym, fields[1])
+            # A function, not a template: a quoted name's `\01` is not a group.
+            fields[1] = re.sub(r'\*\s+\S+$', lambda _m: '* @%s' % sym, fields[1])
         fields[2] = '!"%s"' % name
         text = re.sub(r'^!%d = !\{.*\}\s*$' % nid,
                       '!%d = !{%s}' % (nid, ', '.join(fields)), text, flags=re.M)

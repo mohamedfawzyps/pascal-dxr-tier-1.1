@@ -1171,7 +1171,7 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 // _existing_globals in lower.py.
                 {
                     static const std::regex kExisting(R"RX(\*\s+(@"[^"]+"|@[\w.$-]+)$)RX");
-                    static const std::regex kCast(R"RX(bitcast \(\S+\* (@"[^"]+"|@[\w.$-]+) to \S+\)$)RX");
+                    static const std::regex kCast(R"RX(bitcast \((?:%"[^"]+"|\S+)\* (@"[^"]+"|@[\w.$-]+) to (?:%"[^"]+"\*|\S+)\)$)RX");
                     const auto fs = SplitTop(md.at(rec.nid));
                     std::smatch em;
                     if (fs.size() > 1 && (std::regex_search(fs[1], em, kExisting) ||

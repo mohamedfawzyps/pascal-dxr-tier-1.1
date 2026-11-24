@@ -165,6 +165,17 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.81.0: PLAN STEP 4 b DONE, RAYQUERY IN AN APPLICATION'S RAYGEN IS
+DRAWN.** `proxy/rg_query`: the raygen lowered into the application's
+pipeline, its lowered TraceRay alone pointed at the shim's scene copy, the
+miss index a run-time constant appended to the raygen's local root
+signature; at DispatchRays the three tables copied on the GPU, the
+application's records then the shim's miss and block. `gitest --rgquery`
+matches in every binding and dispatch shape one scene allows; two poisons
+diverge. Fixed on the way: a record type holding a comma broke both
+rewriters on 6.6 libraries. Escher 845 of 845 byte-identical. NEXT: plan
+step 4 c (closest-hit and miss, collections).
+
 **0.80.0: PLAN STEP 4 BEGUN, THE REWRITER HALF OF RAYQUERY IN AN
 APPLICATION'S RAYGEN.** The raygen is presented to the compute lowering as a
 compute shader (`rghost.py`, `rg_host.cpp`) and comes back a library of its

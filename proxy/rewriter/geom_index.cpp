@@ -352,7 +352,7 @@ bool RetraceToShimScene(const std::string& in,
                         const std::vector<std::pair<unsigned, unsigned>>& pairs, unsigned copies,
                         const std::vector<unsigned>& slotOf, unsigned slots,
                         const std::vector<unsigned>& capsIn,
-                        std::string* out, int* calls, std::string* why) {
+                        std::string* out, int* calls, std::string* why, const std::string& only) {
     static const std::regex kTrace(
         R"RX(^(\s*)call void @dx\.op\.traceRay\.([^(]+)\(i32 157, %dx\.types\.Handle (%[\w.]+), i32 ([^,]+), i32 ([^,]+), i32 ([^,]+), i32 ([^,]+), (.*)$)RX");
     static const std::regex kNum(R"RX(^-?\d+$)RX");
@@ -532,7 +532,10 @@ bool RetraceToShimScene(const std::string& in,
                 }
             }
         }
-        if (!std::regex_match(l, m, kTrace)) { cur.push_back(l); continue; }
+        if (!std::regex_match(l, m, kTrace) || (!only.empty() && m[2].str() != only)) {
+            cur.push_back(l);
+            continue;
+        }
         if (!slotOf.empty() && (size_t)n >= slotOf.size()) {
             *why = "more TraceRay calls than scene slots given";
             return false;

@@ -51,6 +51,7 @@
 #include "trace_args.h"
 
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -381,5 +382,32 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
                    const SceneSel& sel, const void* owner,
                    const std::vector<ID3D12DescriptorHeap*>& heaps,
                    std::vector<ID3D12DescriptorHeap*>* bind, std::string* why);
+
+// RayQuery in an APPLICATION's raygen (0.81.0, proxy/rg_query.h) uses these.
+// A library's functions from its RDAT: (name, DXIL shader kind; 7 a raygen).
+bool LibraryFunctions(const void* container, size_t size,
+                      std::vector<std::pair<std::string, uint32_t>>* fns);
+// Whether a library declares subobjects of its own.
+bool LibraryHasSubobjects(const void* container, size_t size);
+// A buffer from the shim's pool, held for `owner` (gpu_hold).
+Microsoft::WRL::ComPtr<ID3D12Resource> AcquireBuffer(ID3D12Device* dev, D3D12_HEAP_TYPE type,
+                                                     UINT64 size, const void* owner);
+// Records into `cl` a copy of `records` records at `src` (any memory the GPU
+// can read, at stride `srcStride`) to `dst` at stride `dstStride`, zero
+// padded: the table copy pass with no geometry index. Replaces the compute
+// root signature and pipeline; the CALLER restores them, and puts `dst` in
+// UNORDERED_ACCESS first.
+bool CopyRecords(ID3D12GraphicsCommandList4* cl, ID3D12Device* dev, D3D12_GPU_VIRTUAL_ADDRESS src,
+                 UINT records, UINT srcStride, D3D12_GPU_VIRTUAL_ADDRESS dst, UINT dstStride,
+                 std::string* why);
+// The description `in` with each unit's local root signature extended by
+// `srvs` root SRVs at t0 up, then `constants` 32-bit constants at b0, all in
+// rq::kGeomIndexSpace, and the libraries at the indices in `code` replaced:
+// what Transform does for GeometryIndex(), without a collection. offsets[u]
+// is where unit u's additions start in its records.
+bool ExtendUnits(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, UINT srvs, UINT constants,
+                 const std::vector<std::vector<std::wstring>>& units,
+                 const std::map<UINT, const std::vector<uint8_t>*>& code,
+                 Transformed* out, std::vector<UINT>* offsets, std::string* why);
 
 }  // namespace gidx

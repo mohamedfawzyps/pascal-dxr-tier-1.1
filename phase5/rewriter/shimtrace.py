@@ -117,8 +117,11 @@ def _key_of(defs, h):
     return None
 
 
-def retrace(text, pairs, copies=0, slot_of=None, slots=1, caps=None):
-    """Returns (text, calls). With `copies` 0, `pairs` is the pipeline's list
+def retrace(text, pairs, copies=0, slot_of=None, slots=1, caps=None, only=None):
+    """Returns (text, calls). `only`, when given, is the one payload overload
+    whose calls are rewritten (`struct.Payload`, the lowering's): an
+    application raygen's own TraceRay beside its lowered query is left as it
+    is and not counted (0.81.0). With `copies` 0, `pairs` is the pipeline's list
     of (R, M), low 4 bits each, and a call's r is the index of its pair. With
     `copies` N >= 1 (arguments computed at run time, or more than 15 pairs)
     each call reads its pair from the shim's table at tN, indexed by
@@ -278,7 +281,7 @@ def retrace(text, pairs, copies=0, slot_of=None, slots=1, caps=None):
                     for a2, b2 in sorted(renamed.items()):
                         out[i] = out[i].replace(', %%%s ]' % a2, ', %%%s ]' % b2)
         m = _TRACE.match(line)
-        if not m:
+        if not m or (only and m.group(2) != only):
             out.append(line)
             continue
         if slot_of and n >= len(slot_of):

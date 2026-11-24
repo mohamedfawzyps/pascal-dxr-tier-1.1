@@ -174,13 +174,15 @@ code (`rq_analyze.cpp`, `rq_lower.cpp`) on 2026-09-26, not from memory:
   TraceRay miss index works on WARP and the 1070. The raygen is presented to
   the compute lowering as a compute shader, and the application's library
   stripped of it.
-- b. The proxy half, NEXT 0.81.0: the state object (the two libraries, the
-  shim's hit groups and miss, the raygen's local root signature extended with
-  the scene copy and the miss index), and at DispatchRays the shim's tables:
-  the application's records unchanged, then the shim's block, reached
-  through a scene copy whose contributions point at it. Render tests in
-  `gitest`.
-- c. Closest-hit and miss (recursion depth grows by 1), and collections.
+- b. The proxy half: DONE 0.81.0 (`proxy/rg_query`). The state object (the
+  two libraries, the shim's hit groups and miss, the raygen's local root
+  signature extended with the scene copy and the miss index), and at
+  DispatchRays the shim's tables, copied on the GPU: the application's
+  records unchanged, then the shim's miss and block, reached through a scene
+  copy whose contributions point at it. `gitest --rgquery`, two poisons.
+  Found doing it, fixed: a resource record type holding a comma.
+- c. NEXT: closest-hit and miss (recursion depth grows by 1), and
+  collections (Unreal's way).
 
 These can call `TraceRay`, so the lowering is the compute one, in place.
 The generated hit groups are added to the application's state object; the
@@ -240,7 +242,16 @@ Three-form matrix, dispatch suite, an Escher run. Then the limits list:
 - a query with another query inside its loop (or retraced inside it) whose
   body does something for a procedural candidate: the stepped search records
   triangles only, recording a box needing loop state in an intersection
-  shader (0.79.0).
+  shader (0.79.0);
+- a query in an application's raygen (0.81.0): whose scene is picked per ray
+  among several (a key table's capacity would have to be fixed when the
+  application creates its state object), or is in the raygen's local root
+  signature, or is not read from its latest build at the dispatch (not
+  deferred to submit); a raygen record in GPU memory in a pipeline with
+  several raygens; a miss or hit table of stride 0; a library with an export
+  list or its own subobjects, or a raygen associated by name with a
+  library's subobject; a shader config not at state object scope;
+  GeometryIndex() in the same pipeline.
 
 ## Size
 

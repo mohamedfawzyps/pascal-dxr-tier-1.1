@@ -150,6 +150,21 @@ int main(int argc, char** argv) {
                     a.query.patternNum, a.query.patternDesc.c_str());
         return 0;
     }
+    if (argc >= 6 && std::string(argv[1]) == "pointraygen") {
+        // A lowered raygen library made ready for the application's pipeline
+        // (0.81.0): <lowered.ll> <out.ll> <queries> <mult>. One scene slot.
+        std::string raw;
+        if (!ReadAll(argv[2], raw)) { std::printf("cannot read %s\n", argv[2]); return 1; }
+        std::string text, why;
+        if (!rq::PointRaygenQueries(llm::Normalize(raw), (unsigned)std::atoi(argv[4]),
+                                    (unsigned)std::atoi(argv[5]), {}, 1, {}, &text, &why)) {
+            std::fprintf(stderr, "REFUSED: %s\n", why.c_str());
+            return 2;
+        }
+        if (!WriteAll(argv[3], text)) { std::printf("cannot write %s\n", argv[3]); return 1; }
+        std::printf("pointed %s -> %s\n", argv[2], argv[3]);
+        return 0;
+    }
     if (argc >= 6 && std::string(argv[1]) == "lowerraygen") {
         // RayQuery in an application's raygen (0.80.0): <in.ll> <raygen>
         // <lowered.ll> <stripped.ll>. See rghost.py.

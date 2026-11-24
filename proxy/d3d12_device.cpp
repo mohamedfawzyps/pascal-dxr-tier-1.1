@@ -28,6 +28,7 @@
 #include "scene_bind.h"
 #include "heap_reserve.h"
 #include "pipe_flags.h"
+#include "rg_query.h"
 
 #include <windows.h>
 #include <d3d12sdklayers.h>
@@ -963,6 +964,35 @@ HRESULT Dxr11Device::CreateStateObjectReal(const D3D12_STATE_OBJECT_DESC* d0, RE
         }
         return hr;
     };
+    // RayQuery in an application's raygen (0.81.0, proxy/rg_query.h): the
+    // raygen lowered into the pipeline. What follows sees the result.
+    gidx::Transformed rt;
+    std::shared_ptr<rgq::Info> rinfo;
+    std::string rwhy;
+    const auto ro = rgq::Transform(m_real, *d, &rt, &rinfo, &rwhy);
+    if (ro == rgq::Outcome::kRefused) {
+        static LONG rn = 0;
+        if (InterlockedIncrement(&rn) <= 16)
+            ProxyLog("[dxr-tier-11-proxy-log] RayQuery in a DXR shader REFUSED: %s. The state object is "
+                     "forwarded unchanged and the driver will reject it.\n", rwhy.c_str());
+    } else if (ro == rgq::Outcome::kTransformed) {
+        d = &rt.desc;
+    }
+    auto attachRq = [&](HRESULT hr) {
+        if (ro == rgq::Outcome::kTransformed)
+            ProxyLog("[dxr-tier-11-proxy-log] %s; CreateStateObject hr=0x%08lx\n", rt.summary.c_str(),
+                     (unsigned long)hr);
+        if (ro != rgq::Outcome::kTransformed || FAILED(hr) || !pp || !*pp) return hr;
+        ID3D12StateObject* so = nullptr;
+        if (SUCCEEDED(static_cast<IUnknown*>(*pp)->QueryInterface(IID_PPV_ARGS(&so))) && so) {
+            std::string w;
+            if (!rgq::Attach(so, rinfo, &w))
+                ProxyLog("[dxr-tier-11-proxy-log] RayQuery raygen: %s; its dispatches will not be drawn\n",
+                         w.c_str());
+            so->Release();
+        }
+        return hr;
+    };
     gidx::Transformed t;
     std::string why;
     const auto o = gidx::Transform(m_real, *d, &t, &why);
@@ -972,8 +1002,8 @@ HRESULT Dxr11Device::CreateStateObjectReal(const D3D12_STATE_OBJECT_DESC* d0, RE
             ProxyLog("[dxr-tier-11-proxy-log] GeometryIndex() REFUSED: %s. The state object is "
                      "forwarded unchanged and the driver will reject it.\n", why.c_str());
     }
-    if (o != gidx::Outcome::kTransformed) return note(m_real->CreateStateObject(d, riid, pp));
-    const HRESULT hr = note(m_real->CreateStateObject(&t.desc, riid, pp));
+    if (o != gidx::Outcome::kTransformed) return attachRq(note(m_real->CreateStateObject(d, riid, pp)));
+    const HRESULT hr = attachRq(note(m_real->CreateStateObject(&t.desc, riid, pp)));
     // A collection that only records its TraceRay arguments has no summary,
     // and Unreal creates one per raygen, so it stays quiet unless it fails.
     if (!t.summary.empty() || FAILED(hr))

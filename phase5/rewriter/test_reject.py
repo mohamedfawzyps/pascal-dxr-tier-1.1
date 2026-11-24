@@ -199,10 +199,29 @@ def raygen_checks(f, path):
     low = io.open(py[0], encoding='utf-8').read()
     shaped = ('define void @RayGen(' in low and 'dxr11_rq_RayGen_' in low and
               '@dx.op.traceRay.struct.Pay(' in low and 'rayQuery_' not in low)
-    good = same and all(valid) and shaped
+    # pointraygen (0.81.0): the lowered library as the proxy hands it to the
+    # driver, the miss index read at run time and the lowered call alone
+    # pointed at the shim's scene copy.
+    pp, pc = os.path.join(d, 'p_pt.ll'), os.path.join(d, 'c_pt.ll')
+    # The lowered call's multiplier, as the lowering wrote it (1 with record data).
+    mm = re.search(r'call void @dx\.op\.traceRay\.struct\.Payload\(i32 157, [^,]+, i32 [^,]+, '
+                   r'i32 [^,]+, i32 [^,]+, i32 (\d+),', low)
+    mult = mm.group(1) if mm else '0'
+    r3 = subprocess.run([sys.executable, os.path.join('phase5', 'rewriter', 'dxrewrite.py'),
+                         'pointraygen', py[0], pp, '1', mult], capture_output=True, text=True)
+    r4 = subprocess.run([DXRW, 'pointraygen', cc[0], pc, '1', mult], capture_output=True, text=True)
+    pointed = not r3.returncode and not r4.returncode and \
+        io.open(pp, encoding='utf-8').read() == io.open(pc, encoding='utf-8').read()
+    if pointed:
+        pt = io.open(pp, encoding='utf-8').read()
+        r = subprocess.run([os.path.join('phase5out', 'dxilrt.exe'), 'asm', pp, pp + '.dxil'],
+                           capture_output=True, text=True)
+        pointed = ('validated and signed ok' in r.stdout + r.stderr and '@dxr11.tlas' in pt and
+                   '@dxr11.gi' in pt and '@dx.op.traceRay.struct.Pay(' in pt)
+    good = same and all(valid) and shaped and pointed
     print('  %s %-34s %s' % ('ok      ' if good else 'FAILED  ', name,
-                             'identical, both valid, the app\'s TraceRay kept' if good else
-                             'identical=%s valid=%s shaped=%s' % (same, valid, shaped)))
+                             'identical, both valid, the app\'s TraceRay kept, pointed' if good else
+                             'identical=%s valid=%s shaped=%s pointed=%s' % (same, valid, shaped, pointed)))
     return good
 
 
@@ -757,7 +776,8 @@ def main():
     # the compute lowering as a compute shader (rghost.py), and the library
     # without it. Both rewriters byte for byte, both outputs valid (the
     # stripped one with the module flags the validator computes).
-    for f in ('lib_rgquery', 'lib_rgquery_sm66'):
+    # 0.81.0: a quoted record type holding a comma (lib_rgquery_vec_sm66).
+    for f in ('lib_rgquery', 'lib_rgquery_sm66', 'lib_rgquery_vec_sm66'):
         path = os.path.join('phase5', 'cases', f + '.ll')
         if not os.path.isfile(path):
             continue

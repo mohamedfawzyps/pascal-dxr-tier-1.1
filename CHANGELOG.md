@@ -24,6 +24,73 @@ not.
 
 ---
 
+## 0.81.0
+
+**Plan step 4 b: RayQuery in an application's raygen is DRAWN.** The proxy
+half of 0.80.0's rewriter half (`proxy/rg_query.{h,cpp}`). Until now such a
+library was forwarded and the driver rejected the whole state object.
+
+- **CreateStateObject.** Each raygen using RayQuery is lowered (0.80.0) into
+  a library of its own and removed from the application's; a library left
+  with no shader is replaced by it. The lowered TraceRay, and only it, is
+  pointed at the shim's copy of the scene with (query k, queries), as the
+  compute path's own layout does (0.61.0): `shimtrace.retrace` and
+  `RetraceToShimScene` take the one payload overload to rewrite, so the
+  raygen's own TraceRay is left alone. Its miss index is read at run time,
+  as a GeometryIndex() read that geomidx turns into the constant at b0 in
+  the shim's register space: the mechanism the 1070 has run since 0.44.0
+  (`rghost.point_queries`, `rg_host` `PointRaygenQueries`). The raygen's
+  local root signature gets the scene copy's address and that constant
+  appended (`gidx::ExtendUnits`, `Extend` taking constants after the SRVs),
+  so its own arguments keep their offsets. The shim's hit groups and miss
+  join the pipeline with explicit local root signatures (a pair SRV, or
+  none), so no default of the application's reaches them, and with every
+  other association the raygen has by name. Payload and attribute limits are
+  raised to the lowering's, a recursion depth of 0 to 1.
+- **DispatchRays.** The three tables are copied on the GPU, by address, with
+  the table copy pass (`gidx::CopyRecords`), so the application's records
+  can be anywhere: the raygen record with the appended arguments, the
+  application's misses then the shim's (the miss index is their count), the
+  application's hit records then the shim's block, one per (instance,
+  geometry, query), which the scene copy's contributions (base = the
+  application's record count) point at. Which raygen a dispatch runs is read
+  from its record; another raygen's dispatch is forwarded untouched. An
+  indirect dispatch issued at submit takes the same path.
+- **Tests.** `gitest --rgquery`: the raygen runs a query beside its own
+  TraceRay (geometry 2 rejected, the answer encoding the committed geometry,
+  instance, contribution and primitive), the hit shaders no GeometryIndex().
+  All 7 layouts match WARP at 6.5 and 6.6, with the scene as a root SRV, in a
+  table, through the heap (index in a root CBV or root constants), with two
+  misses, indirect from upload and GPU memory, the tables in GPU memory,
+  GPU-written instances and two scenes. `DXR_TIER11_RGQ_POISON=1` (the miss
+  index at the application's miss) diverges in exactly the query's misses,
+  4096 pixels a structure; `=2` (every record the first instance's
+  contribution) wherever instances differ. The refusals below are shown
+  logged by the suite.
+- **Found doing it, fixed: a resource record whose type name holds a comma.**
+  `%"class.RWStructuredBuffer<vector<unsigned int, 4> >"`: the Python split
+  records on every comma and refused it; the C++ split right, but neither
+  side's pattern for a 6.6 library record (a bitcast of the global) took a
+  quoted type, so the C++ took the library's own global for a missing one
+  and declared a 6.5 handle function nothing called, which the validator
+  rejects. Both now split as the C++ model does and match quoted types;
+  `lib_rgquery_vec_sm66.hlsl` is the case (0.80.0's C++ emits an invalid
+  library for it, its Python refuses it). And a quoted global name's `\01`
+  no longer reaches a regular expression replacement in the Python.
+- **Refused by name, on the limits list:** a query whose scene is picked per
+  ray among several scenes (the key table would need a capacity fixed when
+  the application creates its state object); its scene in the raygen's local
+  root signature; a scene not read from its latest build at the dispatch (not
+  deferred to submit yet); a raygen record in GPU memory in a pipeline with
+  several raygens; a miss or hit table of stride 0; a library with an export
+  list or subobjects of its own, or a raygen associated by name with a
+  library's subobject; a shader config not at state object scope;
+  GeometryIndex() in the same pipeline. RayQuery in a collection, in a
+  pipeline linking one, or in a closest-hit or miss: plan step 4 c.
+- Rewriter checks 104 of 104; dispatch suite 158 of 158 plus the raygen
+  runs. Escher: all 845 dumped Unreal shader inputs lower byte-identically
+  to 0.80.0; none is a raygen with RayQuery.
+
 ## 0.80.0
 
 **Plan step 4, first part: RayQuery in an application's raygen, the

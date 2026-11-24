@@ -52,6 +52,16 @@ for %%f in ("%~dp0phase5\cases\*sm66.hlsl") do (
     if exist "%~dp0phase5\cases\%%~nf.ll" (echo   ok  case %%~nf ^(cs_6_6^)) else (echo   -   case %%~nf is not a cs_6_6 shader, skipped)
 )
 
+rem DXR libraries with RayQuery in their raygen (0.80.0, 0.81.0): lib_6_5, and
+rem lib_6_6 for the *sm66 ones, after the passes above.
+for %%f in ("%~dp0phase5\cases\lib_*.hlsl") do (
+    "%DXC%" -T lib_6_5 -Fc "%~dp0phase5\cases\%%~nf.ll" -Fo "%~dp0phase5\cases\%%~nf.dxil" "%%f" >nul 2>&1
+)
+for %%f in ("%~dp0phase5\cases\lib_*sm66.hlsl") do (
+    "%DXC%" -T lib_6_6 -Fc "%~dp0phase5\cases\%%~nf.ll" -Fo "%~dp0phase5\cases\%%~nf.dxil" "%%f" >nul 2>&1
+    if exist "%~dp0phase5\cases\%%~nf.ll" (echo   ok  case %%~nf ^(lib_6_6^))
+)
+
 echo.
 echo Disassembly in phase5\dxil\*.ll, containers in phase5\dxil\*.dxil
 echo Findings in docs\phase5-dxil-recon.md

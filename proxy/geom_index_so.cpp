@@ -762,7 +762,8 @@ UINT ArgsEnd(const D3D12_ROOT_SIGNATURE_DESC1& d) {
 // in the record, identifier included. *tooBig, when given, is set when it is
 // refused for its size alone.
 bool Extend(ID3D12Device* dev, ID3D12RootSignature* rs, UINT srvs, UINT table,
-            ComPtr<ID3D12RootSignature>* out, UINT* offset, bool* tooBig, std::string* why) {
+            ComPtr<ID3D12RootSignature>* out, UINT* offset, bool* tooBig, std::string* why,
+            UINT constants = 0) {
     // Either the geometry index, a constant at b0, or `srvs` SRVs at t0 up:
     // the shim scene's copies, and with arguments computed at run time its
     // pair table (0.57.0), and the key table (0.60.0). All in
@@ -791,6 +792,17 @@ bool Extend(ID3D12Device* dev, ID3D12RootSignature* rs, UINT srvs, UINT table,
             extra.Constants.Num32BitValues = 1;
         }
         extra.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    }
+    // After the SRVs, `constants` 32-bit constants at b0: an application
+    // raygen's lowered query reads its miss index there (0.81.0).
+    if (srvs && constants) {
+        D3D12_ROOT_PARAMETER1 c{};
+        c.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        c.Constants.ShaderRegister = 0;
+        c.Constants.RegisterSpace = rq::kGeomIndexSpace;
+        c.Constants.Num32BitValues = constants;
+        c.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        extras.push_back(c);
     }
 
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC v{};
@@ -1082,7 +1094,7 @@ bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, UINT srvs, UI
              const std::map<UINT, const std::vector<uint8_t>*>& code,
              const std::map<UINT, ID3D12StateObject*>& colls,
              Transformed* out, std::vector<UINT>* offsets, UINT* signatures, bool* tooBig,
-             std::string* why) {
+             std::string* why, UINT constants = 0) {
     const UINT n = in.NumSubobjects;
     const D3D12_STATE_SUBOBJECT* s = in.pSubobjects;
     std::set<std::wstring> affected;
@@ -1123,7 +1135,7 @@ bool Rebuild(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, UINT srvs, UI
             }
             ComPtr<ID3D12RootSignature> rs;
             UINT offset = 0;
-            if (!Extend(dev, orig, srvs, table, &rs, &offset, tooBig, why)) return false;
+            if (!Extend(dev, orig, srvs, table, &rs, &offset, tooBig, why, constants)) return false;
             extended[idx] = { rs, offset };
         }
         offsets->push_back(extended[idx].second);
@@ -2163,7 +2175,70 @@ ComPtr<ID3D12Resource> Acquire(ID3D12Device* dev, D3D12_HEAP_TYPE type, UINT64 s
     return r;
 }
 
+// The table copy pass, ready on `dev`. Caller holds g_lock.
+bool EnsurePipe(ID3D12Device* dev, std::string* why) {
+    if (g_pipe.device == dev && g_pipe.pso) return true;
+    Pipe p;
+    p.device = dev;
+    if (FAILED(dev->CreateRootSignature(0, g_geomTableCS, sizeof(g_geomTableCS), IID_PPV_ARGS(&p.rs)))) {
+        *why = "could not create the table copy root signature";
+        return false;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = p.rs.Get();
+    pd.CS.pShaderBytecode = g_geomTableCS;
+    pd.CS.BytecodeLength = sizeof(g_geomTableCS);
+    if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&p.pso)))) {
+        *why = "could not create the table copy pipeline";
+        return false;
+    }
+    g_pipe = p;
+    return true;
+}
+
 }  // namespace
+
+bool LibraryFunctions(const void* container, size_t size,
+                      std::vector<std::pair<std::string, uint32_t>>* fns) {
+    return Functions(container, size, fns);
+}
+
+bool LibraryHasSubobjects(const void* container, size_t size) {
+    LibSubobjects so;
+    return LibrarySubobjects(container, size, &so) && !so.all.empty();
+}
+
+ComPtr<ID3D12Resource> AcquireBuffer(ID3D12Device* dev, D3D12_HEAP_TYPE type, UINT64 size,
+                                     const void* owner) {
+    std::lock_guard<std::mutex> g(g_lock);
+    return Acquire(dev, type, size, owner);
+}
+
+bool CopyRecords(ID3D12GraphicsCommandList4* cl, ID3D12Device* dev, D3D12_GPU_VIRTUAL_ADDRESS src,
+                 UINT records, UINT srcStride, D3D12_GPU_VIRTUAL_ADDRESS dst, UINT dstStride,
+                 std::string* why) {
+    if (!records) return true;
+    std::lock_guard<std::mutex> g(g_lock);
+    if (!EnsurePipe(dev, why)) return false;
+    cl->SetComputeRootSignature(g_pipe.rs.Get());
+    cl->SetPipelineState(g_pipe.pso.Get());
+    const UINT c[4] = { records, srcStride, dstStride, 0 };
+    cl->SetComputeRoot32BitConstants(0, 4, c, 0);
+    cl->SetComputeRootShaderResourceView(1, src);
+    cl->SetComputeRootShaderResourceView(2, src);   // no groups: never read
+    cl->SetComputeRootUnorderedAccessView(3, dst);
+    cl->Dispatch((records + 63) / 64, 1, 1);
+    return true;
+}
+
+bool ExtendUnits(ID3D12Device* dev, const D3D12_STATE_OBJECT_DESC& in, UINT srvs, UINT constants,
+                 const std::vector<std::vector<std::wstring>>& units,
+                 const std::map<UINT, const std::vector<uint8_t>*>& code,
+                 Transformed* out, std::vector<UINT>* offsets, std::string* why) {
+    UINT signatures = 0;
+    bool tooBig = false;
+    return Rebuild(dev, in, srvs, 0, units, code, {}, out, offsets, &signatures, &tooBig, why, constants);
+}
 
 bool RecordTable(ID3D12GraphicsCommandList4* cl, ID3D12Device* dev, const Info& info,
                  const std::vector<std::pair<UINT, UINT>>& pairs,

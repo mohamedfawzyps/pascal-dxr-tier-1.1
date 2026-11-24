@@ -242,3 +242,50 @@ def fix_flags(text, said):
             lines[n] = fm.group(1) + m.group(2) + fm.group(2)
             return '\n'.join(lines)
     return None
+
+
+# The lowering's own TraceRay, by its payload overload (0.81.0).
+SHIM_PAYLOAD = 'struct.Payload'
+_SHIM_TRACE = re.compile(r'^(\s*)call void @dx\.op\.traceRay\.struct\.Payload\(i32 157, '
+                         r'(%dx\.types\.Handle [^,]+, i32 [^,]+, i32 [^,]+, i32 [^,]+, '
+                         r'i32 [^,]+), i32 ([^,]+), (.*)$')
+
+
+def shim_miss(text):
+    """The lowered query's TraceRay takes its miss index at run time (0.81.0):
+    its miss is the shim's, after the application's misses, whose count only
+    a dispatch knows (probed in 0.80.0, gitest --dynmiss). The index becomes
+    a GeometryIndex() read, which geomidx.lower then turns into the constant
+    at b0, space GI_SPACE, that the shim appends to the raygen's local root
+    signature: the mechanism the GTX 1070 has run since 0.44.0."""
+    out, n = [], 0
+    for l in text.split('\n'):
+        m = _SHIM_TRACE.match(l)
+        if m:
+            v = '%%rgq.ms%d' % n
+            out.append('%s%s = call i32 @dx.op.geometryIndex.i32(i32 213)' % (m.group(1), v))
+            l = ('%scall void @dx.op.traceRay.struct.Payload(i32 157, %s, i32 %s, %s'
+                 % (m.group(1), m.group(2), v, m.group(4)))
+            n += 1
+        out.append(l)
+    return '\n'.join(out)
+
+
+def point_queries(text, queries, mult, slot_of=None, slots=1, caps=None):
+    """The lowered raygen library made ready for the application's pipeline
+    (0.81.0): the miss index read at run time, and the lowered TraceRay calls
+    pointed at the shim's copy of the scene with (query k, queries), as the
+    compute path's own layout does (0.61.0). The application's own TraceRay
+    is left alone."""
+    import geomidx
+    import shimtrace
+    try:
+        text, _ = geomidx.lower(shim_miss(text))
+        pairs = [(k, mult) for k in range(queries)]
+        text, n = shimtrace.retrace(text, pairs, 0, slot_of, slots, caps, only=SHIM_PAYLOAD)
+    except geomidx.Unsupported as e:
+        raise Unsupported(str(e))
+    if not n:
+        raise Unsupported("the lowered raygen has no TraceRay of its own to point at the "
+                          "shim's scene")
+    return text

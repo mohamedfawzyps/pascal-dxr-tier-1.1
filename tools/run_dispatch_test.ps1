@@ -750,6 +750,43 @@ foreach ($l in @('--localscene', '--localscenetable')) {
     if ($gi -match 'ALL MATCH') { Write-Host "  gitest $l --biglrs (191 dwords of the application's): all layouts match" }
     else { Write-Host "  gitest $l --biglrs: NOT ALL MATCH"; $failed++ }
 }
+
+# RayQuery in an APPLICATION's raygen (0.81.0, plan step 4 b): gitest's
+# raygen runs an inline query beside its own TraceRay, through the shim's
+# tables (the application's records, then the shim's block). Every layout,
+# both shader models, the scene bound every way one scene can be, the
+# argument and table placements. Poisons: 1 the miss index at the
+# application's miss, 2 every record of the shim's block the first
+# instance's contribution; both must DIVERGE. A scene picked per ray among
+# several is refused by name and drawn nowhere, which the log must say.
+Write-Host ''
+Write-Host '=== RayQuery in an application raygen (gitest --rgquery) ==='
+foreach ($a in @(@(), @('--sm66'), @('--table'), @('--bindless'), @('--bindlessrc'), @('--dynmiss'),
+                 @('--indirect'), @('--indirectgpu'), @('--gpusbt'), @('--gpuinst'), @('--twoscenes'),
+                 @('--sm66', '--dynmiss'), @('--sm66', '--indirectgpu'), @('--sm66', '--gpusbt'))) {
+    $gi = & .\gitest.exe --rgquery @a 2>&1
+    if ($gi -match 'ALL MATCH') { Write-Host "  gitest --rgquery $($a -join ' '): all layouts match" }
+    else { Write-Host "  gitest --rgquery $($a -join ' '): NOT ALL MATCH"; $failed++ }
+}
+foreach ($p in @('1', '2')) {
+    $env:DXR_TIER11_RGQ_POISON = $p
+    $gi = & .\gitest.exe --rgquery mult 2>&1
+    Remove-Item env:DXR_TIER11_RGQ_POISON
+    if ($gi -match 'DIVERGE') { Write-Host "  gitest --rgquery, DXR_TIER11_RGQ_POISON=${p}: diverges" }
+    else { Write-Host "  POISON NOT SEEN: gitest --rgquery, DXR_TIER11_RGQ_POISON=$p"; $failed++ }
+}
+$rlog = Join-Path $PWD 'rgq_refuse.log'
+Remove-Item $rlog -ErrorAction SilentlyContinue
+$env:DXR_TIER11_LOG = $rlog
+& .\gitest.exe --rgquery --scenearray mult 2>&1 | Out-Null
+& .\gitest.exe --rgquery --collections mult 2>&1 | Out-Null
+Remove-Item env:DXR_TIER11_LOG
+$said = Get-Content $rlog -ErrorAction SilentlyContinue
+if (($said -match 'NOT DRAWN: a query in an application.s raygen whose scene is picked per ray among several') -and
+    ($said -match 'REFUSED: RayQuery in a DXR shader of a collection')) {
+    Write-Host '  refused by name: a scene picked per ray among several, a RayQuery raygen in a collection'
+} else { Write-Host '  REFUSAL NOT LOGGED: --scenearray or --collections with --rgquery'; $failed++ }
+Remove-Item $rlog -ErrorAction SilentlyContinue
 $env:DXR_TIER11 = ''
 
 # Spec Tier 1.1 item 7: the vertex formats Tier 1.1 adds for bottom-level

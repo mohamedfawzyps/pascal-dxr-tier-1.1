@@ -332,4 +332,44 @@ bool FixFlags(const std::string& in, const std::string& said, std::string* out) 
     return false;
 }
 
+// The lowering's own TraceRay takes its miss index at run time (0.81.0):
+// a GeometryIndex() read, which LowerGeometryIndex turns into the constant at
+// b0, space kGeomIndexSpace. shim_miss in rghost.py.
+std::string ShimMiss(const std::string& in) {
+    static const std::regex kTrace(
+        R"RX(^(\s*)call void @dx\.op\.traceRay\.struct\.Payload\(i32 157, (%dx\.types\.Handle [^,]+, i32 [^,]+, i32 [^,]+, i32 [^,]+, i32 [^,]+), i32 ([^,]+), (.*)$)RX");
+    std::vector<std::string> out;
+    int n = 0;
+    std::smatch m;
+    for (const auto& l : llm::SplitLines(in)) {
+        if (std::regex_match(l, m, kTrace)) {
+            const std::string v = "%rgq.ms" + std::to_string(n++);
+            out.push_back(m[1].str() + v + " = call i32 @dx.op.geometryIndex.i32(i32 213)");
+            out.push_back(m[1].str() + "call void @dx.op.traceRay.struct.Payload(i32 157, " + m[2].str() +
+                          ", i32 " + v + ", " + m[4].str());
+            continue;
+        }
+        out.push_back(l);
+    }
+    return Join(out);
+}
+
+bool PointRaygenQueries(const std::string& in, unsigned queries, unsigned mult,
+                        const std::vector<unsigned>& slotOf, unsigned slots,
+                        const std::vector<unsigned>& caps, std::string* out, std::string* why) {
+    std::string gi;
+    std::vector<std::string> fns;
+    if (!LowerGeometryIndex(ShimMiss(in), &gi, &fns, why)) return false;
+    std::vector<std::pair<unsigned, unsigned>> pairs;
+    for (unsigned k = 0; k < queries; ++k) pairs.push_back({ k, mult });
+    int calls = 0;
+    if (!RetraceToShimScene(gi, pairs, 0, slotOf, slots, caps, out, &calls, why, "struct.Payload"))
+        return false;
+    if (!calls) {
+        *why = "the lowered raygen has no TraceRay of its own to point at the shim's scene";
+        return false;
+    }
+    return true;
+}
+
 }  // namespace rq

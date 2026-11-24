@@ -7,6 +7,7 @@
 
 #include "d3d12_command_list.h"
 #include "geom_index_so.h"
+#include "rg_query.h"
 
 #include <set>
 #include <functional>
@@ -1306,8 +1307,34 @@ bool Dxr11CommandList::GeometryIndexScenes(gidx::Info& gi,
     return false;
 }
 
+// A pipeline whose raygen uses RayQuery (0.81.0, proxy/rg_query.h): drawn
+// through the shim's tables, or not at all, logged. Shared by DispatchRays and
+// by an indirect one issued at submit, on `cl`.
+void Dxr11CommandList::DispatchRaygenQuery(ID3D12GraphicsCommandList4* cl, const rgq::Info& info,
+                                           const Dxr11Bindings& b, const D3D12_DISPATCH_RAYS_DESC& d,
+                                           const void* owner, const std::function<void()>& restore) {
+    std::string why;
+    const int k = gidx::Get(b.stateObject) ? -3 : rgq::PickRaygen(info, d, &why);
+    if (k == -1) { cl->DispatchRays(&d); return; }   // another raygen: the application's own
+    if (k == -3) why = "GeometryIndex() in the hit shaders of a pipeline with a RayQuery raygen";
+    if (k >= 0) {
+        gidx::SceneSel sel;
+        ScenesSel(info.raygens[(size_t)k].scenes, b, &sel);
+        if (rgq::Dispatch(cl, RealDevice(), info, k, d, sel, owner, restore, &why))
+            return;
+    }
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) <= 16)
+        ProxyLog("[dxr-tier-11-proxy-log] RayQuery raygen dispatch NOT DRAWN: %s\n", why.c_str());
+}
+
 void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_DESC* d) {
     WorkBarrier();
+    if (d)
+        if (std::shared_ptr<rgq::Info> rq = rgq::Get(m_bindings.stateObject)) {
+            DispatchRaygenQuery(m_real, *rq, m_bindings, *d, this, [this] { RestoreComputeAfterCapture(); });
+            return;
+        }
     std::shared_ptr<gidx::Info> gi = d ? gidx::Get(m_bindings.stateObject) : nullptr;
     if (!gi) { FWD(DispatchRays(d)); return; }
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS> srvs;
@@ -1842,6 +1869,11 @@ bool Dxr11CommandList::SubmitSegmented(ID3D12CommandQueue* queue, SubmitFn submi
                                       pend.giExact, pend.giSel, DispatchPairs(*gi, pb, desc), sl, desc,
                                       pb.heaps,
                                       [sl, &pb] { pb.Replay(sl); });
+            } else if (std::shared_ptr<rgq::Info> rgi = rgq::Get(pend.bindings.stateObject)) {
+                // An indirect dispatch of a RayQuery raygen's pipeline (0.81.0).
+                ID3D12GraphicsCommandList4* sl = slot->list.Get();
+                const Dxr11Bindings& pb = pend.bindings;
+                DispatchRaygenQuery(sl, *rgi, pb, desc, sl, [sl, &pb] { pb.Replay(sl); });
             } else {
                 slot->list->DispatchRays(&desc);
             }

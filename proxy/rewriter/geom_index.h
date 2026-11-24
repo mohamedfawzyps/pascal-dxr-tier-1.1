@@ -46,7 +46,11 @@ bool RetraceToShimScene(const std::string& in,
                         const std::vector<std::pair<unsigned, unsigned>>& pairs, unsigned copies,
                         const std::vector<unsigned>& slotOf, unsigned slots,
                         const std::vector<unsigned>& caps,
-                        std::string* out, int* calls, std::string* why);
+                        std::string* out, int* calls, std::string* why,
+                        const std::string& only = std::string());
+// `only`, when not empty: the one payload overload whose calls are rewritten
+// (struct.Payload, the lowering's); an application raygen's own TraceRay
+// beside its lowered query is left alone and not counted (0.81.0).
 
 // The name a state object uses for a library function: DXC mangles
 // `\01?CH@@YAX...` and exports it as CH.

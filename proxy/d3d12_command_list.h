@@ -18,10 +18,13 @@
 
 #include <d3d12.h>
 #include <wrl/client.h>
+#include <functional>
 #include <string>
 #include <vector>
 
 #include "geom_index_so.h"
+
+namespace rgq { struct Info; }
 
 // --- command list splitting -------------------------------------------------
 //
@@ -376,6 +379,9 @@ private:
     // The same for any scene scan: a lowered RayQuery library's, which has
     // no records of the application's to leave a slot to (0.61.0).
     void ScenesSel(const gidx::Scenes& scenes, const Dxr11Bindings& b, gidx::SceneSel* sel);
+    void DispatchRaygenQuery(ID3D12GraphicsCommandList4* cl, const rgq::Info& info,
+                             const Dxr11Bindings& b, const D3D12_DISPATCH_RAYS_DESC& d,
+                             const void* owner, const std::function<void()>& restore);
     // At submit: every range of `rec` still empty, read from CPU-visible
     // memory, or copied from GPU memory, submitted and waited for once. Only
     // with GPU-written arguments, whose ranges are not known before.
