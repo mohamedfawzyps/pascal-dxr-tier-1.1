@@ -384,6 +384,9 @@ bool RecordVariant(ID3D12GraphicsCommandList4* cl, ID3D12Device5* dev, Info& inf
                    std::vector<ID3D12DescriptorHeap*>* bind, std::string* why);
 
 // RayQuery in an APPLICATION's raygen (0.81.0, proxy/rg_query.h) uses these.
+// Every hit group of a description, the state object's and its libraries':
+// its name, then its closest-hit, any-hit and intersection imports.
+std::vector<std::vector<std::wstring>> HitGroupUnits(const D3D12_STATE_OBJECT_DESC& d);
 // A library's functions from its RDAT: (name, DXIL shader kind; 7 a raygen).
 bool LibraryFunctions(const void* container, size_t size,
                       std::vector<std::pair<std::string, uint32_t>>* fns);

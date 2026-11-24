@@ -760,7 +760,7 @@ foreach ($l in @('--localscene', '--localscenetable')) {
 # instance's contribution; both must DIVERGE. A scene picked per ray among
 # several is refused by name and drawn nowhere, which the log must say.
 Write-Host ''
-Write-Host '=== RayQuery in an application raygen (gitest --rgquery) ==='
+Write-Host '=== RayQuery in an application raygen, closest-hit and miss (gitest --rgquery, --chquery) ==='
 foreach ($a in @(@(), @('--sm66'), @('--table'), @('--bindless'), @('--bindlessrc'), @('--dynmiss'),
                  @('--indirect'), @('--indirectgpu'), @('--gpusbt'), @('--gpuinst'), @('--twoscenes'),
                  @('--sm66', '--dynmiss'), @('--sm66', '--indirectgpu'), @('--sm66', '--gpusbt'))) {
@@ -775,6 +775,24 @@ foreach ($p in @('1', '2')) {
     if ($gi -match 'DIVERGE') { Write-Host "  gitest --rgquery, DXR_TIER11_RGQ_POISON=${p}: diverges" }
     else { Write-Host "  POISON NOT SEEN: gitest --rgquery, DXR_TIER11_RGQ_POISON=$p"; $failed++ }
 }
+# RayQuery in an application's closest-hit and miss (0.82.0, plan step 4 c):
+# gitest --chquery, the closest-hit querying from beside its hit, the lower
+# half of the rays missing and the miss querying from the ray's origin; with
+# --rgquery all three hosted in one pipeline. WARP removes its device on a
+# heap-indexed scene traced from a closest-hit or miss, so the heap cases bind
+# WARP's scene globally (--warpglobal).
+foreach ($a in @(@(), @('--sm66'), @('--table'), @('--bindless', '--warpglobal'), @('--bindlessrc', '--warpglobal'),
+                 @('--dynmiss'), @('--indirect'), @('--indirectgpu'), @('--gpusbt'), @('--gpuinst'),
+                 @('--twoscenes'), @('--rgquery'), @('--rgquery', '--sm66'), @('--sm66', '--indirectgpu'))) {
+    $gi = & .\gitest.exe --chquery @a 2>&1
+    if ($gi -match 'ALL MATCH') { Write-Host "  gitest --chquery $($a -join ' '): all layouts match" }
+    else { Write-Host "  gitest --chquery $($a -join ' '): NOT ALL MATCH"; $failed++ }
+}
+$env:DXR_TIER11_RGQ_POISON = '2'
+$gi = & .\gitest.exe --chquery mult 2>&1
+Remove-Item env:DXR_TIER11_RGQ_POISON
+if ($gi -match 'DIVERGE') { Write-Host '  gitest --chquery, DXR_TIER11_RGQ_POISON=2: diverges' }
+else { Write-Host '  POISON NOT SEEN: gitest --chquery, DXR_TIER11_RGQ_POISON=2'; $failed++ }
 $rlog = Join-Path $PWD 'rgq_refuse.log'
 Remove-Item $rlog -ErrorAction SilentlyContinue
 $env:DXR_TIER11_LOG = $rlog
@@ -782,7 +800,7 @@ $env:DXR_TIER11_LOG = $rlog
 & .\gitest.exe --rgquery --collections mult 2>&1 | Out-Null
 Remove-Item env:DXR_TIER11_LOG
 $said = Get-Content $rlog -ErrorAction SilentlyContinue
-if (($said -match 'NOT DRAWN: a query in an application.s raygen whose scene is picked per ray among several') -and
+if (($said -match 'NOT DRAWN: a query in an application.s DXR shader whose scene is picked per ray among several') -and
     ($said -match 'REFUSED: RayQuery in a DXR shader of a collection')) {
     Write-Host '  refused by name: a scene picked per ray among several, a RayQuery raygen in a collection'
 } else { Write-Host '  REFUSAL NOT LOGGED: --scenearray or --collections with --rgquery'; $failed++ }

@@ -23,7 +23,7 @@ Runs on NORMALISED text.
 
 import re
 
-from dxil import Module
+from dxil import Module, split_args
 from rayquery import Unsupported
 
 RT11_SHADER_FLAG = 0x2000000
@@ -212,11 +212,12 @@ def strip_function(text, export):
     lines[ep] = '!dx.entryPoints = !{%s}' % ', '.join(rest)
     for x in mine:
         lines[md[int(x[1:])][0]] = None
-    # The function's pair in the annotation node: `void ()* @f, !n`.
+    # The function's pair in the annotation node: `void (...)* @f, !n`, its
+    # parameters' types inside the brackets for a closest-hit or miss (0.82.0).
     for n, l in enumerate(lines):
         if l is None or not re.match(r'^!\d+ = !\{i32 1, ', l):
             continue
-        lines[n] = re.sub(r', void \(\)\* ' + re.escape(ref) + r', !\d+', '', l)
+        lines[n] = re.sub(r', void \([^)]*\)\* ' + re.escape(ref) + r', !\d+', '', l)
     lines = [l for l in lines if l is not None]
     lines = _drop_unused_declarations(lines)
     lines = _drop_unused_resources(lines)
@@ -271,17 +272,22 @@ def shim_miss(text):
     return '\n'.join(out)
 
 
-def point_queries(text, queries, mult, slot_of=None, slots=1, caps=None):
+def point_queries(text, queries, mult, slot_of=None, slots=1, caps=None, base=0, total=None):
     """The lowered raygen library made ready for the application's pipeline
     (0.81.0): the miss index read at run time, and the lowered TraceRay calls
     pointed at the shim's copy of the scene with (query k, queries), as the
     compute path's own layout does (0.61.0). The application's own TraceRay
-    is left alone."""
+    is left alone. Several shaders of one pipeline share the shim's block
+    (0.82.0): this one's queries take ray contributions base .. base + queries
+    - 1 of `total`, the other places held by pairs no lowered call has."""
     import geomidx
     import shimtrace
     try:
         text, _ = geomidx.lower(shim_miss(text))
-        pairs = [(k, mult) for k in range(queries)]
+        total = total or queries
+        pairs = [(15, 2 + j) for j in range(total)]
+        for k in range(queries):
+            pairs[base + k] = (k, mult)
         text, n = shimtrace.retrace(text, pairs, 0, slot_of, slots, caps, only=SHIM_PAYLOAD)
     except geomidx.Unsupported as e:
         raise Unsupported(str(e))
@@ -289,3 +295,46 @@ def point_queries(text, queries, mult, slot_of=None, slots=1, caps=None):
         raise Unsupported("the lowered raygen has no TraceRay of its own to point at the "
                           "shim's scene")
     return text
+
+
+
+def restore_function(lowered, cs, orig, export):
+    """A closest-hit or miss hosted as a compute shader comes back from the
+    lowering as a raygen would: no parameters, a raygen's entry properties and
+    annotation (0.82.0). Its own are put back: the parameters as `cs` (what
+    raygen_as_cs made) declares them, the function type they make, and the
+    entry properties (shader kind, payload and attribute sizes) and parameter
+    annotations `orig`, the library, gives it. Those nodes name no function,
+    so they are still in the lowered module under the same ids. A raygen comes
+    back unchanged."""
+    dm = re.search(r'^define void @main\((.*)\) #\d+ \{$', cs, re.M)
+    if not dm or not dm.group(1).strip():
+        return lowered
+    params = dm.group(1)
+    ftype = 'void (%s)*' % ', '.join(p.split()[0] for p in split_args(params))
+    fn = _function(Module(orig), export)
+    ref = _fn_ref(fn.name)
+    props = ann = None
+    for _n, body in _md(orig.split('\n')).values():
+        f = split_args(body)
+        if len(f) >= 5 and f[0].endswith(' ' + ref) and f[1].startswith('!"'):
+            props = f[4]
+        if f and f[0] == 'i32 1':
+            for k in range(1, len(f) - 1, 2):
+                if f[k].endswith(' ' + ref):
+                    ann = f[k + 1]
+    if props is None or ann is None:
+        raise Unsupported('the entry or annotation of %s is not where it was looked for' % export)
+    me = _fn_ref(export)
+    out = []
+    for l in lowered.split('\n'):
+        if l.startswith('define void %s() ' % me):
+            l = 'define void %s(%s) ' % (me, params) + l[len('define void %s() ' % me):]
+        elif l.startswith('!'):
+            l = l.replace('void ()* %s, !"' % me, '%s %s, !"' % (ftype, me))
+            l = re.sub(r'(%s %s, !"[^"]*", null, null, )!\d+\}' % (re.escape(ftype), re.escape(me)),
+                       lambda m: m.group(1) + props + '}', l)
+            l = re.sub(r'void \(\)\* %s, !\d+' % re.escape(me),
+                       lambda m: '%s %s, %s' % (ftype, me, ann), l)
+        out.append(l)
+    return '\n'.join(out)

@@ -181,8 +181,13 @@ code (`rq_analyze.cpp`, `rq_lower.cpp`) on 2026-09-26, not from memory:
   records unchanged, then the shim's miss and block, reached through a scene
   copy whose contributions point at it. `gitest --rgquery`, two poisons.
   Found doing it, fixed: a resource record type holding a comma.
-- c. NEXT: closest-hit and miss (recursion depth grows by 1), and
-  collections (Unreal's way).
+- c. Closest-hit and miss: DONE 0.82.0. Hosted like a raygen and given
+  their own signature back; recursion depth grows by 1; hosted shaders share
+  one shim block, their arguments written into every record of their units
+  by a GPU pass (`proxy/rg_table.hlsl`). `gitest --chquery`.
+- d. NEXT: collections (Unreal's way: each shader its own collection,
+  exports renamed, linked into a pipeline, often by AddToStateObject), and
+  libraries included through an export list.
 
 These can call `TraceRay`, so the lowering is the compute one, in place.
 The generated hit groups are added to the application's state object; the
@@ -243,15 +248,16 @@ Three-form matrix, dispatch suite, an Escher run. Then the limits list:
   body does something for a procedural candidate: the stepped search records
   triangles only, recording a box needing loop state in an intersection
   shader (0.79.0);
-- a query in an application's raygen (0.81.0): whose scene is picked per ray
-  among several (a key table's capacity would have to be fixed when the
-  application creates its state object), or is in the raygen's local root
-  signature, or is not read from its latest build at the dispatch (not
-  deferred to submit); a raygen record in GPU memory in a pipeline with
-  several raygens; a miss or hit table of stride 0; a library with an export
-  list or its own subobjects, or a raygen associated by name with a
-  library's subobject; a shader config not at state object scope;
-  GeometryIndex() in the same pipeline.
+- a query in an application's raygen, closest-hit or miss (0.81.0,
+  0.82.0): whose scene is picked per ray among several (a key table's
+  capacity would have to be fixed when the application creates its state
+  object), or is in a local root signature, or is not read from its latest
+  build at the dispatch (not deferred to submit); a miss or hit table of
+  stride 0; a library with its own subobjects, or a shader associated by
+  name with a library's subobject; a shader config not at state object
+  scope; GeometryIndex() in the same pipeline; more than 15 query slots in
+  one pipeline; a closest-hit or miss query in a pipeline already at
+  recursion depth 31.
 
 ## Size
 

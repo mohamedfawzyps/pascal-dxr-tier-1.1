@@ -24,6 +24,55 @@ not.
 
 ---
 
+## 0.82.0
+
+**Plan step 4 c: RayQuery in an application's closest-hit and miss is
+drawn.** A closest-hit and a miss can call TraceRay, so their queries lower as
+a raygen's do, one recursion level deeper.
+
+- **Rewriter.** The shader is hosted as a compute shader as a raygen is
+  (0.80.0); the lowering hands it back with a raygen's signature, entry and
+  annotation, so a new pass gives it its own back (`rghost.restore_function`,
+  `rg_host` `RestoreFunction`): its parameters, the function type they make,
+  and the entry properties (shader kind, payload and attribute sizes) and
+  parameter annotations the library gives it. The lowering no longer declares
+  a dx.op function the module already declares (a closest-hit declares hit
+  intrinsics the generated shaders call too: "invalid redefinition"). The
+  strip matches a function type with parameters. `point_queries` takes the
+  shader's first query slot of the pipeline's: several shaders share one
+  shim block.
+- **Proxy** (`proxy/rg_query`, reworked around HOSTED shaders). Each hosted
+  shader's queries take ray contributions `base .. base + Q - 1` of the
+  pipeline's query slots (at most 15, one scene copy structure). Its UNITS
+  carry its appended arguments: a raygen or miss itself, a closest-hit each
+  hit group importing it (`gidx::HitGroupUnits`), extended with that group's
+  shaders. A closest-hit or miss raises the recursion depth by 1. At
+  DispatchRays a new pass (`proxy/rg_table.hlsl`) copies every application
+  record, raygen, miss and hit group alike, and writes the arguments into the
+  records of each unit, recognised by identifier ON THE GPU; each hosted
+  shader has a miss of the shim's after the application's, its miss index
+  its own. That also lifts 0.81.0's refusal of a raygen record in GPU memory
+  in a pipeline with several raygens. A dispatch reaching no hosted shader is
+  forwarded untouched.
+- **Tests.** `gitest --chquery`: the closest-hit queries from beside its hit,
+  the lower half of the rays miss and the miss queries from their origin,
+  both encoding the committed geometry, instance, contribution and primitive;
+  with `--rgquery` the raygen, closest-hit and miss all hosted in one
+  pipeline. All 7 layouts match WARP in 14 shapes (6.5 and 6.6, root SRV,
+  table, heap index in a root CBV or constants, two misses, indirect, tables
+  in GPU memory, GPU-written instances, two scenes). WARP removes its device
+  on a heap-indexed scene traced from a closest-hit or miss (known since
+  0.56.0), so those bind WARP's scene globally. `DXR_TIER11_RGQ_POISON=2`
+  diverges; `--rgquery` still matches, and both its poisons diverge.
+  `lib_chquery.hlsl` at 6.5 and 6.6: both rewriters byte-identical, valid,
+  in the shared block's second slot of three. Rewriter checks 108 of 108; dispatch suite 158 of 158 plus the raygen, closest-hit and miss runs.
+- **Refused by name, on the limits list:** more than 15 query slots in one
+  pipeline; a closest-hit or miss query in a pipeline already at depth 31.
+  RayQuery in an any-hit, intersection or callable shader: plan step 7.
+  Collections and export lists: plan step 4 d, next.
+- Escher: all 845 dumped Unreal shader inputs lower byte-identically to
+  0.81.0.
+
 ## 0.81.0
 
 **Plan step 4 b: RayQuery in an application's raygen is DRAWN.** The proxy

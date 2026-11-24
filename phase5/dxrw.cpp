@@ -156,8 +156,11 @@ int main(int argc, char** argv) {
         std::string raw;
         if (!ReadAll(argv[2], raw)) { std::printf("cannot read %s\n", argv[2]); return 1; }
         std::string text, why;
+        // [base total] (0.82.0): the queries' first slot of the pipeline's.
+        const unsigned base = argc >= 8 ? (unsigned)std::atoi(argv[6]) : 0u;
+        const unsigned total = argc >= 8 ? (unsigned)std::atoi(argv[7]) : 0u;
         if (!rq::PointRaygenQueries(llm::Normalize(raw), (unsigned)std::atoi(argv[4]),
-                                    (unsigned)std::atoi(argv[5]), {}, 1, {}, &text, &why)) {
+                                    (unsigned)std::atoi(argv[5]), {}, 1, {}, &text, &why, base, total)) {
             std::fprintf(stderr, "REFUSED: %s\n", why.c_str());
             return 2;
         }
@@ -184,6 +187,11 @@ int main(int argc, char** argv) {
         if (!a.ok) { std::fprintf(stderr, "REFUSED: %s\n", a.error.c_str()); return 2; }
         auto l = rq::Lower(m, a.query, rq::RaygenExports(rg));
         if (!l.ok) { std::fprintf(stderr, "REFUSED: %s\n", l.error.c_str()); return 2; }
+        // A closest-hit or miss gets its own signature and entry back (0.82.0).
+        if (!rq::RestoreFunction(l.text, cs, norm, rg, &l.text, &why)) {
+            std::fprintf(stderr, "REFUSED: %s\n", why.c_str());
+            return 2;
+        }
         if (!WriteAll(argv[4], l.text)) { std::printf("cannot write %s\n", argv[4]); return 1; }
         if (!empty && !WriteAll(argv[5], strip)) { std::printf("cannot write %s\n", argv[5]); return 1; }
         std::printf("lowered %s -> %s (%s)%s\n", rg.c_str(), argv[4], a.query.patternDesc.c_str(),

@@ -30,8 +30,18 @@ bool FixFlags(const std::string& in, const std::string& said, std::string* out);
 // queries); the application's own TraceRay left alone. point_queries in
 // rghost.py. `mult`: the lowered calls' multiplier, 1 with record data.
 std::string ShimMiss(const std::string& in);
+// A closest-hit or miss hosted as a compute shader, given back its own
+// parameters, function type, entry properties and annotations (0.82.0); a
+// raygen comes back unchanged. `cs` is what RaygenAsCs made, `orig` the
+// library. restore_function in rghost.py.
+bool RestoreFunction(const std::string& lowered, const std::string& cs, const std::string& orig,
+                     const std::string& exportName, std::string* out, std::string* why);
 bool PointRaygenQueries(const std::string& in, unsigned queries, unsigned mult,
                         const std::vector<unsigned>& slotOf, unsigned slots,
-                        const std::vector<unsigned>& caps, std::string* out, std::string* why);
+                        const std::vector<unsigned>& caps, std::string* out, std::string* why,
+                        unsigned base = 0, unsigned total = 0);
+// `base`, `total` (0.82.0): several shaders of a pipeline share the shim's
+// block, this one's queries at ray contributions base .. base + queries - 1
+// of `total` (0: queries).
 
 }  // namespace rq

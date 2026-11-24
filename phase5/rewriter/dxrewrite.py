@@ -84,6 +84,7 @@ def cmd_lowerraygen(src, raygen, dst, stripped):
         mod = Module(nvapi.fold(cs))
         q = rayquery.analyze(mod)
         out = lower.lower(mod, q, rghost.exports(raygen))
+        out = rghost.restore_function(out, cs, text, raygen)
     except (rayquery.Unsupported, lower.LowerError) as e:
         sys.stderr.write('REFUSED: %s\n' % e)
         return 2
@@ -97,13 +98,13 @@ def cmd_lowerraygen(src, raygen, dst, stripped):
     return 0
 
 
-def cmd_pointraygen(src, dst, queries, mult):
+def cmd_pointraygen(src, dst, queries, mult, base=0, total=None):
     """A lowered raygen library made ready for the application's pipeline
     (0.81.0): see point_queries in rghost.py. One scene slot."""
     import rghost
     text = normalize(io.open(src, encoding='utf-8').read())
     try:
-        out = rghost.point_queries(text, queries, mult)
+        out = rghost.point_queries(text, queries, mult, base=base, total=total)
     except rayquery.Unsupported as e:
         sys.stderr.write('REFUSED: %s\n' % e)
         return 2
@@ -142,7 +143,8 @@ def main(argv):
     if len(argv) >= 6 and argv[1] == 'lowerraygen':
         return cmd_lowerraygen(argv[2], argv[3], argv[4], argv[5])
     if len(argv) >= 6 and argv[1] == 'pointraygen':
-        return cmd_pointraygen(argv[2], argv[3], int(argv[4]), int(argv[5]))
+        extra = [int(a) for a in argv[6:8]] if len(argv) >= 8 else []
+        return cmd_pointraygen(argv[2], argv[3], int(argv[4]), int(argv[5]), *extra)
     print(__doc__)
     return 1
 

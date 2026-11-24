@@ -160,18 +160,18 @@ def expect_lower_ok(name, text):
 DXRW = os.path.join('phase5out', 'dxrw.exe')
 
 
-def raygen_checks(f, path):
+def raygen_checks(f, path, fn='RayGen'):
     """lowerraygen in both rewriters, compared, and both outputs validated."""
     import subprocess
     import tempfile
     import rghost
-    name = 'raygen RayQuery (%s)' % f
+    name = '%s RayQuery (%s)' % ('raygen' if fn == 'RayGen' else fn, f)
     d = tempfile.mkdtemp()
     py = [os.path.join(d, 'p_low.ll'), os.path.join(d, 'p_strip.ll')]
     cc = [os.path.join(d, 'c_low.ll'), os.path.join(d, 'c_strip.ll')]
     r1 = subprocess.run([sys.executable, os.path.join('phase5', 'rewriter', 'dxrewrite.py'),
-                         'lowerraygen', path, 'RayGen'] + py, capture_output=True, text=True)
-    r2 = subprocess.run([DXRW, 'lowerraygen', path, 'RayGen'] + cc, capture_output=True, text=True)
+                         'lowerraygen', path, fn] + py, capture_output=True, text=True)
+    r2 = subprocess.run([DXRW, 'lowerraygen', path, fn] + cc, capture_output=True, text=True)
     if r1.returncode or r2.returncode:
         print('  FAILED   %-34s %s %s' % (name, r1.stderr.strip()[:60], r2.stderr.strip()[:60]))
         return False
@@ -197,8 +197,12 @@ def raygen_checks(f, path):
         else:
             valid.append(False)
     low = io.open(py[0], encoding='utf-8').read()
-    shaped = ('define void @RayGen(' in low and 'dxr11_rq_RayGen_' in low and
-              '@dx.op.traceRay.struct.Pay(' in low and 'rayQuery_' not in low)
+    # A closest-hit or miss (0.82.0) traces nothing of its own here, and gets
+    # its parameters back.
+    own = fn == 'RayGen'
+    shaped = ('define void @%s(' % fn in low and 'dxr11_rq_%s_' % fn in low and
+              (not own or '@dx.op.traceRay.struct.Pay(' in low) and 'rayQuery_' not in low and
+              (own or 'define void @%s()' % fn not in low))
     # pointraygen (0.81.0): the lowered library as the proxy hands it to the
     # driver, the miss index read at run time and the lowered call alone
     # pointed at the shim's scene copy.
@@ -207,9 +211,11 @@ def raygen_checks(f, path):
     mm = re.search(r'call void @dx\.op\.traceRay\.struct\.Payload\(i32 157, [^,]+, i32 [^,]+, '
                    r'i32 [^,]+, i32 [^,]+, i32 (\d+),', low)
     mult = mm.group(1) if mm else '0'
+    # A closest-hit or miss in the shared block's second slot of three (0.82.0).
+    slots = [] if own else ['1', '3']
     r3 = subprocess.run([sys.executable, os.path.join('phase5', 'rewriter', 'dxrewrite.py'),
-                         'pointraygen', py[0], pp, '1', mult], capture_output=True, text=True)
-    r4 = subprocess.run([DXRW, 'pointraygen', cc[0], pc, '1', mult], capture_output=True, text=True)
+                         'pointraygen', py[0], pp, '1', mult] + slots, capture_output=True, text=True)
+    r4 = subprocess.run([DXRW, 'pointraygen', cc[0], pc, '1', mult] + slots, capture_output=True, text=True)
     pointed = not r3.returncode and not r4.returncode and \
         io.open(pp, encoding='utf-8').read() == io.open(pc, encoding='utf-8').read()
     if pointed:
@@ -217,10 +223,12 @@ def raygen_checks(f, path):
         r = subprocess.run([os.path.join('phase5out', 'dxilrt.exe'), 'asm', pp, pp + '.dxil'],
                            capture_output=True, text=True)
         pointed = ('validated and signed ok' in r.stdout + r.stderr and '@dxr11.tlas' in pt and
-                   '@dxr11.gi' in pt and '@dx.op.traceRay.struct.Pay(' in pt)
+                   (own or ', i32 1, i32 3, i32 %rgq.ms0' in pt) and
+                   '@dxr11.gi' in pt and (not own or '@dx.op.traceRay.struct.Pay(' in pt))
     good = same and all(valid) and shaped and pointed
     print('  %s %-34s %s' % ('ok      ' if good else 'FAILED  ', name,
-                             'identical, both valid, the app\'s TraceRay kept, pointed' if good else
+                             ('identical, both valid, the app\'s TraceRay kept, pointed' if own else
+                              'identical, both valid, its signature back, pointed') if good else
                              'identical=%s valid=%s shaped=%s pointed=%s' % (same, valid, shaped, pointed)))
     return good
 
@@ -782,6 +790,15 @@ def main():
         if not os.path.isfile(path):
             continue
         ok.append(raygen_checks(f, path))
+    # RayQuery in an application's closest-hit and miss (0.82.0).
+    for f in ('lib_chquery', 'lib_chquery_sm66'):
+        path = os.path.join('phase5', 'cases', f + '.ll')
+        if not os.path.isfile(path):
+            print('  FAILED   %-34s input missing (build_phase5.bat)' % f)
+            ok.append(False)
+            continue
+        for fn in ('ClosestHit', 'Miss'):
+            ok.append(raygen_checks(f, path, fn))
 
     print('\n%d of %d checks behaved as intended\n' % (sum(ok), len(ok)))
     return 0 if all(ok) else 1

@@ -2202,6 +2202,19 @@ def _swap_declarations(text, q, globals_, binding=False):
             new += ['', '; Function Attrs: nounwind readonly',
                     'declare %%dx.types.Handle @%s(i32, %s) #RQRO' % (fnname, elem)]
 
+    # A declaration the module has already is not made again: a closest-hit
+    # or miss hosted as a compute shader declares hit intrinsics the generated
+    # shaders also call (0.82.0).
+    kept = []
+    for l in new:
+        dm = re.match(r'^declare [^@]*(@[^(]+)\(', l)
+        if dm and ('\ndeclare ' in text and re.search(r'^declare [^@]*%s\(' % re.escape(dm.group(1)),
+                                                     text, re.M)):
+            while kept and (kept[-1] == '' or kept[-1].startswith('; Function Attrs:')):
+                kept.pop()
+            continue
+        kept.append(l)
+    new = kept
     anchor = text.index('\nattributes #0 =')
     text = text[:anchor] + '\n' + '\n'.join(new) + text[anchor:]
 

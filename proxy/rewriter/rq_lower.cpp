@@ -2576,6 +2576,32 @@ LowerResult Lower(const llm::Module& m, const Query& q, const Exports& e) {
                 add.push_back("declare %dx.types.Handle @" + f + "(i32, " + g.elem + ") #RQRO");
             }
         }
+        // A declaration the module has already is not made again: a
+        // closest-hit or miss hosted as a compute shader declares hit
+        // intrinsics the generated shaders also call (0.82.0).
+        {
+            std::vector<std::string> kept;
+            for (const auto& l : add) {
+                if (l.rfind("declare ", 0) == 0) {
+                    const size_t at = l.find('@'), end = l.find('(', at);
+                    const std::string name = at == std::string::npos ? "" : l.substr(at, end - at);
+                    bool have = false;
+                    for (const auto& ol : llm::SplitLines(out))
+                        if (ol.rfind("declare ", 0) == 0 && ol.find(" " + name + "(") != std::string::npos) {
+                            have = true;
+                            break;
+                        }
+                    if (have) {
+                        while (!kept.empty() && (kept.back().empty() ||
+                                                 kept.back().rfind("; Function Attrs:", 0) == 0))
+                            kept.pop_back();
+                        continue;
+                    }
+                }
+                kept.push_back(l);
+            }
+            add = kept;
+        }
         const size_t anchor = out.find("\nattributes #0 =");
         std::string joined;
         for (size_t i = 0; i < add.size(); ++i) {

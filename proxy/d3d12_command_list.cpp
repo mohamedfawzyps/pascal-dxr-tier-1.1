@@ -1314,18 +1314,19 @@ void Dxr11CommandList::DispatchRaygenQuery(ID3D12GraphicsCommandList4* cl, const
                                            const Dxr11Bindings& b, const D3D12_DISPATCH_RAYS_DESC& d,
                                            const void* owner, const std::function<void()>& restore) {
     std::string why;
-    const int k = gidx::Get(b.stateObject) ? -3 : rgq::PickRaygen(info, d, &why);
-    if (k == -1) { cl->DispatchRays(&d); return; }   // another raygen: the application's own
-    if (k == -3) why = "GeometryIndex() in the hit shaders of a pipeline with a RayQuery raygen";
-    if (k >= 0) {
-        gidx::SceneSel sel;
-        ScenesSel(info.raygens[(size_t)k].scenes, b, &sel);
-        if (rgq::Dispatch(cl, RealDevice(), info, k, d, sel, owner, restore, &why))
-            return;
+    // Reaching no hosted shader (0.82.0: none is a closest-hit or miss, and
+    // the raygen is another one): the application's own dispatch.
+    if (rgq::Untouched(info, d)) { cl->DispatchRays(&d); return; }
+    if (gidx::Get(b.stateObject)) {
+        why = "GeometryIndex() in the hit shaders of a pipeline with a RayQuery DXR shader";
+    } else {
+        std::vector<gidx::SceneSel> sels(info.hosted.size());
+        for (size_t k = 0; k < sels.size(); ++k) ScenesSel(info.hosted[k].scenes, b, &sels[k]);
+        if (rgq::Dispatch(cl, RealDevice(), info, d, sels, owner, restore, &why)) return;
     }
     static LONG n = 0;
     if (InterlockedIncrement(&n) <= 16)
-        ProxyLog("[dxr-tier-11-proxy-log] RayQuery raygen dispatch NOT DRAWN: %s\n", why.c_str());
+        ProxyLog("[dxr-tier-11-proxy-log] RayQuery DXR shader dispatch NOT DRAWN: %s\n", why.c_str());
 }
 
 void STDMETHODCALLTYPE Dxr11CommandList::DispatchRays(const D3D12_DISPATCH_RAYS_DESC* d) {

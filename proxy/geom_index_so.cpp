@@ -2198,6 +2198,16 @@ bool EnsurePipe(ID3D12Device* dev, std::string* why) {
 
 }  // namespace
 
+std::vector<std::vector<std::wstring>> HitGroupUnits(const D3D12_STATE_OBJECT_DESC& d) {
+    std::vector<std::vector<std::wstring>> out;
+    for (const auto& g : HitGroupsOf(d)) {
+        std::vector<std::wstring> u{ g.name };
+        for (const auto& w : g.Imports()) u.push_back(w);
+        out.push_back(u);
+    }
+    return out;
+}
+
 bool LibraryFunctions(const void* container, size_t size,
                       std::vector<std::pair<std::string, uint32_t>>* fns) {
     return Functions(container, size, fns);

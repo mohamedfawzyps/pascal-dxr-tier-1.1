@@ -165,6 +165,16 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.82.0: PLAN STEP 4 c DONE, RAYQUERY IN AN APPLICATION'S CLOSEST-HIT AND
+MISS IS DRAWN.** Hosted like a raygen, then given its own signature and entry
+back (`restore_function`); one recursion level deeper. `proxy/rg_query` now
+handles HOSTED shaders sharing one shim block (query slots), their arguments
+written into every record of their units (raygen, miss, each hit group
+importing a closest-hit) by a GPU pass that recognises them by identifier
+(`proxy/rg_table.hlsl`). `gitest --chquery` (and with `--rgquery`) matches in
+14 shapes. Escher 845 of 845 byte-identical. NEXT: plan step 4 d
+(collections, Unreal's way, and export lists with renames).
+
 **0.81.0: PLAN STEP 4 b DONE, RAYQUERY IN AN APPLICATION'S RAYGEN IS
 DRAWN.** `proxy/rg_query`: the raygen lowered into the application's
 pipeline, its lowered TraceRay alone pointed at the shim's scene copy, the

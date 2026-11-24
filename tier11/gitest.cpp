@@ -166,6 +166,7 @@ static bool g_dynArgs = false;
 // cbuffer value, 1 at run time, record 0 a decoy miss. One state object only.
 static bool g_dynMiss = false;
 static bool g_rgQuery = false;   // --rgquery (0.81.0)
+static bool g_chQuery = false;   // --chquery (0.82.0)
 // --twoscenes: the raygen traces the scene, then a SECOND scene (t1, the same
 // instances in reverse order) and folds both answers into its output; with
 // --recurse the closest-hits trace the second scene. With --localscene the
@@ -263,10 +264,11 @@ struct Pay {
 #define TRACE_FLAGS RAY_FLAG_FORCE_OPAQUE
 #endif
 #define NO_HIT uint4(0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
-#if RGQUERY
-// --rgquery (0.81.0): the raygen runs an inline query beside its TraceRay,
-// and nothing reads GeometryIndex() in a hit shader, so the shim's RayQuery
-// raygen path is the one under test.
+#if RGQUERY || CHQUERY
+// --rgquery (0.81.0): the raygen runs an inline query beside its TraceRay;
+// --chquery (0.82.0): the closest-hit and the miss do. Nothing reads
+// GeometryIndex() in a hit shader, so the shim's RayQuery path for DXR
+// shaders is the one under test.
 #define HIT_GI 0
 #define AH_GI PrimitiveIndex()
 #else
@@ -289,6 +291,25 @@ RayDesc MakeRay(uint2 p) {
     return r;
 }
 
+#if CHQUERY
+// What a query from `o` straight down commits, geometry 2 rejected: the
+// committed geometry, instance, contribution and primitive, or 0xFFFFFFFE.
+uint QueryAt(float3 o) {
+    SCENE_DECL
+    RayDesc r;
+    r.Origin = o;
+    r.Direction = float3(0, 0, -1);
+    r.TMin = 0.0; r.TMax = 10.0;
+    RayQuery<RAY_FLAG_FORCE_NON_OPAQUE> q;
+    q.TraceRayInline(TSCENE, RAY_FLAG_NONE, 0xFF, r);
+    while (q.Proceed())
+        if (q.CandidateGeometryIndex() != 2) q.CommitNonOpaqueTriangleHit();
+    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) return 0xFFFFFFFE;
+    return 1 + q.CommittedGeometryIndex() + 16 * q.CommittedInstanceIndex() +
+           256 * q.CommittedInstanceContributionToHitGroupIndex() + 65536 * q.CommittedPrimitiveIndex();
+}
+#endif
+
 [shader("raygeneration")] void RayGen() {
     uint2 p = DispatchRaysIndex().xy;
     SCENE_DECL
@@ -298,7 +319,7 @@ RayDesc MakeRay(uint2 p) {
     pay.depth = 0;
     if (p.y >= H / 2) r.Origin.x = -5.0;   // misses: the miss shader traces it
 #endif
-#if DYNMISS
+#if DYNMISS || CHQUERY
     if (p.y >= H / 2) r.Origin.x = -5.0;   // misses: the miss index is the probe
 #endif
     TraceRay(TSCENE, TRACE_FLAGS, 0xFF, R_VAL, M_VAL, MISS_VAL, r, pay);
@@ -366,6 +387,9 @@ void Follow(inout Pay p) {
     }
 #endif
     p.v = NO_HIT;
+#if CHQUERY
+    p.v.x = QueryAt(MakeRay(DispatchRaysIndex().xy).Origin);
+#endif
 #if RGQUERY
     // At the lowered payload's committed status: a query miss run through
     // this shader instead of the shim's (DXR_TIER11_RGQ_POISON) reads as a hit.
@@ -376,6 +400,12 @@ void Follow(inout Pay p) {
 [shader("closesthit")]
 void ClosestHit(inout Pay p, BuiltInTriangleIntersectionAttributes a) {
     p.v = uint4(HIT_GI, InstanceIndex(), PrimitiveIndex(), RecTag);
+#if CHQUERY
+    {
+        const float3 h = WorldRayOrigin() + RayTCurrent() * WorldRayDirection();
+        p.v.x = QueryAt(float3(h.x + 0.3, h.y, 1.0));
+    }
+#endif
 #if RECURSE
     Follow(p);
 #endif
@@ -427,11 +457,12 @@ static ComPtr<IDxcBlob> Compile(int R, int M, bool anyhit, const char* src = kLi
     const wchar_t* dc = g_recurse ? L"RECURSE=1" : L"RECURSE=0";
     const wchar_t* dmiss = g_dynMiss ? L"DYNMISS=1" : L"DYNMISS=0";
     const wchar_t* drq = g_rgQuery ? L"RGQUERY=1" : L"RGQUERY=0";
+    const wchar_t* dchq = g_chQuery ? L"CHQUERY=1" : L"CHQUERY=0";
     std::vector<const wchar_t*> args = { L"-T", g_sm66 ? L"lib_6_6" : L"lib_6_5",
                                          L"-D", dr.c_str(), L"-D", dm.c_str(), L"-D", da.c_str(),
                                          L"-D", db, L"-D", dl, L"-D", ds, L"-D", dc,
                                          L"-D", dd, L"-D", d2, L"-D", dks.c_str(), L"-D", dmiss,
-                                         L"-D", drq };
+                                         L"-D", drq, L"-D", dchq };
     DxcBuffer buf{ src, std::strlen(src), DXC_CP_UTF8 };
     ComPtr<IDxcResult> res;
     HR(c->Compile(&buf, args.data(), (UINT32)args.size(), nullptr, IID_PPV_ARGS(&res)), "Compile");
@@ -1288,6 +1319,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--dynargs")) g_dynArgs = true;
         else if (!std::strcmp(argv[i], "--dynmiss")) g_dynMiss = true;
         else if (!std::strcmp(argv[i], "--rgquery")) g_rgQuery = true;
+        else if (!std::strcmp(argv[i], "--chquery")) g_chQuery = true;
         else if (!std::strcmp(argv[i], "--twoscenes")) g_twoScenes = 1;
         else if (!std::strcmp(argv[i], "--twoconflict")) g_twoScenes = 2;
         else if (!std::strcmp(argv[i], "--scenearray")) g_sceneKey = 1;

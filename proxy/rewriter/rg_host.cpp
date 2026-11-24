@@ -288,7 +288,8 @@ bool StripFunction(const std::string& in, const std::string& raygen, std::string
         if (std::string(".^$|()[]{}*+?\\").find(c) != std::string::npos) esc += '\\';
         esc += c;
     }
-    const std::regex kPair(", void \\(\\)\\* " + esc + ", !\\d+");
+    // `void (...)* @f, !n`: parameter types inside for a closest-hit or miss (0.82.0).
+    const std::regex kPair(", void \\([^)]*\\)\\* " + esc + ", !\\d+");
     for (size_t n = 0; n < lines.size(); ++n) {
         if (dead[n] || !std::regex_search(lines[n], kAnn)) continue;
         lines[n] = std::regex_replace(lines[n], kPair, "");
@@ -356,12 +357,15 @@ std::string ShimMiss(const std::string& in) {
 
 bool PointRaygenQueries(const std::string& in, unsigned queries, unsigned mult,
                         const std::vector<unsigned>& slotOf, unsigned slots,
-                        const std::vector<unsigned>& caps, std::string* out, std::string* why) {
+                        const std::vector<unsigned>& caps, std::string* out, std::string* why,
+                        unsigned base, unsigned total) {
     std::string gi;
     std::vector<std::string> fns;
     if (!LowerGeometryIndex(ShimMiss(in), &gi, &fns, why)) return false;
     std::vector<std::pair<unsigned, unsigned>> pairs;
-    for (unsigned k = 0; k < queries; ++k) pairs.push_back({ k, mult });
+    if (!total) total = queries;
+    for (unsigned j = 0; j < total; ++j) pairs.push_back({ 15u, 2u + j });
+    for (unsigned k = 0; k < queries; ++k) pairs[base + k] = { k, mult };
     int calls = 0;
     if (!RetraceToShimScene(gi, pairs, 0, slotOf, slots, caps, out, &calls, why, "struct.Payload"))
         return false;
@@ -369,6 +373,77 @@ bool PointRaygenQueries(const std::string& in, unsigned queries, unsigned mult,
         *why = "the lowered raygen has no TraceRay of its own to point at the shim's scene";
         return false;
     }
+    return true;
+}
+
+// A closest-hit or miss hosted as a compute shader, given back its own
+// parameters, function type, entry properties and annotations (0.82.0).
+// restore_function in rghost.py.
+bool RestoreFunction(const std::string& lowered, const std::string& cs, const std::string& orig,
+                     const std::string& exportName, std::string* out, std::string* why) {
+    static const std::regex kMain(R"RX(^define void @main\((.*)\) #\d+ \{$)RX");
+    std::string params;
+    {
+        std::smatch m;
+        for (const auto& l : llm::SplitLines(cs))
+            if (std::regex_match(l, m, kMain)) { params = m[1].str(); break; }
+    }
+    if (Trim(params).empty()) { *out = lowered; return true; }
+    std::string ftype = "void (";
+    {
+        const auto ps = llm::SplitArgs(params);
+        for (size_t i = 0; i < ps.size(); ++i) {
+            const std::string p = Trim(ps[i]);
+            ftype += (i ? ", " : "") + p.substr(0, p.find(' '));
+        }
+        ftype += ")*";
+    }
+    const std::string* name = nullptr;
+    std::string fnName;
+    {
+        llm::Module m(orig);
+        for (const auto& f : m.functions)
+            if (ExportName(f.name) == exportName) { fnName = f.name; name = &fnName; break; }
+    }
+    if (!name) { *why = "the library exports no function " + exportName; return false; }
+    const std::string ref = FnRef(fnName);
+    std::string props, ann;
+    for (const auto& kv : Md(llm::SplitLines(orig))) {
+        const auto f = llm::SplitArgs(kv.second.second);
+        auto ends = [&](const std::string& s) {
+            return s.size() > ref.size() && s.compare(s.size() - ref.size() - 1, std::string::npos, " " + ref) == 0;
+        };
+        if (f.size() >= 5 && ends(f[0]) && f[1].rfind("!\"", 0) == 0) props = f[4];
+        if (!f.empty() && f[0] == "i32 1")
+            for (size_t k = 1; k + 1 < f.size(); k += 2)
+                if (ends(f[k])) ann = f[k + 1];
+    }
+    if (props.empty() || ann.empty()) {
+        *why = "the entry or annotation of " + exportName + " is not where it was looked for";
+        return false;
+    }
+    const std::string me = FnRef(exportName);
+    const std::string def = "define void " + me + "() ";
+    auto esc = [](const std::string& s) {
+        static const std::regex kSpecial(R"([.^$|()\[\]{}*+?\\])");
+        return std::regex_replace(s, kSpecial, "\\$&");
+    };
+    const std::regex kEntry("(" + esc(ftype) + " " + esc(me) + ", !\"[^\"]*\", null, null, )!\\d+\\}");
+    const std::regex kAnn("void \\(\\)\\* " + esc(me) + ", !\\d+");
+    std::vector<std::string> lines;
+    for (std::string l : llm::SplitLines(lowered)) {
+        if (l.rfind(def, 0) == 0) {
+            l = "define void " + me + "(" + params + ") " + l.substr(def.size());
+        } else if (!l.empty() && l[0] == '!') {
+            const std::string from = "void ()* " + me + ", !\"";
+            for (size_t at = l.find(from); at != std::string::npos; at = l.find(from, at + 1))
+                l.replace(at, from.size(), ftype + " " + me + ", !\"");
+            l = std::regex_replace(l, kEntry, "$1" + props + "}");
+            l = std::regex_replace(l, kAnn, ftype + " " + me + ", " + ann);
+        }
+        lines.push_back(l);
+    }
+    *out = Join(lines);
     return true;
 }
 
