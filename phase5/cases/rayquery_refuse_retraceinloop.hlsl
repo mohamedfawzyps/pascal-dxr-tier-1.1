@@ -1,5 +1,7 @@
 // Refused by name (0.73.0): the query traced again inside its own Proceed
-// loop, which becomes an any-hit shader and cannot call TraceRay.
+// loop, which becomes an any-hit shader and cannot call TraceRay. Since
+// 0.79.0 the query is stepped (nest.py), and refused because a procedural
+// candidate would reach the retrace (the stepped search sees triangles only).
 cbuffer CB : register(b0) {
     uint width; uint height; float halfExtent; float camZ;
     float tMin; float tMax; float2 _pad;

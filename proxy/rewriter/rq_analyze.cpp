@@ -602,9 +602,22 @@ static std::string FindLoopShape(const llm::Function& fn, Query& q) {
     std::set<std::string> proceedBlocks;
     for (const auto& p : q.proceeds) proceedBlocks.insert(p.first->label);
 
+    // The latch has to TEST the Proceed (0.79.0): a lone Proceed() in the
+    // latch of some other loop around it does not make that loop this
+    // query's. See _tests in rayquery.py.
+    auto tests = [&](const std::string& label) {
+        const llm::Block* b = fn.FindBlock(label);
+        const llm::Instr* t = b ? b->Terminator() : nullptr;
+        static const std::regex kCond(R"(^br i1 (\S+), )");
+        std::smatch mc;
+        if (!t || !std::regex_search(t->body, mc, kCond)) return false;
+        for (const auto& p : q.proceeds)
+            if (p.first->label == label && p.second->result == mc[1].str()) return true;
+        return false;
+    };
     std::vector<llm::Loop> found;
     for (const auto& lp : fn.NaturalLoops())
-        if (proceedBlocks.count(lp.latch)) found.push_back(lp);
+        if (proceedBlocks.count(lp.latch) && tests(lp.latch)) found.push_back(lp);
 
     if (found.size() > 1) return "more than one Proceed loop on one query";
     if (found.empty()) {
@@ -619,8 +632,9 @@ static std::string FindLoopShape(const llm::Function& fn, Query& q) {
                 if (p.first->label == lp.header) { pr = p.second; break; }
             const llm::Instr* term = hdr->Terminator();
             std::smatch m;
-            if (!term || !std::regex_match(term->body, m, kBr) || m[1].str() != pr->result ||
-                !lp.body.count(m[2].str()) || lp.body.count(m[3].str()))
+            const bool br = term && std::regex_match(term->body, m, kBr);
+            if (br && m[1].str() != pr->result) continue;   // some other loop's header (0.79.0)
+            if (!br || !lp.body.count(m[2].str()) || lp.body.count(m[3].str()))
                 return "a Proceed loop tested at its top has an unexpected header shape";
             for (const auto& i : hdr->instrs)
                 if (!(i.isPhi || &i == pr || &i == term))
@@ -1004,8 +1018,10 @@ static std::string MergeTraces(const llm::Function& fn, Query& q,
 // contributions (shimscene::PairsPerStructure).
 const size_t kMaxPerQuery = 15;
 
-std::string CheckQueries(const llm::Function& fn, const std::vector<Query>& qs) {
+std::string CheckQueries(const llm::Function& fn, const std::vector<Query>& qs,
+                         const Query** outer) {
     for (const auto& q : qs) {
+        *outer = &q;
         if (!q.hasLoop) continue;
         for (const auto& label : q.loop.body) {
             const llm::Block* blk = fn.FindBlock(label);
@@ -1129,7 +1145,14 @@ AnalyzeResult Analyze(const llm::Module& m) {
             }
             if (q.traces.size() > 1) {
                 err = MergeTraces(fn, q, traces, outSets);
-                if (!err.empty()) { r.error = err; return r; }
+                if (!err.empty()) {
+                    r.error = err;
+                    if (err.find("is traced again inside its own Proceed loop") != std::string::npos) {
+                        r.nested = true;
+                        r.outer = q;
+                    }
+                    return r;
+                }
             }
             MarkProceduralEffects(m, fn, q);
             qs.push_back(q);
@@ -1138,8 +1161,15 @@ AnalyzeResult Analyze(const llm::Module& m) {
     // Before the per-query checks, so a query nested in another's loop is
     // refused for THAT, not for whatever it happens to read there.
     if (qs.size() > 1) {
-        const std::string err = CheckQueries(fn, qs);
-        if (!err.empty()) { r.error = err; return r; }
+        const Query* outer = nullptr;
+        const std::string err = CheckQueries(fn, qs, &outer);
+        if (!err.empty()) {
+            // Stepped by nest_step.cpp (0.79.0), which reads the outer query.
+            r.error = err;
+            r.nested = true;
+            r.outer = *outer;
+            return r;
+        }
         bool any = false;
         for (const auto& q : qs) any = any || q.NeedsBoth();
         if (any) {
@@ -1220,6 +1250,10 @@ bool NumThreads(const llm::Module& m, int out[3]) {
         return true;
     }
     return false;
+}
+
+std::set<std::string> ReachAsKind(const llm::Function& fn, const Query& q, int kind) {
+    return ReachAs(fn, q, kind);
 }
 
 }  // namespace rq

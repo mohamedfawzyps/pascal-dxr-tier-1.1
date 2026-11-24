@@ -132,7 +132,7 @@ def expect_lower_reject(name, text, must_mention):
     not covered here at all until a new one needed proving reachable.
     """
     try:
-        m = Module(text)
+        m = Module(nvapi.fold(text))   # the pre-passes, as the product runs them
         q = rayquery.analyze(m)
         lower.lower(m, q)
         print('  FAILED   %-34s was LOWERED, should have been refused' % name)
@@ -148,7 +148,7 @@ def expect_lower_reject(name, text, must_mention):
 def expect_lower_ok(name, text):
     """LOWERED, where it used to be refused."""
     try:
-        m = Module(text)
+        m = Module(nvapi.fold(text))   # the pre-passes, as the product runs them
         lower.lower(m, rayquery.analyze(m))
         print('  ok       %-34s lowered' % name)
         return True
@@ -367,13 +367,41 @@ def main():
             print('  FAILED   %-34s refused: %s' % (name, e))
             ok.append(False)
         ok.append(cpp_agrees(name, t, None))
-    for f, why in (('refuse_nested_query.ll', 'cannot call TraceRay'),):
-        path = os.path.join('phase5', 'cases', f)
-        if os.path.isfile(path):
-            t = load(path)
-            name = 'query nested in a loop'
-            ok.append(expect_reject(name, t, why))
-            ok.append(cpp_agrees(name, t, why))
+    # A query inside another's loop (0.79.0; until then refused, the outer loop
+    # becoming an any-hit, which cannot call TraceRay): the outer query is
+    # stepped by the pre-pass (nest.py), its loop kept in the raygen.
+    for f in ('refuse_nested_query', 'rayquery_nested', 'rayquery_nestedop',
+              'rayquery_nestedloop', 'rayquery_nestedfront', 'rayquery_looped'):
+        path = os.path.join('phase5', 'cases', f + '.ll')
+        if not os.path.isfile(path):
+            continue
+        t = load(path)
+        name = 'nested query (%s)' % f.split('_', 1)[1]
+        try:
+            m = Module(nvapi.fold(t))
+            out = lower.lower(m, rayquery.analyze(m))
+            stepped = '%ns0.q0.' in out
+            good = stepped == (f != 'rayquery_looped')
+            print('  %s %-34s %s' % ('ok      ' if good else 'FAILED  ', name,
+                                     'stepped' if stepped else 'lowers, not stepped'))
+            ok.append(good)
+        except (rayquery.Unsupported, lower.LowerError) as e:
+            print('  FAILED   %-34s refused: %s' % (name, e))
+            ok.append(False)
+        ok.append(cpp_agrees(name, t, None))
+    path = os.path.join('phase5', 'cases', 'refuse_nested_box.ll')
+    if os.path.isfile(path):
+        t = load(path)
+        name = 'nested query, body acts for a box'
+        try:
+            nvapi.fold(t)
+            print('  FAILED   %-34s not refused' % name)
+            ok.append(False)
+        except rayquery.Unsupported as e:
+            good = 'triangles only' in str(e)
+            print('  %s %-34s %s' % ('refused ' if good else 'FAILED  ', name, str(e)[:60]))
+            ok.append(good)
+        ok.append(cpp_agrees(name, t, 'triangles only'))
 
     # Several queries where one needs an intersection shader (0.77.0; until
     # then refused, the intersection shader having no payload to read a query
@@ -553,7 +581,7 @@ def main():
                       ('rayquery_refuse_procfx.ll', 'also writes for procedural candidates'),
                       ('rayquery_refuse_procdynabort.ll', 'with ray flags computed at run time'),
                       ('rayquery_refuse_candafter.ll', 'which code that did not leave the loop also reaches'),
-                      ('rayquery_refuse_retraceinloop.ll', 'traced again inside its own Proceed loop'),
+                      ('rayquery_refuse_retraceinloop.ll', 'triangles only'),   # stepped since 0.79.0; a box reaches the retrace
                       ('rayquery_refuse_proceednest.ll', 'inside the body of the Proceed() before it'),
                       ('rayquery_refuse_proceedwrite.ll', 'code between two Proceed() calls writes memory'),
                       ('rayquery_refuse_abortbetween.ll', 'Abort() between two Proceed() calls')):

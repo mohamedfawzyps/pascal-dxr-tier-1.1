@@ -61,6 +61,13 @@ def _uses(name):
 
 
 def fold(text):
+    """The NVAPI fold, then the stepping of a query with another inside its
+    loop (nest.py, 0.79.0): the pre-passes, in order."""
+    import nest
+    return nest.step(_fold(text))
+
+
+def _fold(text):
     lines = text.split('\n')
     bindings = set()
     for ln in lines:

@@ -484,7 +484,17 @@ $cases = @(
     @{ name = 'dynloopnu'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_dynloopnu.hlsl', '--table'); desc = 'the same through NonUniformResourceIndex' },
     @{ name = 'dynloopnu_sm66'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_dynloopnu_sm66.hlsl', '--table'); desc = 'the same through NonUniformResourceIndex, at 6.6' },
     @{ name = 'dynlooph'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_dynlooph.hlsl', '--table'); desc = 'the handle made before the loop, rebuilt from its carried index' },
-    @{ name = 'dynlooph_sm66'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_dynlooph_sm66.hlsl', '--table'); desc = 'the handle made before the loop, rebuilt from its carried index, at 6.6' }
+    @{ name = 'dynlooph_sm66'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_dynlooph_sm66.hlsl', '--table'); desc = 'the handle made before the loop, rebuilt from its carried index, at 6.6' },
+    # A query inside another's loop (0.79.0, plan step 3 l): the outer query
+    # stepped, its loop kept in the raygen.
+    @{ name = 'nested'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_nested.hlsl', '--geom', '--stack'); desc = 'a query inside another query''s loop' },
+    @{ name = 'nestedop'; pat = 'alpha'; extra = @('--cs', 'phase5\cases\rayquery_nestedop.hlsl', '--geom', '--opaquemix', '--stack'); desc = 'the same, opaque geometry committed by traversal' },
+    @{ name = 'nestedloop'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_nestedloop.hlsl', '--geom', '--stack'); desc = 'an inner query with a loop of its own' },
+    @{ name = 'nestedfront'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_nestedfront.hlsl', '--geom', '--stack'); desc = 'the front layer committed' },
+    @{ name = 'nestedmix'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_nestedfront.hlsl', '--mixed', '--contrib'); desc = 'the same on a mixed scene' },
+    @{ name = 'nestedstep'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\probe_nested_step.hlsl', '--geom', '--stack'); desc = 'the stepped form written by hand' },
+    @{ name = 'retraceinloop'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_retraceinloop.hlsl', '--geom', '--stack'); desc = 'a query traced again inside its own loop, stepped' },
+    @{ name = 'looped'; pat = 'opaque'; extra = @('--cs', 'phase5\cases\rayquery_looped.hlsl'); desc = 'a query proceeded once per iteration of an ordinary loop' }
 )
 
 $failed = 0
@@ -852,7 +862,7 @@ $env:DXR_TIER11 = ''
 # twoexits (the code after the loop that the original skipped) must DIVERGE;
 # with the procedural abort poison, procbreakstack must too.
 Write-Host ''
-Write-Host '=== exits, retraces, chains, aborts outside the loop, carried values, records per query, run-time indices ==='
+Write-Host '=== exits, retraces, chains, aborts outside the loop, carried values, records per query, run-time indices, nested queries ==='
 $env:DXR_TIER11 = '1'
 $xg = @(
     @{ n = 'breakstack'; v = 'DXR_TIER11_EXIT_POISON'; x = @('--cs', 'phase5\cases\rayquery_break.hlsl', '--geom', '--stack') },
@@ -879,8 +889,11 @@ $xg = @(
     @{ n = 'twoqproc'; v = 'DXR_TIER11_PERQUERY_POISON'; x = @('--cs', 'phase5\cases\rayquery_twoqproc.hlsl', '--mixed') },
     # A run-time index in the loop (0.78.0): every handle a hit shader
     # rebuilds from one takes element 0, a decoy.
-    @{ n = 'dynloopc'; v = 'DXR_TIER11_DYNIDX_POISON'; x = @('--cs', 'phase5\cases\rayquery_dynloopc.hlsl', '--table') },
-    @{ n = 'dynlooph_sm66'; v = 'DXR_TIER11_DYNIDX_POISON'; x = @('--cs', 'phase5\cases\rayquery_dynlooph_sm66.hlsl', '--table') }
+    @{ n = 'dynloopc'; v = 'DXR_TIER11_DYNIDX_POISON'; p = 'opaque'; x = @('--cs', 'phase5\cases\rayquery_dynloopc.hlsl', '--table') },
+    @{ n = 'dynlooph_sm66'; v = 'DXR_TIER11_DYNIDX_POISON'; p = 'opaque'; x = @('--cs', 'phase5\cases\rayquery_dynlooph_sm66.hlsl', '--table') },
+    # A stepped query (0.79.0): an opaque hit a search found is not committed.
+    # --opaquemix needs the alpha pattern: under opaque every geometry is.
+    @{ n = 'nestedop'; v = 'DXR_TIER11_NEST_POISON'; x = @('--cs', 'phase5\cases\rayquery_nestedop.hlsl', '--geom', '--opaquemix', '--stack') }
 )
 foreach ($g in $xg) {
     $x = $g.x

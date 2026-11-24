@@ -158,10 +158,15 @@ code (`rq_analyze.cpp`, `rq_lower.cpp`) on 2026-09-26, not from memory:
   indexed resource inside the loop. The resource: DONE 0.78.0 (the index
   rebuilt or carried like any value, the handle rebuilt from it; a handle
   made in the loop body turned into its library form, which at 6.6 had
-  failed at the assembler). The nested query: NEXT, 0.79.0. Its loop stays
-  in the raygen, each `Proceed()` one TraceRay finding the next candidate
-  front to back (a legal RayQuery order), so the inner query runs where
-  TraceRay can be called.
+  failed at the assembler). The nested query: DONE 0.79.0, the outer query
+  STEPPED by a pre-pass: its loop kept in the raygen, each `Proceed()` a
+  search by a fresh query for the nearest non-opaque candidate past the last
+  (front to back, a legal RayQuery order), a closer opaque hit committed
+  without the body. Covers a query retraced inside its own loop too. Found
+  doing it, fixed: a loop was taken for a query's Proceed loop because its
+  latch held a `Proceed()`, without its branch testing it. STEP 3 DONE; left
+  of it on the limits list: a stepped body that acts for a procedural
+  candidate.
 
 ### 4. Spec item 3, RayQuery in raygen, closest-hit and miss (2 to 3 versions)
 
@@ -219,7 +224,11 @@ Three-form matrix, dispatch suite, an Escher run. Then the limits list:
 - several queries where one needs an intersection shader: more than 15 of
   them (one scene copy holds 15 ray contributions), or a scene not resolved
   through the root signature (the application's record layout has no room
-  for records per query) (0.77.0).
+  for records per query) (0.77.0);
+- a query with another query inside its loop (or retraced inside it) whose
+  body does something for a procedural candidate: the stepped search records
+  triangles only, recording a box needing loop state in an intersection
+  shader (0.79.0).
 
 ## Size
 

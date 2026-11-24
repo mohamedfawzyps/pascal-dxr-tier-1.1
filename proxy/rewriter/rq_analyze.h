@@ -238,7 +238,15 @@ struct AnalyzeResult {
     bool ok = false;
     std::string error;    // why it was refused, when !ok
     Query query;
+    // Refused for a query used inside another's Proceed loop (0.79.0): the
+    // outer query, which nest_step.cpp steps.
+    bool nested = false;
+    Query outer;
 };
+
+// The loop-body blocks a candidate of `kind` reaches (0 a triangle, 1 a
+// procedural primitive); reach_as in rayquery.py.
+std::set<std::string> ReachAsKind(const llm::Function& fn, const Query& q, int kind);
 
 // Analyse the single RayQuery in this module, or explain why it cannot be
 // lowered.

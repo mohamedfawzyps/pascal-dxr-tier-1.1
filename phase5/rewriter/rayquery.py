@@ -611,9 +611,11 @@ def _merge_traces(fn, q, owner):
             'a query traced on either arm of a branch, without a rotated Proceed '
             'loop to start the search at')
     if any(b.label in q.loop[2] for b, _ in q.traces):
-        raise Unsupported(
+        e = Unsupported(
             'RayQuery %s is traced again inside its own Proceed loop; that loop '
             'becomes an any-hit shader, which cannot call TraceRay' % q.handle)
+        e.nested = q
+        raise e
     guard =[(b, i) for b, i in q.proceeds if b.label != q.loop[1]]
     if len(guard) != 1:
         raise Unsupported('a query traced on either arm of a branch, with no '
@@ -683,19 +685,25 @@ def _check_queries(fn, queries):
                 used = instr.uses()
                 for h in others:
                     if h in used:
-                        raise Unsupported(
+                        # Stepped by nest.py (0.79.0), which reads the outer
+                        # query off the refusal.
+                        e = Unsupported(
                             'RayQuery %s is used inside the Proceed loop of %s; '
                             'that loop becomes an any-hit shader, which cannot '
                             'call TraceRay' % (h, q.handle))
+                        e.nested = q
+                        raise e
         # The same query traced again inside its own loop (0.73.0).
         for x in queries:
             if x is q or x.handle != q.handle:
                 continue
             if any(b.label in q.loop[2] for b, _ in _ops(x)):
-                raise Unsupported(
+                e = Unsupported(
                     'RayQuery %s is traced again inside its own Proceed loop; that '
                     'loop becomes an any-hit shader, which cannot call TraceRay'
                     % q.handle)
+                e.nested = q
+                raise e
 
 
 def _ops(q):
@@ -832,6 +840,13 @@ def _place_aborts(fn, q):
             q.post_aborts.append((b, i))
 
 
+def _tests(fn, q, label):
+    """Whether the block's branch tests one of this query's Proceed() calls."""
+    term = fn.block(label).terminator
+    m = re.match(r'^br i1 (\S+), ', term.body) if term else None
+    return bool(m) and m.group(1) in {i.result for b, i in q.proceeds if b.label == label}
+
+
 def _find_loop_shape(fn, q):
     """Locate the rotated Proceed loop, if there is one.
 
@@ -841,7 +856,10 @@ def _find_loop_shape(fn, q):
     proceed_blocks = {b.label for b, _ in q.proceeds}
     found = []
     for header, latch, body in fn.natural_loops():
-        if latch in proceed_blocks:
+        # The latch has to TEST the Proceed (0.79.0): a lone Proceed() that
+        # happens to sit in the latch of some other loop around it (another
+        # query's, now in the raygen) does not make that loop this query's.
+        if latch in proceed_blocks and _tests(fn, q, latch):
             found.append((header, latch, body))
     if len(found) > 1:
         raise Unsupported('more than one Proceed loop on one query')
@@ -857,8 +875,9 @@ def _find_loop_shape(fn, q):
             pr = [i for b, i in q.proceeds if b.label == header][0]
             m = re.match(r'^br i1 (\S+), label (\S+), label (\S+)$',
                          hdr.terminator.body) if hdr.terminator else None
-            if (not m or m.group(1) != pr.result or m.group(2) not in body
-                    or m.group(3) in body):
+            if m and m.group(1) != pr.result:
+                continue   # some other loop's header (0.79.0)
+            if (not m or m.group(2) not in body or m.group(3) in body):
                 raise Unsupported('a Proceed loop tested at its top has an '
                                   'unexpected header shape')
             for i in hdr.instrs:

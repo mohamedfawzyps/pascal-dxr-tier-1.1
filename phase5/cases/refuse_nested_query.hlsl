@@ -1,6 +1,7 @@
-// A REFUSAL case: a second query traced INSIDE the first one's Proceed loop.
-// That loop becomes an any-hit shader, and an any-hit shader cannot call
-// TraceRay, so there is nowhere for the inner trace to go. Refused by name.
+// Was a REFUSAL case until 0.79.0: a second query traced INSIDE the first
+// one's Proceed loop. It lowers since: the outer query is stepped (nest.py).
+// (That loop became an any-hit shader, and an any-hit shader cannot call
+// TraceRay, so there was nowhere for the inner trace to go.)
 //
 // Named refuse_* so the render suite does not pick it up as a case.
 cbuffer CB : register(b0) {

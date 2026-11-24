@@ -165,6 +165,16 @@ user 2026-09-24.** Verified from Unreal's source the same day:
 
 ## Current position (2026-09-23)
 
+**0.79.0: PLAN STEP 3 DONE; A QUERY INSIDE ANOTHER'S LOOP IS STEPPED.** A
+pre-pass (`nest.py`, `nest_step.cpp`) keeps the outer loop in the raygen, each
+`Proceed()` a search by a fresh query for the nearest non-opaque candidate past
+the last (front to back, legal), a closer opaque hit committed without the
+body; state in local variables. Also covers a query retraced inside its own
+loop. Refused by name: a stepped body that acts for a box. Fixed on the way:
+a loop whose latch holds a `Proceed()` was taken for its Proceed loop without
+the branch testing it. Escher 845 of 845 byte-identical. NEXT: plan step 4
+(RayQuery in raygen, closest-hit and miss).
+
 **0.78.0: PLAN STEP 3 l, FIRST HALF: A RESOURCE INDEXED AT RUN TIME INSIDE
 THE LOOP.** The index is rebuilt or carried in the payload like any value,
 the handle rebuilt from it; a handle DXC makes inside the loop body becomes

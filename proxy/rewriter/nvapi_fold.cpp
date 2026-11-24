@@ -1,6 +1,7 @@
 // C++ port of phase5/rewriter/nvapi.py. Mirrors its structure on purpose, so
 // the two can be held byte-identical; see nvapi_fold.h.
 #include "nvapi_fold.h"
+#include "nest_step.h"
 
 #include <cstring>
 #include <regex>
@@ -70,7 +71,17 @@ bool EndsBlock(const std::string& line) {
 
 }  // namespace
 
+static bool FoldNvapiOnly(const std::string& in, std::string* out, std::string* why);
+
+// The NVAPI fold, then the stepping of a query with another inside its loop
+// (nest_step.cpp, 0.79.0): the pre-passes, in order. fold in nvapi.py.
 bool FoldNvapi(const std::string& in, std::string* out, std::string* why) {
+    std::string folded;
+    if (!FoldNvapiOnly(in, &folded, why)) return false;
+    return StepNested(folded, out, why);
+}
+
+static bool FoldNvapiOnly(const std::string& in, std::string* out, std::string* why) {
     static const std::regex kRecord(
         std::string(R"RX(^!\d+ = !\{i32 (\d+), )RX") +
         R"RX(%"class\.RWStructuredBuffer<NvShaderExtnStruct>"\* [^,]+, !"[^"]*", i32 (\d+), i32 (\d+), )RX");

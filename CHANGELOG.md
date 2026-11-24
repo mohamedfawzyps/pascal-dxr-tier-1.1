@@ -24,6 +24,55 @@ not.
 
 ---
 
+## 0.79.0
+
+**Plan step 3 l, second half: a query used inside another query's Proceed
+loop. Step 3 is done.** Refused until now: the outer loop became an any-hit
+shader, which cannot call TraceRay, so the inner query had nowhere to go.
+
+- **The outer query is STEPPED** by a new pre-pass (`phase5/rewriter/nest.py`,
+  `proxy/rewriter/nest_step.cpp`, run after the NVAPI fold). Its loop stays in
+  the raygen. Each of its `Proceed()` calls becomes a search by a fresh query
+  on the same ray, which commits nothing and keeps the nearest non-opaque
+  candidate past the last one yielded, by (t, instance, geometry, primitive).
+  Front to back is a legal RayQuery order. A closer opaque hit the search's
+  traversal committed is committed for the outer query, without the body, and
+  the search runs again behind it. The outer query's state (last key,
+  candidate, committed hit, abort) lives in local variables, so commits,
+  `Abort()` and every accessor become stores and loads, and the body, inner
+  query included, runs where TraceRay can be called. The searches are ordinary
+  queries; nothing after the pre-pass knows a query was stepped.
+- **Probed first:** the stepped form written by hand
+  (`phase5/cases/probe_nested_step.hlsl`) gives the nested original's result
+  on WARP (18496 hits), and through the shim on the 1070 the same, 0
+  mismatches.
+- **Also stepped:** a query traced again inside its own Proceed loop (refused
+  since 0.73.0); the retrace starts a new search the next `Proceed()` steps.
+- **Refused by name, on the limits list:** a stepped query whose body does
+  something for a procedural candidate. The search records triangles only,
+  because recording a box needs loop state in an intersection shader (already
+  on the list). A box that passes through the body untouched (CandidateType()
+  folded, no effect, loop state unchanged) is fine and checked.
+- **Found doing it, fixed:** the analysis took ANY loop whose latch holds a
+  query's `Proceed()` for that query's Proceed loop, without asking whether
+  the latch branches on it. A query traced and proceeded once per iteration
+  of an ordinary loop was refused ("unexpected header shape"); a lone
+  `Proceed()` inside another query's loop, which stepping makes, was taken
+  for that loop. Now the branch has to test the call. `rayquery_looped.hlsl`
+  (three rays per pixel) matches WARP, 17268 hits.
+- **Tests.** `rayquery_nested.hlsl` (back layer committed when the inner query
+  finds something in front), `rayquery_nestedop.hlsl` (opaque geometry
+  committed by traversal in half the quadrants, the body in the others),
+  `rayquery_nestedloop.hlsl` (an inner query with a loop of its own, reading
+  the outer candidate's t and the outer committed state),
+  `rayquery_nestedfront.hlsl` (the front layer, and on a mixed scene),
+  `rayquery_retraceinloop.hlsl`, and the old refusal case: all match WARP.
+  `DXR_TIER11_NEST_POISON=1` (an opaque hit a search found is not committed)
+  diverges in exactly the 9248 opaque-quadrant rays. Byte-identical in both
+  rewriters; rewriter checks 101 of 101; dispatch suite 158 of 158.
+- **Escher unchanged:** all 845 dumped Unreal shader inputs lower
+  byte-identically to 0.78.0. None has a nested query.
+
 ## 0.78.0
 
 **Plan step 3 l, first half: a resource indexed at run time inside the

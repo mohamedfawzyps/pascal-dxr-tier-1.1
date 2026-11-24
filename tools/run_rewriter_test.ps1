@@ -197,7 +197,18 @@ $cases = @(
     @{ name = 'dynlooph'; src = 'phase5\cases\rayquery_dynlooph.ll'; pat = 'opaque'; flags = @('--table');
        norender = $true; desc = 'the handle made before the loop, rebuilt from its carried index' },
     @{ name = 'dynlooph_sm66'; src = 'phase5\cases\rayquery_dynlooph_sm66.ll'; pat = 'opaque'; flags = @('--table');
-       norender = $true; desc = 'the handle made before the loop, rebuilt from its carried index' }
+       norender = $true; desc = 'the handle made before the loop, rebuilt from its carried index' },
+    # Nested queries (0.79.0): rendered by the dispatch suite.
+    @{ name = 'nested'; src = 'phase5\cases\rayquery_nested.ll'; pat = 'opaque'; flags = @('--geom', '--stack');
+       norender = $true; desc = 'a query inside another querys loop' },
+    @{ name = 'nestedop'; src = 'phase5\cases\rayquery_nestedop.ll'; pat = 'alpha'; flags = @('--geom', '--opaquemix', '--stack');
+       norender = $true; desc = 'opaque geometry committed by traversal' },
+    @{ name = 'nestedloop'; src = 'phase5\cases\rayquery_nestedloop.ll'; pat = 'opaque'; flags = @('--geom', '--stack');
+       norender = $true; desc = 'an inner query with a loop of its own' },
+    @{ name = 'nestedfront'; src = 'phase5\cases\rayquery_nestedfront.ll'; pat = 'opaque'; flags = @('--geom', '--stack');
+       norender = $true; desc = 'the front layer committed' },
+    @{ name = 'looped'; src = 'phase5\cases\rayquery_looped.ll'; pat = 'opaque'; flags = @();
+       norender = $true; desc = 'a query proceeded once per iteration of a loop' }
 )
 
 if (-not (Test-Path 'phase5\dxil\rayquery_opaque.ll')) {
